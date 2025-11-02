@@ -1,0 +1,134 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  unit-tests:
+    name: Unit Tests (Stub-based)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies (Ubuntu)
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake build-essential
+
+    - name: Configure CMake
+      working-directory: tests
+      run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build tests
+      working-directory: tests
+      run: cmake --build build --config Release
+
+    - name: Run unit tests
+      working-directory: tests
+      run: ./build/TestRunner --success
+
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: unit-test-results-${{ matrix.os }}
+        path: tests/build/
+
+  integration-tests-macos:
+    name: Integration Tests (macOS with XCFramework)
+    runs-on: macos-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Clone llama.cpp
+      run: |
+        git clone https://github.com/ggerganov/llama.cpp.git
+        cd llama.cpp
+        # Use same commit as calibrate-ndk for compatibility
+        git checkout 338074c3
+
+    - name: Build llama.cpp XCFramework
+      run: |
+        cd llama.cpp
+        bash build-xcframework.sh
+
+    - name: Download test model
+      working-directory: tests
+      run: |
+        mkdir -p fixtures
+        if [ ! -f fixtures/tiny-random-llama.gguf ]; then
+          curl -L "https://huggingface.co/tensorblock/tiny-random-LlamaForCausalLM-GGUF/resolve/main/tiny-random-LlamaForCausalLM-Q4_K_M.gguf" \
+            --progress-bar \
+            -o fixtures/tiny-random-llama.gguf
+        fi
+
+    - name: Configure CMake for integration tests
+      working-directory: tests
+      run: |
+        cmake -S . -B build_integration \
+          -DLLOYAL_BUILD_INTEGRATION_TESTS=ON \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DLLAMA_CPP_FRAMEWORK_PATH="${{ github.workspace }}/llama.cpp/build-apple/llama.xcframework/macos-arm64_x86_64/llama.framework"
+
+    - name: Build integration tests
+      working-directory: tests
+      run: cmake --build build_integration --config Release
+
+    - name: Run integration tests
+      working-directory: tests
+      env:
+        LLAMA_TEST_MODEL: ${{ github.workspace }}/tests/fixtures/tiny-random-llama.gguf
+      run: ./build_integration/IntegrationRunner --success
+
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: integration-test-results-macos
+        path: tests/build_integration/
+
+  lint:
+    name: Code Style Check
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install clang-format
+      run: sudo apt-get update && sudo apt-get install -y clang-format
+
+    - name: Check formatting
+      run: |
+        find include/ tests/ -name '*.hpp' -o -name '*.cpp' | while read file; do
+          clang-format --dry-run --Werror "$file" || exit 1
+        done
+
+  summary:
+    name: Test Summary
+    runs-on: ubuntu-latest
+    needs: [unit-tests, integration-tests-macos]
+    if: always()
+
+    steps:
+    - name: Check test results
+      run: |
+        echo "Unit Tests: ${{ needs.unit-tests.result }}"
+        echo "Integration Tests (macOS): ${{ needs.integration-tests-macos.result }}"
+
+        if [ "${{ needs.unit-tests.result }}" != "success" ] || \
+           [ "${{ needs.integration-tests-macos.result }}" != "success" ]; then
+          echo "❌ Some tests failed"
+          exit 1
+        else
+          echo "✅ All tests passed"
+        fi
