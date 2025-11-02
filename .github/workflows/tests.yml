@@ -121,7 +121,10 @@ jobs:
         echo "Running basic integration tests with tiny-random-llama..."
         echo "Model path: $LLAMA_TEST_MODEL"
         ls -lh "$LLAMA_TEST_MODEL"
-        ./build_integration/IntegrationRunner --success
+        # Run tests that work with random weights (exclude Empirical and RoPE Invariant)
+        ./build_integration/IntegrationRunner --success \
+          --test-case-exclude="Empirical:*" \
+          --test-case-exclude="RoPE Invariant:*"
 
     - name: Run integration tests (coherent model)
       working-directory: tests
@@ -131,7 +134,9 @@ jobs:
         echo "Running coherent model tests with TinyLlama-1.1B..."
         echo "Model path: $LLAMA_TEST_MODEL"
         ls -lh "$LLAMA_TEST_MODEL"
-        ./build_integration/IntegrationRunner --success
+        # Run only tests that require coherent models
+        ./build_integration/IntegrationRunner --success \
+          --test-case="Empirical:*,RoPE Invariant:*"
 
     - name: Upload test results
       if: always()
