@@ -116,17 +116,21 @@ jobs:
     - name: Run integration tests (random model)
       working-directory: tests
       env:
-        LLAMA_TEST_MODEL: ${{ github.workspace }}/packages/liblloyal/tests/fixtures/tiny-random-llama.gguf
+        LLAMA_TEST_MODEL: ${{ github.workspace }}/tests/fixtures/tiny-random-llama.gguf
       run: |
         echo "Running basic integration tests with tiny-random-llama..."
+        echo "Model path: $LLAMA_TEST_MODEL"
+        ls -lh "$LLAMA_TEST_MODEL"
         ./build_integration/IntegrationRunner --success
 
     - name: Run integration tests (coherent model)
       working-directory: tests
       env:
-        LLAMA_TEST_MODEL: ${{ github.workspace }}/packages/liblloyal/tests/fixtures/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+        LLAMA_TEST_MODEL: ${{ github.workspace }}/tests/fixtures/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
       run: |
         echo "Running coherent model tests with TinyLlama-1.1B..."
+        echo "Model path: $LLAMA_TEST_MODEL"
+        ls -lh "$LLAMA_TEST_MODEL"
         ./build_integration/IntegrationRunner --success
 
     - name: Upload test results
