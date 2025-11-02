@@ -52,15 +52,54 @@ jobs:
       with:
         lfs: true  # Pull LFS files (xcframework binaries)
 
-    - name: Download test model
+    - name: Download test models
       working-directory: tests
       run: |
         mkdir -p fixtures
+
+        # Download tiny-random-llama (12MB) for basic integration tests
         if [ ! -f fixtures/tiny-random-llama.gguf ]; then
-          curl -L "https://huggingface.co/tensorblock/tiny-random-LlamaForCausalLM-GGUF/resolve/main/tiny-random-LlamaForCausalLM-Q4_K_M.gguf" \
-            --progress-bar \
+          echo "Downloading tiny-random-llama.gguf (12MB)..."
+          curl -fsSL --retry 3 --retry-delay 2 \
+            "https://huggingface.co/tensorblock/tiny-random-LlamaForCausalLM-GGUF/resolve/main/tiny-random-LlamaForCausalLM-Q4_K_M.gguf" \
             -o fixtures/tiny-random-llama.gguf
+
+          # Verify it's a valid GGUF file (check magic bytes)
+          echo "Verifying tiny-random-llama.gguf..."
+          if ! head -c 4 fixtures/tiny-random-llama.gguf | grep -q "GGUF"; then
+            echo "ERROR: Downloaded file is not a valid GGUF file"
+            echo "File header:"
+            head -c 32 fixtures/tiny-random-llama.gguf | xxd
+            rm -f fixtures/tiny-random-llama.gguf
+            exit 1
+          fi
+          echo "✓ tiny-random-llama.gguf verified"
+        else
+          echo "✓ Using cached tiny-random-llama.gguf"
         fi
+
+        # Download TinyLlama-1.1B (638MB) for coherent model tests
+        if [ ! -f fixtures/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf ]; then
+          echo "Downloading tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf (638MB)..."
+          curl -fsSL --retry 3 --retry-delay 2 \
+            "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf" \
+            -o fixtures/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+
+          # Verify GGUF magic bytes
+          echo "Verifying tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf..."
+          if ! head -c 4 fixtures/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf | grep -q "GGUF"; then
+            echo "ERROR: Downloaded file is not a valid GGUF file"
+            echo "File header:"
+            head -c 32 fixtures/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf | xxd
+            rm -f fixtures/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+            exit 1
+          fi
+          echo "✓ tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf verified"
+        else
+          echo "✓ Using cached tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
+        fi
+
+        echo "All test models ready"
 
     - name: Configure CMake for integration tests
       working-directory: tests
@@ -73,11 +112,21 @@ jobs:
       working-directory: tests
       run: cmake --build build_integration --config Release
 
-    - name: Run integration tests
+    - name: Run integration tests (random model)
       working-directory: tests
       env:
-        LLAMA_TEST_MODEL: ${{ github.workspace }}/tests/fixtures/tiny-random-llama.gguf
-      run: ./build_integration/IntegrationRunner --success
+        LLAMA_TEST_MODEL: ${{ github.workspace }}/packages/liblloyal/tests/fixtures/tiny-random-llama.gguf
+      run: |
+        echo "Running basic integration tests with tiny-random-llama..."
+        ./build_integration/IntegrationRunner --success
+
+    - name: Run integration tests (coherent model)
+      working-directory: tests
+      env:
+        LLAMA_TEST_MODEL: ${{ github.workspace }}/packages/liblloyal/tests/fixtures/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+      run: |
+        echo "Running coherent model tests with TinyLlama-1.1B..."
+        ./build_integration/IntegrationRunner --success
 
     - name: Upload test results
       if: always()
