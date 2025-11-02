@@ -2,11 +2,11 @@
 
 #include "common.hpp"
 #include "helpers.hpp"
-#include <llama/llama.h>
-#include <cstdint>
-#include <vector>
 #include <algorithm>
+#include <cstdint>
+#include <llama/llama.h>
 #include <stdexcept>
+#include <vector>
 
 /**
  * Decoder Anti-Corruption Layer (Header-Only)
@@ -18,40 +18,36 @@
  */
 
 namespace lloyal::detail {
-  /**
-   * RAII guard for automatic batch cleanup
-   * Ensures llama_batch_free is called even if exceptions occur
-   */
-  struct BatchGuard {
-    llama_batch& batch;
-    explicit BatchGuard(llama_batch& b) : batch(b) {}
-    ~BatchGuard() { llama_batch_free(batch); }
-  };
+/**
+ * RAII guard for automatic batch cleanup
+ * Ensures llama_batch_free is called even if exceptions occur
+ */
+struct BatchGuard {
+  llama_batch &batch;
+  explicit BatchGuard(llama_batch &b) : batch(b) {}
+  ~BatchGuard() { llama_batch_free(batch); }
+};
 
-  /**
-   * Add tokens to batch with position info
-   */
-  inline void add_tokens_to_batch(
-    llama_batch& batch,
-    const llama_token* tokens,
-    int32_t start_idx,
-    int32_t n_eval,
-    int32_t n_past,
-    int32_t capacity
-  ) {
-    // Clear batch using helpers.hpp function
-    lloyal::batch_clear(batch);
+/**
+ * Add tokens to batch with position info
+ */
+inline void add_tokens_to_batch(llama_batch &batch, const llama_token *tokens,
+                                int32_t start_idx, int32_t n_eval,
+                                int32_t n_past, int32_t capacity) {
+  // Clear batch using helpers.hpp function
+  lloyal::batch_clear(batch);
 
-    // Add tokens one by one, mark logits=true on LAST token only
-    for (int32_t i = 0; i < n_eval; ++i) {
-      const int32_t pos = n_past + i;
-      const bool want_logits = (i == n_eval - 1);
+  // Add tokens one by one, mark logits=true on LAST token only
+  for (int32_t i = 0; i < n_eval; ++i) {
+    const int32_t pos = n_past + i;
+    const bool want_logits = (i == n_eval - 1);
 
-      // Add token to sequence 0 (single-sequence design)
-      lloyal::batch_add(batch, tokens[start_idx + i], pos, {0}, want_logits, capacity);
-    }
+    // Add token to sequence 0 (single-sequence design)
+    lloyal::batch_add(batch, tokens[start_idx + i], pos, {0}, want_logits,
+                      capacity);
   }
 }
+} // namespace lloyal::detail
 
 namespace lloyal::decoder {
 
@@ -73,14 +69,11 @@ namespace lloyal::decoder {
  *
  * CRITICAL: Call kv::remove_range() BEFORE this function, never after.
  */
-inline void decode_tokens(
-  llama_context* ctx,
-  const llama_token* tokens,
-  int32_t n_tokens,
-  int32_t n_past,
-  int32_t n_batch
-) {
-  LLOYAL_LOG_DEBUG("[decoder::decode_tokens] Processing %d tokens at position %d", n_tokens, n_past);
+inline void decode_tokens(llama_context *ctx, const llama_token *tokens,
+                          int32_t n_tokens, int32_t n_past, int32_t n_batch) {
+  LLOYAL_LOG_DEBUG(
+      "[decoder::decode_tokens] Processing %d tokens at position %d", n_tokens,
+      n_past);
 
   if (!ctx) {
     LLOYAL_LOG_DEBUG("[decoder::decode_tokens] ERROR: NULL context");
@@ -103,18 +96,22 @@ inline void decode_tokens(
     const int32_t n_eval = std::min(n_tokens - processed, n_batch);
 
     // Add chunk to batch
-    detail::add_tokens_to_batch(batch, tokens, processed, n_eval, n_past, n_batch);
+    detail::add_tokens_to_batch(batch, tokens, processed, n_eval, n_past,
+                                n_batch);
 
     // Decode chunk (updates KV cache)
     if (llama_decode(ctx, batch) != 0) {
-      LLOYAL_LOG_DEBUG("[decoder::decode_tokens] ERROR: llama_decode failed at position %d", n_past);
+      LLOYAL_LOG_DEBUG(
+          "[decoder::decode_tokens] ERROR: llama_decode failed at position %d",
+          n_past);
       throw std::runtime_error("decoder::decode_tokens - llama_decode failed");
     }
 
     n_past += n_eval;
     processed += n_eval;
 
-    LLOYAL_LOG_DEBUG("[decoder::decode_tokens] Processed %d/%d tokens", processed, n_tokens);
+    LLOYAL_LOG_DEBUG("[decoder::decode_tokens] Processed %d/%d tokens",
+                     processed, n_tokens);
   }
 
   LLOYAL_LOG_DEBUG("[decoder::decode_tokens] Decode complete");
@@ -123,13 +120,11 @@ inline void decode_tokens(
 /**
  * Convenience overload for std::vector<llama_token>
  */
-inline void decode_tokens(
-  llama_context* ctx,
-  const std::vector<llama_token>& tokens,
-  int32_t n_past,
-  int32_t n_batch
-) {
-  decode_tokens(ctx, tokens.data(), static_cast<int32_t>(tokens.size()), n_past, n_batch);
+inline void decode_tokens(llama_context *ctx,
+                          const std::vector<llama_token> &tokens,
+                          int32_t n_past, int32_t n_batch) {
+  decode_tokens(ctx, tokens.data(), static_cast<int32_t>(tokens.size()), n_past,
+                n_batch);
 }
 
 } // namespace lloyal::decoder

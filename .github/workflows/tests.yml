@@ -157,9 +157,15 @@ jobs:
 
     - name: Check formatting
       run: |
-        find include/ tests/ -name '*.hpp' -o -name '*.cpp' | while read file; do
-          clang-format --dry-run --Werror "$file" || exit 1
-        done
+        # Exclude vendored libraries and build artifacts from formatting checks
+        find include/ tests/ \( -name '*.hpp' -o -name '*.cpp' \) \
+          -not -path '*/nlohmann/*' \
+          -not -path '*/minja/*' \
+          -not -path '*/build/*' \
+          -not -path '*/build_*/*' \
+          -not -path '*/_deps/*' \
+          -not -path '*/lib/*' \
+          -exec clang-format --dry-run --Werror {} \; || exit 1
 
   summary:
     name: Test Summary
