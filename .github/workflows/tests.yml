@@ -44,23 +44,13 @@ jobs:
         path: tests/build/
 
   integration-tests-macos:
-    name: Integration Tests (macOS with XCFramework)
+    name: Integration Tests (macOS)
     runs-on: macos-latest
 
     steps:
     - uses: actions/checkout@v4
-
-    - name: Clone llama.cpp
-      run: |
-        git clone https://github.com/ggerganov/llama.cpp.git
-        cd llama.cpp
-        # Use same commit as calibrate-ndk for compatibility
-        git checkout 338074c3
-
-    - name: Build llama.cpp XCFramework
-      run: |
-        cd llama.cpp
-        bash build-xcframework.sh
+      with:
+        lfs: true  # Pull LFS files (xcframework binaries)
 
     - name: Download test model
       working-directory: tests
@@ -75,11 +65,9 @@ jobs:
     - name: Configure CMake for integration tests
       working-directory: tests
       run: |
-        # Use relative path from tests/ directory to llama.cpp
         cmake -S . -B build_integration \
           -DLLOYAL_BUILD_INTEGRATION_TESTS=ON \
-          -DCMAKE_BUILD_TYPE=Release \
-          -DLLAMA_CPP_FRAMEWORK_PATH="../../llama.cpp/build-apple/llama.xcframework/macos-arm64_x86_64/llama.framework"
+          -DCMAKE_BUILD_TYPE=Release
 
     - name: Build integration tests
       working-directory: tests

@@ -78,10 +78,12 @@ option(LLOYAL_BUILD_INTEGRATION_TESTS "Build integration tests with real llama.c
 if(LLOYAL_BUILD_INTEGRATION_TESTS)
   message(STATUS "Building integration tests with real llama.cpp")
 
-  # Default to calibrate-ndk's pre-built llama.xcframework (can be overridden)
+  # Default to liblloyal's vendored pre-built xcframework (can be overridden)
   if(NOT DEFINED LLAMA_CPP_FRAMEWORK_PATH)
-    set(LLAMA_CPP_FRAMEWORK_PATH "../../@calibrate/calibrate-ndk/llama.cpp/build-apple/llama.xcframework/macos-arm64_x86_64/llama.framework")
-    message(STATUS "Using default llama.cpp framework: ${LLAMA_CPP_FRAMEWORK_PATH}")
+    # Pin to specific llama.cpp version (tag b6870, commit 338074c3)
+    set(LLAMA_CPP_VERSION "b6870")
+    set(LLAMA_CPP_FRAMEWORK_PATH "lib/${LLAMA_CPP_VERSION}/llama.xcframework/macos-arm64_x86_64/llama.framework")
+    message(STATUS "Using vendored llama.cpp framework: ${LLAMA_CPP_VERSION} (${LLAMA_CPP_FRAMEWORK_PATH})")
   endif()
 
   # Integration test executable

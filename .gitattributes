@@ -1,2 +1,6 @@
 # Large model files should use Git LFS
 tests/fixtures/*.gguf filter=lfs diff=lfs merge=lfs -text
+
+# Pre-built llama.cpp xcframework binaries
+tests/lib/llama.xcframework/**/*.a filter=lfs diff=lfs merge=lfs -text
+tests/lib/llama.xcframework/**/*.dylib filter=lfs diff=lfs merge=lfs -text
