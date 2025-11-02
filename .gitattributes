@@ -1,0 +1,2 @@
+# Large model files should use Git LFS
+tests/fixtures/*.gguf filter=lfs diff=lfs merge=lfs -text

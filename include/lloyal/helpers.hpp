@@ -3,6 +3,9 @@
 #include "common.hpp"
 #include <llama/llama.h>
 #include <llama/ggml.h>
+#include <lloyal/nlohmann/json.hpp>
+#include "minja/chat-template.hpp"
+#include "minja/minja.hpp"
 #include <vector>
 #include <cassert>
 #include <string>
@@ -14,6 +17,20 @@
  * Helper utilities vendored from llama.cpp/common/
  * MIT License - Copyright (c) 2023-2024 The ggml.ai team
  */
+
+// Forward declarations for detail namespace (defined at end of file)
+namespace lloyal::detail {
+    std::string common_token_to_piece(const struct llama_vocab* vocab, llama_token token, bool special);
+    std::string get_token_safe(const llama_model* model, llama_token token);
+    const char* get_chatml_template();
+    std::string apply_chat_template_helper(
+        const std::string& template_str,
+        const nlohmann::ordered_json& messages,
+        const std::string& bos_token,
+        const std::string& eos_token,
+        bool add_generation_prompt
+    );
+}
 
 namespace lloyal {
 

@@ -1,0 +1,3 @@
+# Test models - downloaded via script, not committed to repo
+*.gguf
+*.bin
