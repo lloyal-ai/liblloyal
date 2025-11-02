@@ -75,10 +75,11 @@ jobs:
     - name: Configure CMake for integration tests
       working-directory: tests
       run: |
+        # Use relative path from tests/ directory to llama.cpp
         cmake -S . -B build_integration \
           -DLLOYAL_BUILD_INTEGRATION_TESTS=ON \
           -DCMAKE_BUILD_TYPE=Release \
-          -DLLAMA_CPP_FRAMEWORK_PATH="${{ github.workspace }}/llama.cpp/build-apple/llama.xcframework/macos-arm64_x86_64/llama.framework"
+          -DLLAMA_CPP_FRAMEWORK_PATH="../../llama.cpp/build-apple/llama.xcframework/macos-arm64_x86_64/llama.framework"
 
     - name: Build integration tests
       working-directory: tests
