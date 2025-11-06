@@ -148,6 +148,8 @@ extern "C" {
     llama_token llama_vocab_bos(const llama_vocab* vocab);
     llama_token llama_vocab_eos(const llama_vocab* vocab);
     llama_token llama_vocab_eot(const llama_vocab* vocab);
+    bool llama_vocab_get_add_bos(const llama_vocab* vocab);
+    bool llama_vocab_get_add_eos(const llama_vocab* vocab);
 
     // Sampler operations (new API commit b6451+)
     llama_sampler_chain_params llama_sampler_chain_default_params();

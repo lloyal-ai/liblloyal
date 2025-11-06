@@ -335,6 +335,22 @@ llama_token llama_vocab_eot(const llama_vocab *vocab) {
   return g_stub_config.eot_token;
 }
 
+bool llama_vocab_get_add_bos(const llama_vocab *vocab) {
+  if (!vocab) {
+    return false;
+  }
+  // Return false by default (matches TinyLlama behavior for unit tests)
+  return false;
+}
+
+bool llama_vocab_get_add_eos(const llama_vocab *vocab) {
+  if (!vocab) {
+    return false;
+  }
+  // Return false by default (matches TinyLlama behavior for unit tests)
+  return false;
+}
+
 // ===== SAMPLER OPERATIONS (New API after commit b6451) =====
 
 llama_sampler_chain_params llama_sampler_chain_default_params() {

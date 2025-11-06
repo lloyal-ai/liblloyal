@@ -28,7 +28,8 @@ std::string apply_chat_template_helper(const std::string &template_str,
                                        const nlohmann::ordered_json &messages,
                                        const std::string &bos_token,
                                        const std::string &eos_token,
-                                       bool add_generation_prompt);
+                                       bool add_generation_prompt,
+                                       bool add_bos, bool add_eos);
 } // namespace lloyal::detail
 
 namespace lloyal {
@@ -93,16 +94,23 @@ format_chat_template_from_model(const llama_model *model,
       template_str = detail::get_chatml_template();
     }
 
-    // Get BOS/EOS tokens from model
+    // Get BOS/EOS tokens and metadata from model
     std::string bos_token, eos_token;
+    bool add_bos = false, add_eos = false;
+
     if (model) {
       const auto *vocab = llama_model_get_vocab(model);
       bos_token = detail::get_token_safe(model, llama_vocab_bos(vocab));
       eos_token = detail::get_token_safe(model, llama_vocab_eos(vocab));
+
+      // Query GGUF metadata to determine if wrapper tokens should be stripped
+      // (they'll be re-added during tokenization if the model expects them)
+      add_bos = llama_vocab_get_add_bos(vocab);
+      add_eos = llama_vocab_get_add_eos(vocab);
     }
 
     return detail::apply_chat_template_helper(template_str, messages, bos_token,
-                                              eos_token, true);
+                                              eos_token, true, add_bos, add_eos);
 
   } catch (const std::exception &e) {
     return "";
@@ -197,14 +205,21 @@ format_chat_template_complete(const llama_model *model,
     }
 
     std::string bos_token, eos_token;
+    bool add_bos = false, add_eos = false;
+
     if (model) {
       const auto *vocab = llama_model_get_vocab(model);
       bos_token = detail::get_token_safe(model, llama_vocab_bos(vocab));
       eos_token = detail::get_token_safe(model, llama_vocab_eos(vocab));
+
+      // Query GGUF metadata to determine if wrapper tokens should be stripped
+      // (they'll be re-added during tokenization if the model expects them)
+      add_bos = llama_vocab_get_add_bos(vocab);
+      add_eos = llama_vocab_get_add_eos(vocab);
     }
 
     result.prompt = detail::apply_chat_template_helper(
-        template_str, messages, bos_token, eos_token, true);
+        template_str, messages, bos_token, eos_token, true, add_bos, add_eos);
     result.additional_stops = extract_template_stop_tokens(model, template_str);
 
   } catch (const std::exception &e) {
@@ -359,10 +374,14 @@ inline const char *get_chatml_template() {
 
 // Apply chat template using minja engine (requires minja.hpp to be included
 // first)
+// Implements a round-trip pattern: template renders with wrapper tokens,
+// then strips them conditionally based on metadata so they can be re-added
+// during tokenization if the model expects them.
 inline std::string apply_chat_template_helper(
     const std::string &template_str, const json &messages,
     const std::string &bos_token = "", const std::string &eos_token = "",
-    bool add_generation_prompt = true) {
+    bool add_generation_prompt = true, bool add_bos = false,
+    bool add_eos = false) {
   try {
     // Create minja chat template with correct 3-parameter constructor
     minja::chat_template tmpl(template_str, bos_token, eos_token);
@@ -374,15 +393,20 @@ inline std::string apply_chat_template_helper(
     inputs.add_generation_prompt = add_generation_prompt;
     inputs.now = std::chrono::system_clock::now();
 
-    // Apply template with default options
+    // Apply template with default options (use_bos_token=true, use_eos_token=true)
+    // This ensures template variables like {{ bos_token }} and {{ eos_token }}
+    // remain available for templates to use as delimiters between messages.
     minja::chat_template_options opts;
     auto result = tmpl.apply(inputs, opts);
 
-    // Handle BOS/EOS token removal
-    if (!bos_token.empty() && result.starts_with(bos_token)) {
+    // Conditional wrapper token stripping
+    // Only strip wrapper tokens at start/end if the model's metadata indicates
+    // they will be re-added during tokenization. This prevents double-token issues
+    // while keeping template variables available for use as delimiters.
+    if (add_bos && !bos_token.empty() && result.starts_with(bos_token)) {
       result = result.substr(bos_token.length());
     }
-    if (!eos_token.empty() && result.ends_with(eos_token)) {
+    if (add_eos && !eos_token.empty() && result.ends_with(eos_token)) {
       result = result.substr(0, result.length() - eos_token.length());
     }
 
