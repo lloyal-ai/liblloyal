@@ -10,7 +10,7 @@
  * Requires: LLAMA_TEST_MODEL and LLAMA_TEST_TINYLLAMA environment variables
  */
 
-#include "doctest/doctest.h"
+#include <doctest/doctest.h>
 #include <lloyal/helpers.hpp>
 #include <lloyal/tokenizer.hpp>
 #include <lloyal/nlohmann/json.hpp>
@@ -22,8 +22,8 @@ using json = nlohmann::ordered_json;
 
 // ===== TEST HELPERS =====
 
-const char* MODEL_PATH = nullptr;
-const char* TINYLLAMA_PATH = nullptr;
+static const char* MODEL_PATH = std::getenv("LLAMA_TEST_MODEL");
+static const char* TINYLLAMA_PATH = std::getenv("LLAMA_TEST_TINYLLAMA");
 
 // RAII guard for llama backend initialization
 struct LlamaBackendGuard {
@@ -347,21 +347,3 @@ TEST_CASE("ChatTemplate Integration: unicode and emoji content") {
   llama_model_free(model);
 }
 
-// ===== INITIALIZATION =====
-
-// Test suite setup - read environment variables
-struct TestSetup {
-  TestSetup() {
-    MODEL_PATH = std::getenv("LLAMA_TEST_MODEL");
-    TINYLLAMA_PATH = std::getenv("LLAMA_TEST_TINYLLAMA");
-
-    if (!MODEL_PATH) {
-      MESSAGE("Note: LLAMA_TEST_MODEL not set, some tests will be skipped");
-    }
-    if (!TINYLLAMA_PATH) {
-      MESSAGE("Note: LLAMA_TEST_TINYLLAMA not set, TinyLlama-specific tests will be skipped");
-    }
-  }
-};
-
-static TestSetup _test_setup;

@@ -80,6 +80,7 @@ extern "C" {
     // Context creation and cleanup
     llama_context* llama_init_from_model(llama_model* model, llama_context_params params);
     void llama_free(llama_context* ctx);
+    uint32_t llama_n_ctx(const llama_context* ctx);  // Get context size
 
     // Default parameters
     llama_model_params llama_model_default_params();
@@ -89,11 +90,17 @@ extern "C" {
     llama_memory_t llama_get_memory(llama_context* ctx);
     bool llama_memory_seq_rm(llama_memory_t mem, llama_seq_id seq, llama_pos p0, llama_pos p1);
     llama_pos llama_memory_seq_pos_max(llama_memory_t mem, llama_seq_id seq);
+    void llama_memory_clear(llama_memory_t mem, bool clear_kv);  // Phase 3: clear KV cache
 
     // Per-sequence state operations
     size_t llama_state_seq_get_size(llama_context* ctx, llama_seq_id seq);
     size_t llama_state_seq_get_data(llama_context* ctx, uint8_t* dst, size_t size, llama_seq_id seq);
     size_t llama_state_seq_set_data(llama_context* ctx, const uint8_t* src, size_t size, llama_seq_id seq);
+
+    // File I/O operations (stub implementations for testing)
+    // NOTE: Signature matches real llama.cpp (filepath before seq_id)
+    size_t llama_state_seq_save_file(llama_context* ctx, const char* filepath, llama_seq_id seq_id, const llama_token* tokens, size_t n_token_count);
+    size_t llama_state_seq_load_file(llama_context* ctx, const char* filepath, llama_seq_id dest_seq_id, llama_token* tokens_out, size_t n_token_capacity, size_t* n_token_count_out);
 
     // Global state operations (fallback)
     size_t llama_state_get_size(llama_context* ctx);
@@ -231,6 +238,12 @@ struct LlamaStubConfig {
     llama_token bos_token = 1;                 // Beginning-of-sequence token
     llama_token eos_token = 2;                 // End-of-sequence token
     llama_token eot_token = 3;                 // End-of-turn token
+
+    // File I/O operations
+    size_t file_write_bytes = 0;               // Bytes written by state_seq_save_file
+    size_t file_read_bytes = 0;                // Bytes read by state_seq_load_file
+    size_t file_token_count = 0;               // Tokens in file
+    bool file_operation_succeeds = true;       // Controls if file ops succeed
 };
 
 // Global stub configuration accessor

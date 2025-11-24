@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.hpp"
+#include "tokenizer.hpp"
 #include <cstdint>
 #include <ctime>
 #include <llama/llama.h>
@@ -383,6 +384,74 @@ inline llama_token sample_with_params(llama_context *ctx,
                    result, temperature, static_cast<int>(top_k), top_p, min_p);
 
   return result;
+}
+
+// ===== MODEL-ACCEPTING CONVENIENCE OVERLOADS =====
+//
+// These overloads accept llama_model* and handle vocab extraction internally.
+// They delegate to the vocab-accepting primitives above.
+//
+// Benefits:
+// - Eliminate boilerplate (vocab extraction) in calling code
+// - Reduce code duplication across projects
+// - Backwards compatible - existing code unchanged
+
+/**
+ * Greedy sampling with automatic vocab extraction
+ *
+ * Convenience wrapper that handles vocab extraction from model.
+ * Selects the token with highest probability (argmax on logits).
+ *
+ * @param ctx Llama context
+ * @param model Llama model
+ * @return Token with highest probability
+ */
+inline llama_token greedy(llama_context *ctx, const llama_model *model) {
+  if (!model) {
+    LLOYAL_LOG_DEBUG("[sampler::greedy] ERROR: model is null");
+    throw std::runtime_error("sampler::greedy - NULL model");
+  }
+
+  const llama_vocab *vocab = lloyal::tokenizer::get_vocab(model);
+  if (!vocab) {
+    LLOYAL_LOG_DEBUG("[sampler::greedy] ERROR: get_vocab returned null");
+    throw std::runtime_error(
+        "sampler::greedy - Failed to get vocab from model");
+  }
+
+  return greedy(ctx, vocab);
+}
+
+/**
+ * Parameterized sampling with automatic vocab extraction
+ *
+ * Convenience wrapper that handles vocab extraction from model.
+ * Supports temperature, top-k, top-p, min-p, and penalty parameters.
+ *
+ * @param ctx Llama context
+ * @param model Llama model
+ * @param params Sampling parameters (any SamplingParamsLike type)
+ * @param grammarSampler Optional grammar constraint (default: nullptr)
+ * @return Sampled token ID
+ */
+template <SamplingParamsLike P>
+inline llama_token sample_with_params(llama_context *ctx,
+                                      const llama_model *model, const P &params,
+                                      llama_sampler *grammarSampler = nullptr) {
+  if (!model) {
+    LLOYAL_LOG_DEBUG("[sampler::sample_with_params] ERROR: model is null");
+    throw std::runtime_error("sampler::sample_with_params - NULL model");
+  }
+
+  const llama_vocab *vocab = lloyal::tokenizer::get_vocab(model);
+  if (!vocab) {
+    LLOYAL_LOG_DEBUG("[sampler::sample_with_params] ERROR: get_vocab "
+                     "returned null");
+    throw std::runtime_error(
+        "sampler::sample_with_params - Failed to get vocab from model");
+  }
+
+  return sample_with_params(ctx, vocab, params, grammarSampler);
 }
 
 } // namespace sampler

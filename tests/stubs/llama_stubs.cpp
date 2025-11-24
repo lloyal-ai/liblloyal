@@ -66,6 +66,11 @@ void llama_free(llama_context * /*ctx*/) {
   // Stub does nothing - no actual cleanup needed
 }
 
+uint32_t llama_n_ctx(const llama_context * /*ctx*/) {
+  // Return default context size for stub tests
+  return 512;
+}
+
 llama_context_params llama_context_default_params() {
   llama_context_params params;
   params.n_ctx = 512;
@@ -89,6 +94,11 @@ llama_pos llama_memory_seq_pos_max(llama_memory_t /*mem*/,
   return g_stub_config.pos_max;
 }
 
+void llama_memory_clear(llama_memory_t /*mem*/, bool /*clear_kv*/) {
+  // Stub: No-op for unit tests
+  // Real behavior validated in integration tests
+}
+
 // ===== PER-SEQUENCE STATE OPERATIONS =====
 
 size_t llama_state_seq_get_size(llama_context * /*ctx*/, llama_seq_id /*seq*/) {
@@ -104,6 +114,40 @@ size_t llama_state_seq_set_data(llama_context * /*ctx*/,
                                 const uint8_t * /*src*/, size_t /*size*/,
                                 llama_seq_id /*seq*/) {
   return g_stub_config.per_seq_rw;
+}
+
+// ===== FILE I/O OPERATIONS =====
+
+// NOTE: Signature matches real llama.cpp (filepath before seq_id)
+size_t llama_state_seq_save_file(llama_context * /*ctx*/,
+                                  const char * /*filepath*/,
+                                  llama_seq_id /*seq_id*/,
+                                  const llama_token * /*tokens*/,
+                                  size_t /*n_token_count*/) {
+  if (!g_stub_config.file_operation_succeeds) {
+    return 0;
+  }
+  return g_stub_config.file_write_bytes;
+}
+
+size_t llama_state_seq_load_file(llama_context * /*ctx*/,
+                                  const char * /*filepath*/,
+                                  llama_seq_id /*dest_seq_id*/,
+                                  llama_token *tokens_out,
+                                  size_t n_token_capacity,
+                                  size_t *n_token_count_out) {
+  if (!g_stub_config.file_operation_succeeds) {
+    return 0;
+  }
+
+  // Simulate token restoration
+  for (size_t i = 0; i < g_stub_config.file_token_count && i < n_token_capacity;
+       ++i) {
+    tokens_out[i] = 100 + static_cast<llama_token>(i); // Fake tokens: 100, 101, 102, ...
+  }
+  *n_token_count_out = g_stub_config.file_token_count;
+
+  return g_stub_config.file_read_bytes;
 }
 
 // ===== GLOBAL STATE OPERATIONS (FALLBACK) =====

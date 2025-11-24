@@ -10,11 +10,10 @@
  * use as delimiters while preventing double-token issues.
  */
 
-#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
-#include "doctest/doctest.h"
+#include <doctest/doctest.h>
 #include <lloyal/helpers.hpp>
 #include <lloyal/nlohmann/json.hpp>
-#include "stubs/llama_stubs.h"
+#include "llama_stubs.h"
 
 using json = nlohmann::ordered_json;
 
@@ -33,12 +32,11 @@ TEST_CASE("ChatTemplate: conditional stripping with add_bos=false, add_eos=false
   llama_vocab vocab{};
 
   // Configure stubs for TinyLlama scenario
-  llamaStubConfig().model_vocab = &vocab;
-  llamaStubConfig().vocab_bos_token = 1;      // <s>
-  llamaStubConfig().vocab_eos_token = 2;      // </s>
+  llamaStubConfig().bos_token = 1;      // <s>
+  llamaStubConfig().eos_token = 2;      // </s>
 
   // Zephyr template (TinyLlama)
-  llamaStubConfig().model_chat_template =
+  llamaStubConfig().chat_template =
     "{% for message in messages %}"
     "{{'<|' + message['role'] + '|>\\n' + message['content'] + eos_token + '\\n'}}"
     "{% endfor %}"
@@ -105,10 +103,9 @@ TEST_CASE("ChatTemplate: metadata flags passed through format_chat_template_comp
   llama_vocab vocab{};
 
   // Configure stubs
-  llamaStubConfig().model_vocab = &vocab;
-  llamaStubConfig().vocab_bos_token = 1;
-  llamaStubConfig().vocab_eos_token = 2;
-  llamaStubConfig().model_chat_template =
+  llamaStubConfig().bos_token = 1;
+  llamaStubConfig().eos_token = 2;
+  llamaStubConfig().chat_template =
     "{% for message in messages %}"
     "{{ message['role'] }}: {{ message['content'] }}\n"
     "{% endfor %}";
@@ -131,10 +128,9 @@ TEST_CASE("ChatTemplate: metadata flags passed through format_chat_template_from
   llama_vocab vocab{};
 
   // Configure stubs
-  llamaStubConfig().model_vocab = &vocab;
-  llamaStubConfig().vocab_bos_token = 1;
-  llamaStubConfig().vocab_eos_token = 2;
-  llamaStubConfig().model_chat_template =
+  llamaStubConfig().bos_token = 1;
+  llamaStubConfig().eos_token = 2;
+  llamaStubConfig().chat_template =
     "User: {{ messages[0]['content'] }}\nAssistant:";
 
   json messages = json::array({
@@ -154,10 +150,9 @@ TEST_CASE("ChatTemplate: multi-turn conversation with round-trip pattern") {
   llama_model model{};
   llama_vocab vocab{};
 
-  llamaStubConfig().model_vocab = &vocab;
-  llamaStubConfig().vocab_bos_token = 1;
-  llamaStubConfig().vocab_eos_token = 2;
-  llamaStubConfig().model_chat_template =
+  llamaStubConfig().bos_token = 1;
+  llamaStubConfig().eos_token = 2;
+  llamaStubConfig().chat_template =
     "{% for message in messages %}"
     "<|{{ message['role'] }}|>\n{{ message['content'] }}{{ eos_token }}\n"
     "{% endfor %}"
@@ -184,12 +179,11 @@ TEST_CASE("ChatTemplate: template variables remain available regardless of metad
   llama_model model{};
   llama_vocab vocab{};
 
-  llamaStubConfig().model_vocab = &vocab;
-  llamaStubConfig().vocab_bos_token = 1;
-  llamaStubConfig().vocab_eos_token = 2;
+  llamaStubConfig().bos_token = 1;
+  llamaStubConfig().eos_token = 2;
 
   // Template that uses bos_token and eos_token as delimiters
-  llamaStubConfig().model_chat_template =
+  llamaStubConfig().chat_template =
     "{% for message in messages %}"
     "{{ bos_token }}[{{ message['role'] }}]{{ eos_token }} {{ message['content'] }}\n"
     "{% endfor %}";
@@ -212,7 +206,6 @@ TEST_CASE("ChatTemplate: error handling with invalid JSON") {
   llama_model model{};
   llama_vocab vocab{};
 
-  llamaStubConfig().model_vocab = &vocab;
 
   auto result = lloyal::format_chat_template_complete(&model, "invalid json");
 
@@ -233,8 +226,7 @@ TEST_CASE("ChatTemplate: empty messages array") {
   llama_model model{};
   llama_vocab vocab{};
 
-  llamaStubConfig().model_vocab = &vocab;
-  llamaStubConfig().model_chat_template = "Empty: {{ messages|length }}";
+  llamaStubConfig().chat_template = "Empty: {{ messages|length }}";
 
   json messages = json::array();
 
@@ -249,8 +241,7 @@ TEST_CASE("ChatTemplate: ChatML fallback when no model template") {
   llama_model model{};
   llama_vocab vocab{};
 
-  llamaStubConfig().model_vocab = &vocab;
-  llamaStubConfig().model_chat_template = "";  // No template in model
+  llamaStubConfig().chat_template = "";  // No template in model
 
   json messages = json::array({
     {{"role", "user"}, {"content", "Hello"}}
@@ -269,8 +260,7 @@ TEST_CASE("ChatTemplate: template override takes precedence") {
   llama_model model{};
   llama_vocab vocab{};
 
-  llamaStubConfig().model_vocab = &vocab;
-  llamaStubConfig().model_chat_template = "Model template";
+  llamaStubConfig().chat_template = "Model template";
 
   std::string override_template = "Override: {{ messages[0]['content'] }}";
 
@@ -309,8 +299,7 @@ TEST_CASE("ChatTemplate: very long message content") {
   llama_model model{};
   llama_vocab vocab{};
 
-  llamaStubConfig().model_vocab = &vocab;
-  llamaStubConfig().model_chat_template = "{{ messages[0]['content'] }}";
+  llamaStubConfig().chat_template = "{{ messages[0]['content'] }}";
 
   // 10KB message
   std::string long_content(10000, 'x');
@@ -330,8 +319,7 @@ TEST_CASE("ChatTemplate: special characters in content") {
   llama_model model{};
   llama_vocab vocab{};
 
-  llamaStubConfig().model_vocab = &vocab;
-  llamaStubConfig().model_chat_template = "Content: {{ messages[0]['content'] }}";
+  llamaStubConfig().chat_template = "Content: {{ messages[0]['content'] }}";
 
   json messages = json::array({
     {{"role", "user"}, {"content", "Quote: \"Hello\"\nNewline\tTab"}}
@@ -349,8 +337,7 @@ TEST_CASE("ChatTemplate: unicode content") {
   llama_model model{};
   llama_vocab vocab{};
 
-  llamaStubConfig().model_vocab = &vocab;
-  llamaStubConfig().model_chat_template = "{{ messages[0]['content'] }}";
+  llamaStubConfig().chat_template = "{{ messages[0]['content'] }}";
 
   json messages = json::array({
     {{"role", "user"}, {"content", "Hello 世界 🌍"}}

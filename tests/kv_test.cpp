@@ -293,3 +293,137 @@ TEST_CASE("KV: global_state_load explicit call") {
 
   CHECK(read == 4096);
 }
+
+// ===== PHASE 3: CACHE CLEARING TESTS =====
+
+TEST_CASE("KV: clear_all - null context guard") {
+  resetStubConfig();
+
+  CHECK_THROWS_AS(clear_all(nullptr), std::runtime_error);
+}
+
+TEST_CASE("KV: clear_all - successful operation") {
+  resetStubConfig();
+
+  llama_context ctx{};
+  llamaStubConfig().pos_max = 50;  // Simulates non-empty cache
+
+  // Should not throw
+  CHECK_NOTHROW(clear_all(&ctx));
+
+  // Note: Stub doesn't actually clear, but validates call sequence
+  // Real behavior validated in integration tests
+}
+
+TEST_CASE("KV: clear_metadata - successful operation") {
+  resetStubConfig();
+
+  llama_context ctx{};
+  llamaStubConfig().pos_max = 50;  // Simulates non-empty cache
+
+  // Should not throw
+  CHECK_NOTHROW(clear_metadata(&ctx));
+
+  // Note: Stub doesn't distinguish metadata-only vs full clear
+  // Real behavior validated in integration tests
+}
+
+// ===== FILE PERSISTENCE TESTS =====
+
+TEST_CASE("KV: write_file - null context guard") {
+  resetStubConfig();
+
+  std::vector<llama_token> tokens = {1, 2, 3};
+  size_t bytes = write_file(nullptr, 0, "test.llama", tokens);
+
+  CHECK(bytes == 0);
+}
+
+TEST_CASE("KV: write_file - empty filepath guard") {
+  resetStubConfig();
+
+  llama_context ctx{};
+  std::vector<llama_token> tokens = {1, 2, 3};
+  size_t bytes = write_file(&ctx, 0, "", tokens);
+
+  CHECK(bytes == 0);
+}
+
+TEST_CASE("KV: write_file - empty KV cache guard") {
+  resetStubConfig();
+
+  llama_context ctx{};
+  llamaStubConfig().pos_max = -1;  // Empty cache
+  std::vector<llama_token> tokens = {1, 2, 3};
+
+  size_t bytes = write_file(&ctx, 0, "test.llama", tokens);
+
+  CHECK(bytes == 0);
+}
+
+TEST_CASE("KV: write_file - success") {
+  resetStubConfig();
+
+  llama_context ctx{};
+  llamaStubConfig().pos_max = 50;  // Non-empty cache
+  llamaStubConfig().file_operation_succeeds = true;
+  llamaStubConfig().file_write_bytes = 8192;
+
+  std::vector<llama_token> tokens = {1, 2, 3, 4, 5};
+  size_t bytes = write_file(&ctx, 0, "test.llama", tokens);
+
+  CHECK(bytes == 8192);
+}
+
+TEST_CASE("KV: write_file - operation fails") {
+  resetStubConfig();
+
+  llama_context ctx{};
+  llamaStubConfig().pos_max = 50;
+  llamaStubConfig().file_operation_succeeds = false;
+
+  std::vector<llama_token> tokens = {1, 2, 3};
+  size_t bytes = write_file(&ctx, 0, "test.llama", tokens);
+
+  CHECK(bytes == 0);
+}
+
+TEST_CASE("KV: read_file - null context throws") {
+  resetStubConfig();
+
+  CHECK_THROWS_AS(read_file(nullptr, 0, "test.llama"), std::runtime_error);
+}
+
+TEST_CASE("KV: read_file - empty filepath throws") {
+  resetStubConfig();
+
+  llama_context ctx{};
+  CHECK_THROWS_AS(read_file(&ctx, 0, ""), std::runtime_error);
+}
+
+TEST_CASE("KV: read_file - success") {
+  resetStubConfig();
+
+  llama_context ctx{};
+  llamaStubConfig().file_operation_succeeds = true;
+  llamaStubConfig().file_read_bytes = 8192;
+  llamaStubConfig().file_token_count = 5;
+
+  auto data = read_file(&ctx, 0, "test.llama");
+
+  CHECK(data.bytes_read == 8192);
+  CHECK(data.tokens.size() == 5);
+  // Verify tokens are sequential (100, 101, 102, 103, 104)
+  for (size_t i = 0; i < data.tokens.size(); ++i) {
+    CHECK(data.tokens[i] == 100 + static_cast<llama_token>(i));
+  }
+}
+
+TEST_CASE("KV: read_file - operation fails throws") {
+  resetStubConfig();
+
+  llama_context ctx{};
+  llamaStubConfig().file_operation_succeeds = false;
+
+  CHECK_THROWS_AS(read_file(&ctx, 0, "test.llama"), std::runtime_error);
+}

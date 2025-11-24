@@ -233,4 +233,173 @@ inline int32_t vocab_size(const llama_vocab *vocab) {
   return llama_vocab_n_tokens(vocab);
 }
 
+// ===== MODEL-ACCEPTING CONVENIENCE OVERLOADS =====
+//
+// These overloads accept llama_model* and handle vocab extraction + metadata
+// queries internally. They delegate to the vocab-accepting primitives above.
+//
+// Benefits:
+// - Eliminate boilerplate (vocab extraction, add_bos queries) in calling code
+// - Reduce code duplication across projects
+// - Backwards compatible - existing code unchanged
+
+/**
+ * Tokenize text to token array (model-accepting overload)
+ *
+ * Convenience wrapper that handles:
+ * - Vocab extraction from model
+ * - add_bos detection from GGUF metadata
+ * - Special token parsing
+ *
+ * @param model Llama model
+ * @param text Text to tokenize
+ * @return Vector of token IDs
+ */
+inline std::vector<llama_token> tokenize(const llama_model *model,
+                                         const std::string &text) {
+  if (!model) {
+    LLOYAL_LOG_DEBUG("[tokenizer::tokenize] ERROR: model is null");
+    return {};
+  }
+
+  const llama_vocab *vocab = get_vocab(model);
+  if (!vocab) {
+    LLOYAL_LOG_DEBUG("[tokenizer::tokenize] ERROR: get_vocab returned null");
+    return {};
+  }
+
+  bool add_bos = llama_vocab_get_add_bos(vocab);
+  return tokenize(vocab, text, add_bos, true);
+}
+
+/**
+ * Detokenize SINGLE token to text (model-accepting overload)
+ *
+ * @param model Llama model
+ * @param token Token ID to convert
+ * @param special Enable special token rendering (default: true)
+ * @return Text representation of token
+ */
+inline std::string detokenize(const llama_model *model, llama_token token,
+                              bool special = true) {
+  if (!model) {
+    LLOYAL_LOG_DEBUG("[tokenizer::detokenize] ERROR: model is null");
+    return "";
+  }
+
+  const llama_vocab *vocab = get_vocab(model);
+  if (!vocab) {
+    LLOYAL_LOG_DEBUG("[tokenizer::detokenize] ERROR: get_vocab returned null");
+    return "";
+  }
+
+  return detokenize(vocab, token, special);
+}
+
+/**
+ * Detokenize TOKEN VECTOR to text (convenience overload)
+ *
+ * Accepts std::vector instead of raw pointer for safer API.
+ *
+ * @param model Llama model
+ * @param tokens Vector of token IDs
+ * @param remove_special Remove BOS/EOS tokens from output (default: false)
+ * @param unparse_special Render special tokens as text (default: true)
+ * @return Complete text representation
+ */
+inline std::string detokenize_batch(const llama_model *model,
+                                    const std::vector<llama_token> &tokens,
+                                    bool remove_special = false,
+                                    bool unparse_special = true) {
+  if (!model) {
+    LLOYAL_LOG_DEBUG(
+        "[tokenizer::detokenize_batch] ERROR: model is null");
+    return "";
+  }
+
+  const llama_vocab *vocab = get_vocab(model);
+  if (!vocab) {
+    LLOYAL_LOG_DEBUG(
+        "[tokenizer::detokenize_batch] ERROR: get_vocab returned null");
+    return "";
+  }
+
+  return detokenize_batch(vocab, tokens.data(),
+                          static_cast<int32_t>(tokens.size()), remove_special,
+                          unparse_special);
+}
+
+/**
+ * Detokenize TOKEN ARRAY to text (model-accepting overload)
+ *
+ * @param model Llama model
+ * @param tokens Array of token IDs
+ * @param n_tokens Number of tokens in array
+ * @param remove_special Remove BOS/EOS tokens from output
+ * @param unparse_special Render special tokens as text
+ * @return Complete text representation
+ */
+inline std::string detokenize_batch(const llama_model *model,
+                                    const llama_token *tokens, int32_t n_tokens,
+                                    bool remove_special, bool unparse_special) {
+  if (!model) {
+    LLOYAL_LOG_DEBUG(
+        "[tokenizer::detokenize_batch] ERROR: model is null");
+    return "";
+  }
+
+  const llama_vocab *vocab = get_vocab(model);
+  if (!vocab) {
+    LLOYAL_LOG_DEBUG(
+        "[tokenizer::detokenize_batch] ERROR: get_vocab returned null");
+    return "";
+  }
+
+  return detokenize_batch(vocab, tokens, n_tokens, remove_special,
+                          unparse_special);
+}
+
+/**
+ * Check if token is end-of-generation marker (model-accepting overload)
+ *
+ * @param model Llama model
+ * @param token Token ID to check
+ * @return True if token marks end of generation
+ */
+inline bool is_eog(const llama_model *model, llama_token token) {
+  if (!model) {
+    LLOYAL_LOG_DEBUG("[tokenizer::is_eog] ERROR: model is null");
+    return false;
+  }
+
+  const llama_vocab *vocab = get_vocab(model);
+  if (!vocab) {
+    LLOYAL_LOG_DEBUG("[tokenizer::is_eog] ERROR: get_vocab returned null");
+    return false;
+  }
+
+  return is_eog(vocab, token);
+}
+
+/**
+ * Get vocabulary size (model-accepting overload)
+ *
+ * @param model Llama model
+ * @return Number of tokens in vocabulary
+ */
+inline int32_t vocab_size(const llama_model *model) {
+  if (!model) {
+    LLOYAL_LOG_DEBUG("[tokenizer::vocab_size] ERROR: model is null");
+    return 0;
+  }
+
+  const llama_vocab *vocab = get_vocab(model);
+  if (!vocab) {
+    LLOYAL_LOG_DEBUG("[tokenizer::vocab_size] ERROR: get_vocab returned null");
+    return 0;
+  }
+
+  return vocab_size(vocab);
+}
+
 } // namespace lloyal::tokenizer

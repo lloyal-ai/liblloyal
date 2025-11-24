@@ -1,8 +1,10 @@
 #pragma once
 
 #include "common.hpp"
+#include "decoder.hpp"
 #include <cstdint>
 #include <llama/llama.h>
+#include <vector>
 
 /**
  * KV Cache Anti-Corruption Layer (Header-Only)
@@ -288,6 +290,316 @@ inline void log_build_info(llama_context *ctx) {
       "[kv::build_info] Critical: Call remove_range() BEFORE llama_decode()");
   LLOYAL_LOG_DEBUG(
       "[kv::build_info] ============================================");
+}
+
+// ===== CACHE CLEARING (PHASE 3) =====
+
+/**
+ * Clear all KV cache (complete reset)
+ *
+ * Wrapper around llama_memory_clear() with:
+ * - Null checking
+ * - Error logging
+ * - Clears both metadata and data buffers
+ *
+ * @param ctx Llama context (must be initialized)
+ * @throws std::runtime_error if ctx is NULL
+ *
+ * USAGE:
+ *   lloyal::kv::clear_all(ctx);  // Fresh start for new conversation
+ *
+ * IMPLEMENTATION NOTE:
+ * Uses llama_memory_clear(mem, true) which:
+ * - Clears metadata (cell positions, sequence heads)
+ * - Zeroes K/V tensor data buffers
+ * - Full reset for new conversation
+ *
+ * Compare with clear_metadata():
+ * - clear_metadata() clears only metadata (keeps allocations, faster)
+ * - clear_all() clears both metadata and data (complete reset)
+ */
+inline void clear_all(llama_context *ctx) {
+  if (!ctx) {
+    LLOYAL_LOG_DEBUG("[kv::clear_all] ERROR: NULL context");
+    throw std::runtime_error("kv::clear_all - NULL context");
+  }
+
+  LLOYAL_LOG_DEBUG("[kv::clear_all] Clearing KV cache (metadata + data)");
+  llama_memory_clear(llama_get_memory(ctx), true);  // true = clear data buffers too
+  LLOYAL_LOG_DEBUG("[kv::clear_all] KV cache cleared");
+}
+
+/**
+ * Clear KV cache metadata only (fast reset)
+ *
+ * Clears logical structure but keeps buffer allocations.
+ * Faster than clear_all() for StreamingLLM pattern.
+ *
+ * @param ctx Llama context (must be initialized)
+ * @throws std::runtime_error if ctx is NULL
+ *
+ * USAGE:
+ *   lloyal::kv::clear_metadata(ctx);  // Fast reset for reseed
+ *
+ * PERFORMANCE:
+ * - Faster than clear_all() (no buffer zeroing)
+ * - Use for StreamingLLM when immediately re-decoding
+ * - Buffer reuse reduces allocation overhead
+ */
+inline void clear_metadata(llama_context *ctx) {
+  if (!ctx) {
+    LLOYAL_LOG_DEBUG("[kv::clear_metadata] ERROR: NULL context");
+    throw std::runtime_error("kv::clear_metadata - NULL context");
+  }
+
+  LLOYAL_LOG_DEBUG("[kv::clear_metadata] Clearing KV cache metadata only");
+  llama_memory_clear(llama_get_memory(ctx), false);  // false = keep data buffers
+  LLOYAL_LOG_DEBUG("[kv::clear_metadata] KV cache metadata cleared");
+}
+
+// ===== STREAMINGLLM SUPPORT (PHASE 3) =====
+
+/**
+ * StreamingLLM state for managing original sinks across reseeds
+ *
+ * StreamingLLM pattern requires ALWAYS reusing the ORIGINAL first 4 tokens
+ * from conversation start as "attention sinks". This struct helps track them.
+ *
+ * NOTE: This is provided for convenience. Callers can also track original
+ * sinks themselves and pass directly to clear_and_reseed().
+ */
+struct StreamingLlmState {
+  std::vector<llama_token> original_sinks;  // First N tokens from conversation start
+  size_t tail_size;                          // Number of recent tokens to keep (usually 252)
+};
+
+/**
+ * Clear KV cache and re-decode sinks + tail (StreamingLLM pattern)
+ *
+ * Implements the "CLEAR" strategy validated in integration tests:
+ * 1. Clear entire KV cache using llama_memory_clear()
+ * 2. Re-decode original_sinks (first N tokens) at position 0
+ * 3. Re-decode tail (last M tokens) at position sinks.size()
+ *
+ * This is SIMPLER and MORE RELIABLE than selective removal (llama_memory_seq_rm)
+ * which has known bugs with position handling in some llama.cpp versions.
+ *
+ * ⚠️  CRITICAL: original_sinks MUST be the FIRST tokens from conversation start!
+ *
+ * StreamingLLM relies on attention sinks at fixed positions. Using different
+ * "first 4" tokens after each reseed will violate the learned positional bias
+ * and destroy perplexity preservation.
+ *
+ * CORRECT usage:
+ *   // First time: Capture original sinks
+ *   std::vector<llama_token> ORIGINAL_SINKS(conversation.begin(), conversation.begin() + 4);
+ *   // Store ORIGINAL_SINKS for entire session
+ *
+ *   // Each reseed: Reuse SAME original sinks
+ *   auto tail = std::vector<llama_token>(conversation.end() - 252, conversation.end());
+ *   kv::clear_and_reseed(ctx, ORIGINAL_SINKS, tail, n_batch);
+ *
+ * WRONG usage:
+ *   auto current_window = get_current_tokens();
+ *   auto sinks = std::vector<llama_token>(current_window.begin(), current_window.begin() + 4);
+ *   kv::clear_and_reseed(ctx, sinks, tail, n_batch);  // ❌ NOT original! Will degrade!
+ *
+ * @param ctx Llama context (must be initialized)
+ * @param original_sinks MUST be first N tokens from conversation start (typically 4)
+ * @param tail Recent M tokens to preserve (typically 252, total 256 with sinks)
+ * @param n_batch Batch size for re-decoding chunks
+ * @throws std::runtime_error if parameters are invalid or re-decode fails
+ *
+ * Empirical validation: Preserves perplexity within 10% (StreamingLLM paper: 3.7%)
+ * See tests/integration/clear_and_reseed_validation.cpp for full validation.
+ *
+ * IMPORTANT: After calling, KV cache position = sinks.size() + tail.size()
+ * Continue generation with n_past = static_cast<int32_t>(sinks.size() + tail.size())
+ */
+inline void clear_and_reseed(llama_context *ctx,
+                             const std::vector<llama_token> &original_sinks,
+                             const std::vector<llama_token> &tail,
+                             int32_t n_batch) {
+  if (!ctx) {
+    LLOYAL_LOG_DEBUG("[kv::clear_and_reseed] ERROR: null context");
+    throw std::runtime_error("kv::clear_and_reseed - NULL context");
+  }
+
+  if (original_sinks.empty() && tail.empty()) {
+    LLOYAL_LOG_DEBUG("[kv::clear_and_reseed] ERROR: both sinks and tail are empty");
+    throw std::runtime_error("kv::clear_and_reseed - no tokens to reseed");
+  }
+
+  LLOYAL_LOG_DEBUG("[kv::clear_and_reseed] Starting reseed: %zu sinks + %zu tail = %zu total",
+                   original_sinks.size(), tail.size(), original_sinks.size() + tail.size());
+
+  // Get memory handle
+  llama_memory_t mem = llama_get_memory(ctx);
+
+  // Log state before clear
+  llama_pos max_pos_before = llama_memory_seq_pos_max(mem, 0);
+  LLOYAL_LOG_DEBUG("[kv::clear_and_reseed] Before clear: KV cache max_pos=%d", max_pos_before);
+
+  // Clear entire KV cache (simple and reliable)
+  llama_memory_clear(mem, true);
+
+  llama_pos max_pos_after_clear = llama_memory_seq_pos_max(mem, 0);
+  if (max_pos_after_clear != -1) {
+    LLOYAL_LOG_DEBUG("[kv::clear_and_reseed] WARNING: KV cache not empty after clear (max_pos=%d)",
+                     max_pos_after_clear);
+  }
+
+  // Re-decode sinks at position 0
+  if (!original_sinks.empty()) {
+    LLOYAL_LOG_DEBUG("[kv::clear_and_reseed] Re-decoding %zu sinks at position 0", original_sinks.size());
+    lloyal::decoder::decode_tokens(ctx, original_sinks, 0, n_batch);
+  }
+
+  // Re-decode tail at position sinks.size()
+  if (!tail.empty()) {
+    int32_t tail_start_pos = static_cast<int32_t>(original_sinks.size());
+    LLOYAL_LOG_DEBUG("[kv::clear_and_reseed] Re-decoding %zu tail tokens at position %d",
+                     tail.size(), tail_start_pos);
+    lloyal::decoder::decode_tokens(ctx, tail, tail_start_pos, n_batch);
+  }
+
+  // Verify final state
+  llama_pos max_pos_after = llama_memory_seq_pos_max(mem, 0);
+  int32_t expected_pos = static_cast<int32_t>(original_sinks.size() + tail.size()) - 1;
+
+  LLOYAL_LOG_DEBUG("[kv::clear_and_reseed] After reseed: KV cache max_pos=%d (expected %d)",
+                   max_pos_after, expected_pos);
+
+  if (max_pos_after != expected_pos) {
+    LLOYAL_LOG_DEBUG("[kv::clear_and_reseed] WARNING: Unexpected final position (got %d, expected %d)",
+                     max_pos_after, expected_pos);
+  }
+
+  LLOYAL_LOG_DEBUG("[kv::clear_and_reseed] Reseed complete");
+}
+
+// ===== FILE PERSISTENCE OPERATIONS =====
+
+/**
+ * FileData structure returned by read_file
+ * Contains tokens and metadata from file
+ */
+struct FileData {
+  std::vector<llama_token> tokens; // Tokens restored from file
+  size_t bytes_read;               // Total bytes read from file
+};
+
+/**
+ * Write KV state to file with self-describing format
+ *
+ * File format (llama.cpp standard):
+ * - Magic + Version (validation)
+ * - Token count + Token array
+ * - KV state data (cache + logits + embeddings)
+ *
+ * @param ctx llama context
+ * @param seq sequence ID (use 0 for single-sequence mode)
+ * @param filepath Destination file path
+ * @param tokens Token IDs to include in file
+ * @return bytes written, or 0 on failure
+ *
+ * Use cases:
+ * - Exit/resume app: kv::write_file(ctx, 0, "app_state.llama", tokens)
+ * - Persistent pages: kv::write_file(ctx, 0, "fork_42.llama", fork_tokens)
+ * - Context sharing: Write → upload to S3 → share signed URL
+ */
+inline size_t write_file(llama_context *ctx, llama_seq_id seq,
+                         const std::string &filepath,
+                         const std::vector<llama_token> &tokens) {
+  if (!ctx) {
+    LLOYAL_LOG_DEBUG("[kv::write_file] ERROR: null context");
+    return 0;
+  }
+
+  if (filepath.empty()) {
+    LLOYAL_LOG_DEBUG("[kv::write_file] ERROR: empty filepath");
+    return 0;
+  }
+
+  // Guard: Don't write if KV cache is empty
+  llama_memory_t mem = llama_get_memory(ctx);
+  llama_pos max_pos = llama_memory_seq_pos_max(mem, seq);
+  if (max_pos < 0) {
+    LLOYAL_LOG_DEBUG(
+        "[kv::write_file] WARNING: KV cache is empty - skipping write");
+    return 0;
+  }
+
+  // Delegate to llama.cpp's session file writer
+  // Note: llama.cpp signature is (ctx, filepath, seq_id, tokens, n_tokens)
+  size_t bytes = llama_state_seq_save_file(ctx, filepath.c_str(), seq,
+                                            tokens.data(), tokens.size());
+
+  if (bytes > 0) {
+    LLOYAL_LOG_DEBUG("[kv::write_file] Wrote %s: %zu bytes (%.1f MB), %zu "
+                     "tokens",
+                     filepath.c_str(), bytes, bytes / 1024.0 / 1024.0,
+                     tokens.size());
+  } else {
+    LLOYAL_LOG_DEBUG("[kv::write_file] FAILED to write %s", filepath.c_str());
+  }
+
+  return bytes;
+}
+
+/**
+ * Read KV state from file
+ *
+ * Validates magic + version automatically.
+ * Returns structured data (no output parameters).
+ *
+ * @param ctx llama context
+ * @param seq sequence ID (use 0 for single-sequence mode)
+ * @param filepath Source file path
+ * @return FileData with tokens and bytes_read
+ * @throws std::runtime_error if validation fails or file doesn't exist
+ *
+ * Example usage:
+ * ```cpp
+ * auto data = lloyal::kv::read_file(ctx, 0, "app_state.llama");
+ * // Use data.tokens for reconstruction/validation
+ * // KV cache is automatically restored
+ * ```
+ */
+inline FileData read_file(llama_context *ctx, llama_seq_id seq,
+                          const std::string &filepath) {
+  if (!ctx) {
+    throw std::runtime_error("[kv::read_file] null context");
+  }
+
+  if (filepath.empty()) {
+    throw std::runtime_error("[kv::read_file] empty filepath");
+  }
+
+  // Get model's n_ctx to allocate token buffer
+  const uint32_t n_ctx = llama_n_ctx(ctx);
+
+  std::vector<llama_token> tokens;
+  tokens.resize(n_ctx); // Allocate buffer with capacity
+
+  size_t token_count = 0;
+  // Note: llama.cpp signature is (ctx, filepath, seq_id, tokens_out, capacity, count_out)
+  size_t bytes =
+      llama_state_seq_load_file(ctx, filepath.c_str(), seq, tokens.data(),
+                                 tokens.size(), &token_count);
+
+  if (bytes == 0) {
+    throw std::runtime_error("[kv::read_file] failed to load from " +
+                             filepath);
+  }
+
+  tokens.resize(token_count);
+
+  LLOYAL_LOG_DEBUG("[kv::read_file] Loaded %s: %zu bytes (%.1f MB), %zu tokens",
+                   filepath.c_str(), bytes, bytes / 1024.0 / 1024.0,
+                   token_count);
+
+  return FileData{std::move(tokens), bytes};
 }
 
 } // namespace lloyal::kv

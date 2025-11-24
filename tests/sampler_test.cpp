@@ -44,7 +44,7 @@ TEST_CASE("Sampler: null vocab guard") {
   resetStubConfig();
 
   llama_context ctx{};
-  CHECK_THROWS(greedy(&ctx, nullptr));
+  CHECK_THROWS(greedy(&ctx, static_cast<const llama_vocab*>(nullptr)));
 }
 
 TEST_CASE("Sampler: null logits guard") {
@@ -119,7 +119,7 @@ TEST_CASE("Sampler: sample_with_params - null vocab guard") {
   llama_context ctx{};
   SamplingParams params;
 
-  CHECK_THROWS(sample_with_params(&ctx, nullptr, params, nullptr));
+  CHECK_THROWS(sample_with_params(&ctx, static_cast<const llama_vocab*>(nullptr), params, nullptr));
 }
 
 TEST_CASE("Sampler: sample_with_params - null logits guard") {
@@ -199,3 +199,76 @@ TEST_CASE("Sampler: sample_with_params - with penalties") {
 // integration/Sampler.cpp Stubs cannot meaningfully test grammar sampling
 // because llama_sampler_apply() logic requires actual parser state, which is
 // too complex to mock accurately.
+
+// ===== MODEL-ACCEPTING OVERLOAD TESTS =====
+
+TEST_CASE("Sampler: greedy(ctx, model) null model guard") {
+  resetStubConfig();
+
+  llama_context ctx{};
+
+  CHECK_THROWS(greedy(&ctx, static_cast<llama_model *>(nullptr)));
+}
+
+TEST_CASE("Sampler: greedy(ctx, model) successful") {
+  resetStubConfig();
+
+  llama_context ctx{};
+  llama_model model{};
+
+  // Configure stub with known logit distribution
+  llamaStubConfig().logits = {0.1f, 0.3f, 0.8f, 0.2f, 0.4f};
+  llamaStubConfig().vocab_size_value = 5;
+
+  llama_token result = greedy(&ctx, &model);
+  CHECK(result == 2); // Index 2 has highest score (0.8)
+}
+
+TEST_CASE("Sampler: sample_with_params(ctx, model, ...) null model guard") {
+  resetStubConfig();
+
+  llama_context ctx{};
+  SamplingParams params;
+
+  CHECK_THROWS(sample_with_params(&ctx, static_cast<llama_model *>(nullptr),
+                                   params, nullptr));
+}
+
+TEST_CASE("Sampler: sample_with_params(ctx, model, ...) successful") {
+  resetStubConfig();
+
+  llama_context ctx{};
+  llama_model model{};
+
+  llamaStubConfig().logits = {0.1f, 0.3f, 0.8f, 0.2f, 0.4f};
+  llamaStubConfig().vocab_size_value = 5;
+  llamaStubConfig().sample_result = 2;
+
+  SamplingParams params;
+  params.temperature = 0.0f; // Greedy mode
+  params.seed = 42;
+
+  llama_token result = sample_with_params(&ctx, &model, params, nullptr);
+  CHECK(result == 2); // Should match stub sample_result
+}
+
+TEST_CASE("Sampler: sample_with_params(ctx, model, ...) with grammar "
+          "sampler") {
+  resetStubConfig();
+
+  llama_context ctx{};
+  llama_model model{};
+
+  llamaStubConfig().logits = {0.1f, 0.3f, 0.8f, 0.2f, 0.4f};
+  llamaStubConfig().vocab_size_value = 5;
+  llamaStubConfig().sample_result = 4;
+
+  SamplingParams params;
+  params.temperature = 0.8f;
+  params.top_k = 3;
+
+  // Note: Grammar sampler not fully testable with stubs (see line 199 comment)
+  // Just verify overload accepts grammar parameter
+  llama_token result = sample_with_params(&ctx, &model, params, nullptr);
+  CHECK(result == 4);
+}
