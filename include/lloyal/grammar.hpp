@@ -2,7 +2,9 @@
 
 #include "common.hpp"
 #include "json-schema-to-grammar.hpp"
-#include <nlohmann/json.hpp>
+#include "tokenizer.hpp"
+#include <llama/llama.h>
+#include <lloyal/nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
 
@@ -74,6 +76,60 @@ inline std::string from_json_schema(const std::string &schema_json) {
     LLOYAL_LOG_DEBUG("[grammar::from_json_schema] ERROR: %s", errorMsg.c_str());
     throw std::runtime_error(errorMsg);
   }
+}
+
+// ===== SAMPLER INITIALIZATION =====
+
+/**
+ * Initialize a grammar sampler from GBNF grammar string
+ *
+ * Convenience wrapper that handles vocab extraction from model.
+ *
+ * @param model Llama model (for vocab extraction)
+ * @param grammar_str GBNF grammar string (from from_json_schema or hand-written)
+ * @param root_rule Root rule name (default: "root")
+ * @return Initialized grammar sampler, or nullptr on failure
+ *
+ * OWNERSHIP: Caller owns returned sampler and must call llama_sampler_free()
+ *
+ * EXAMPLE:
+ *   std::string gbnf = grammar::from_json_schema(schema);
+ *   llama_sampler* sampler = grammar::init_sampler(model, gbnf);
+ *   // ... use sampler ...
+ *   llama_sampler_free(sampler);
+ */
+inline llama_sampler *init_sampler(const llama_model *model,
+                                   const std::string &grammar_str,
+                                   const std::string &root_rule = "root") {
+  if (!model) {
+    LLOYAL_LOG_DEBUG("[grammar::init_sampler] ERROR: model is null");
+    return nullptr;
+  }
+
+  if (grammar_str.empty()) {
+    LLOYAL_LOG_DEBUG("[grammar::init_sampler] ERROR: grammar_str is empty");
+    return nullptr;
+  }
+
+  const llama_vocab *vocab = tokenizer::get_vocab(model);
+  if (!vocab) {
+    LLOYAL_LOG_DEBUG("[grammar::init_sampler] ERROR: get_vocab returned null");
+    return nullptr;
+  }
+
+  LLOYAL_LOG_DEBUG("[grammar::init_sampler] Initializing grammar sampler "
+                   "(grammar: %zu bytes, root: %s)",
+                   grammar_str.size(), root_rule.c_str());
+
+  llama_sampler *sampler =
+      llama_sampler_init_grammar(vocab, grammar_str.c_str(), root_rule.c_str());
+
+  if (!sampler) {
+    LLOYAL_LOG_DEBUG("[grammar::init_sampler] ERROR: "
+                     "llama_sampler_init_grammar returned null");
+  }
+
+  return sampler;
 }
 
 } // namespace lloyal::grammar

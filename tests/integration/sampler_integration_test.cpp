@@ -3,6 +3,7 @@
 #include <doctest/doctest.h>
 #include <llama/llama.h>
 #include <lloyal/decoder.hpp>
+#include <lloyal/grammar.hpp>
 #include <lloyal/model_registry.hpp>
 #include <lloyal/sampler.hpp>
 #include <lloyal/tokenizer.hpp>
@@ -272,7 +273,7 @@ TEST_CASE("Integration: llama_sampler_apply constrains logits with grammar "
   // Create simple grammar (only allows 'a' or 'b' characters)
   const char *grammar_str = "root ::= [ab]+";
   llama_sampler *grammar_sampler =
-      llama_sampler_init_grammar(vocab, grammar_str, "root");
+      grammar::init_sampler(model.get(), grammar_str);
   REQUIRE(grammar_sampler != nullptr);
 
   // Get logits
@@ -344,7 +345,7 @@ TEST_CASE("Integration: llama_sampler_accept advances grammar state (Part 2)") {
   // Create grammar
   const char *grammar_str = "root ::= \"a\" \"b\" \"c\""; // Fixed sequence
   llama_sampler *grammar_sampler =
-      llama_sampler_init_grammar(vocab, grammar_str, "root");
+      grammar::init_sampler(model.get(), grammar_str);
   REQUIRE(grammar_sampler != nullptr);
 
   // Find token IDs for 'a', 'b', 'c'
@@ -429,7 +430,7 @@ TEST_CASE(
       "ws ::= [ \\t\\n]*";
 
   llama_sampler *grammar_sampler =
-      llama_sampler_init_grammar(vocab, json_grammar, "root");
+      grammar::init_sampler(model.get(), json_grammar);
   REQUIRE(grammar_sampler != nullptr);
 
   // Test parameterized sampling WITH grammar (exercises all Part 2 primitives)
