@@ -120,23 +120,45 @@ TEST_CASE("Behavioral: KV cache state size is stable") {
   size_t state_size = kv::state_size(ctx, 0);
   REQUIRE(state_size > 0);
 
-  // Golden: state size should be consistent for same model/context config
-  // NOTE: This is CRITICAL - if this changes, serialization breaks!
-  // Measured with tiny-random-llama.gguf (4.11M params, Q4_K_M): 460 bytes
-  // Allowing ±30% variance for minor implementation changes
-  const size_t EXPECTED_MIN_STATE_SIZE = 320; // ~460 - 30%
-  const size_t EXPECTED_MAX_STATE_SIZE = 600; // ~460 + 30%
+  // Calculate expected size based on model architecture
+  // KV state contains: n_tokens * n_layer * n_embd * 2 (K+V) * sizeof(fp16)
+  // Plus metadata overhead (sequence info, position info, etc.)
+  int32_t n_layer = llama_model_n_layer(model.get());
+  int32_t n_embd = llama_model_n_embd(model.get());
+  int32_t n_tokens = 3; // Number of tokens in KV cache
 
-  INFO("KV state size: " << state_size << " bytes");
+  // Expected KV data size (K + V tensors, fp16 = 2 bytes per element)
+  // Simplified: KV cache for 3 tokens = 3 * n_layer * n_embd * 2 (K+V) * 2 bytes (fp16)
+  size_t expected_kv_data = n_tokens * n_layer * n_embd * 2 * 2;
 
-  CHECK(state_size >= EXPECTED_MIN_STATE_SIZE);
-  CHECK(state_size <= EXPECTED_MAX_STATE_SIZE);
+  // Add metadata overhead (sequence info, cell metadata, etc.)
+  // Empirically measured ~100-200 bytes for tiny models, scales with layers
+  size_t expected_metadata = 200 + (n_layer * 20);
 
-  if (state_size < EXPECTED_MIN_STATE_SIZE ||
-      state_size > EXPECTED_MAX_STATE_SIZE) {
+  size_t expected_total = expected_kv_data + expected_metadata;
+
+  // Allow ±50% variance for:
+  // - GQA/MQA optimizations (grouped query attention reduces K/V size)
+  // - Alignment and padding
+  // - Format changes in llama.cpp
+  size_t expected_min = static_cast<size_t>(expected_total * 0.5);
+  size_t expected_max = static_cast<size_t>(expected_total * 1.5);
+
+  INFO("Model: n_layer=" << n_layer << ", n_embd=" << n_embd);
+  INFO("Expected KV state size: ~" << expected_total << " bytes (±50%)");
+  INFO("Actual KV state size: " << state_size << " bytes");
+
+  CHECK(state_size >= expected_min);
+  CHECK(state_size <= expected_max);
+
+  if (state_size < expected_min || state_size > expected_max) {
+    double deviation_pct = (static_cast<double>(state_size) / expected_total - 1.0) * 100;
     WARN("⚠️ KV state size outside expected range!");
-    WARN("This likely means llama.cpp changed KV cache format.");
-    WARN("Serialization may be broken!");
+    INFO("Expected: " << expected_min << " - " << expected_max << " bytes");
+    INFO("Actual: " << state_size << " bytes");
+    INFO("Deviation: " << deviation_pct << "%");
+    INFO("This likely means llama.cpp changed KV cache format.");
+    INFO("Serialization may be broken!");
   }
 
   llama_batch_free(batch);

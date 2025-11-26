@@ -97,6 +97,7 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
     integration/clear_and_reseed_test.cpp
     integration/rope_position_invariant_test.cpp
     integration/chat_template_integration_test.cpp
+    integration/kv_file_persistence_test.cpp
   )
 
   # Create llama/ subdirectory and symlink headers so #include <llama/llama.h> works
