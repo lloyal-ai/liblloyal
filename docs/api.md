@@ -32,6 +32,7 @@
 - [KV Cache](#kv-cache)
 - [Chat Template](#chat-template)
 - [Grammar](#grammar)
+- [Embedding](#embedding)
 - [Helpers](#helpers)
 
 ---
@@ -648,6 +649,246 @@ auto vocab = llama_model_get_vocab(model);
 llama_sampler* grammar_sampler = llama_sampler_init_grammar(vocab, gbnf.c_str(), "root");
 llama_token next = sampler::sample_with_params(ctx, model, params, grammar_sampler);
 llama_sampler_free(grammar_sampler);
+```
+
+---
+
+## Embedding
+
+**Header:** `lloyal/embedding.hpp`
+
+Extract and compare dense vector embeddings from models with pooling support.
+
+### Model Capability Checks
+
+#### `has_embeddings()`
+```cpp
+bool has_embeddings(const llama_model* model);
+```
+
+Check if model supports embedding extraction.
+
+**Returns:** `true` if model has non-zero embedding dimension
+
+---
+
+#### `dimension()`
+```cpp
+int32_t dimension(const llama_model* model);
+```
+
+Get embedding vector dimension (model's hidden size).
+
+**Returns:** Embedding dimension, or `0` if model is null
+
+**Common Dimensions:**
+- 768 (BERT-base, nomic-embed-text)
+- 1024 (BERT-large)
+- 2048 (SmolLM2)
+- 4096 (Llama-7B)
+
+---
+
+### Context Capability Checks
+
+#### `has_pooling()`
+```cpp
+bool has_pooling(llama_context* ctx);
+```
+
+Check if context has pooling enabled (required for meaningful embeddings).
+
+**Returns:** `true` if pooling type is not `LLAMA_POOLING_TYPE_NONE`
+
+---
+
+#### `pooling_type()`
+```cpp
+int32_t pooling_type(llama_context* ctx);
+```
+
+Get context's pooling strategy.
+
+**Returns:** One of:
+- `LLAMA_POOLING_TYPE_NONE` (0) - No pooling
+- `LLAMA_POOLING_TYPE_MEAN` (1) - Mean pooling (recommended)
+- `LLAMA_POOLING_TYPE_CLS` (2) - CLS token pooling
+- `LLAMA_POOLING_TYPE_LAST` (3) - Last token pooling
+
+---
+
+### Embedding Extraction
+
+#### `Normalize` enum
+```cpp
+enum class Normalize : int32_t {
+    None = 0,  // Raw embeddings
+    L2 = 1,    // L2-normalized (unit length)
+};
+```
+
+Normalization mode for extracted embeddings.
+
+---
+
+#### `get()`
+```cpp
+std::vector<float> get(
+    llama_context* ctx,
+    Normalize normalize = Normalize::L2
+);
+```
+
+Extract pooled embedding from context (sequence 0).
+
+**Parameters:**
+- `ctx` - Llama context (must have decoded tokens)
+- `normalize` - Normalization mode (default: L2)
+
+**Returns:** Embedding vector of size `dimension(model)`
+
+**Throws:**
+- `std::invalid_argument` if context is null
+- `std::runtime_error` if embeddings unavailable
+
+**Example:**
+```cpp
+// Create context with pooling enabled
+auto ctx_params = llama_context_default_params();
+ctx_params.embeddings = true;
+ctx_params.pooling_type = LLAMA_POOLING_TYPE_MEAN;
+llama_context* ctx = llama_init_from_model(model, ctx_params);
+
+// Tokenize and decode
+auto tokens = tokenizer::tokenize(model, "Hello world");
+decoder::decode_tokens(ctx, tokens, 0, 512);
+
+// Extract L2-normalized embedding
+auto emb = embedding::get(ctx);  // Default: L2 normalized
+```
+
+---
+
+#### `get_seq()`
+```cpp
+std::vector<float> get_seq(
+    llama_context* ctx,
+    llama_seq_id seq,
+    Normalize normalize = Normalize::L2
+);
+```
+
+Extract pooled embedding for specific sequence.
+
+**Use Case:** Multi-sequence batch embedding where each sequence represents a different text.
+
+---
+
+#### `get_ith()`
+```cpp
+std::vector<float> get_ith(
+    llama_context* ctx,
+    int32_t token_idx,
+    Normalize normalize = Normalize::L2
+);
+```
+
+Extract embedding for specific token position (no pooling).
+
+**Use Case:** Token-level analysis, attention visualization.
+
+---
+
+### Similarity Computation
+
+#### `cosine_similarity()`
+```cpp
+float cosine_similarity(
+    const std::vector<float>& a,
+    const std::vector<float>& b
+);
+```
+
+Compute cosine similarity between two embedding vectors.
+
+**Parameters:**
+- `a`, `b` - Embedding vectors (should be same dimension)
+
+**Returns:** Similarity score in range `[-1.0, 1.0]`:
+- `1.0` = identical direction
+- `0.0` = orthogonal (unrelated)
+- `-1.0` = opposite direction
+
+**Throws:** `std::invalid_argument` if dimensions mismatch
+
+**Performance Note:** For L2-normalized vectors, cosine similarity reduces to dot product (no sqrt needed).
+
+**Example:**
+```cpp
+// Embed two sentences
+auto tokens1 = tokenizer::tokenize(model, "The cat sat on the mat");
+decoder::decode_tokens(ctx, tokens1, 0, 512);
+auto emb1 = embedding::get(ctx);
+
+kv::clear_all(ctx);
+
+auto tokens2 = tokenizer::tokenize(model, "A cat rested on the rug");
+decoder::decode_tokens(ctx, tokens2, 0, 512);
+auto emb2 = embedding::get(ctx);
+
+// Compare similarity
+float sim = embedding::cosine_similarity(emb1, emb2);
+// sim > 0.7 for semantically similar sentences
+```
+
+---
+
+### Complete Embedding Workflow
+
+```cpp
+#include <lloyal/embedding.hpp>
+#include <lloyal/tokenizer.hpp>
+#include <lloyal/decoder.hpp>
+#include <lloyal/kv.hpp>
+
+// 1. Load model (any LLM works, but embedding models are better)
+auto model = ModelRegistry::acquire("nomic-embed-text.gguf", params);
+
+// 2. Check embedding support
+if (!embedding::has_embeddings(model.get())) {
+    throw std::runtime_error("Model doesn't support embeddings");
+}
+int32_t dim = embedding::dimension(model.get());
+
+// 3. Create context with pooling
+auto ctx_params = llama_context_default_params();
+ctx_params.embeddings = true;
+ctx_params.pooling_type = LLAMA_POOLING_TYPE_MEAN;
+llama_context* ctx = llama_init_from_model(model.get(), ctx_params);
+
+// 4. Embed documents
+std::vector<std::vector<float>> doc_embeddings;
+for (const auto& doc : documents) {
+    kv::clear_all(ctx);
+    auto tokens = tokenizer::tokenize(model.get(), doc);
+    decoder::decode_tokens(ctx, tokens, 0, 512);
+    doc_embeddings.push_back(embedding::get(ctx));
+}
+
+// 5. Find most similar to query
+auto query_tokens = tokenizer::tokenize(model.get(), query);
+decoder::decode_tokens(ctx, query_tokens, 0, 512);
+auto query_emb = embedding::get(ctx);
+
+float best_sim = -1.0f;
+size_t best_idx = 0;
+for (size_t i = 0; i < doc_embeddings.size(); ++i) {
+    float sim = embedding::cosine_similarity(query_emb, doc_embeddings[i]);
+    if (sim > best_sim) {
+        best_sim = sim;
+        best_idx = i;
+    }
+}
 ```
 
 ---

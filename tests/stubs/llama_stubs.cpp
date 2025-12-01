@@ -484,4 +484,38 @@ const llama_model *llama_get_model(const llama_context * /*ctx*/) {
   return reinterpret_cast<const llama_model *>(0xB000); // Stub pointer
 }
 
+// ===== EMBEDDING OPERATIONS =====
+
+int32_t llama_model_n_embd(const llama_model * /*model*/) {
+  return g_stub_config.n_embd;
+}
+
+int32_t llama_pooling_type(const llama_context * /*ctx*/) {
+  return g_stub_config.pooling_type;
+}
+
+float *llama_get_embeddings(llama_context * /*ctx*/) {
+  if (!g_stub_config.embeddings_available ||
+      g_stub_config.embeddings.empty()) {
+    return nullptr;
+  }
+  return g_stub_config.embeddings.data();
+}
+
+float *llama_get_embeddings_seq(llama_context * /*ctx*/, llama_seq_id /*seq*/) {
+  if (!g_stub_config.embeddings_available ||
+      g_stub_config.embeddings.empty()) {
+    return nullptr;
+  }
+  return g_stub_config.embeddings.data();
+}
+
+float *llama_get_embeddings_ith(llama_context * /*ctx*/, int32_t /*idx*/) {
+  if (!g_stub_config.embeddings_available ||
+      g_stub_config.embeddings.empty()) {
+    return nullptr;
+  }
+  return g_stub_config.embeddings.data();
+}
+
 } // extern "C"
