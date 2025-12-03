@@ -186,7 +186,20 @@ extern "C" {
 
     // Model introspection (for vendored common_sampler)
     const llama_model* llama_get_model(const llama_context* ctx);
+
+    // Embedding operations
+    int32_t llama_model_n_embd(const llama_model* model);
+    int32_t llama_pooling_type(const llama_context* ctx);
+    float* llama_get_embeddings(llama_context* ctx);
+    float* llama_get_embeddings_seq(llama_context* ctx, llama_seq_id seq);
+    float* llama_get_embeddings_ith(llama_context* ctx, int32_t idx);
 }
+
+// Pooling type constants matching llama.cpp
+#define LLAMA_POOLING_TYPE_NONE 0
+#define LLAMA_POOLING_TYPE_MEAN 1
+#define LLAMA_POOLING_TYPE_CLS 2
+#define LLAMA_POOLING_TYPE_LAST 3
 
 // Test control structure for configuring stub behavior
 struct LlamaStubConfig {
@@ -244,6 +257,12 @@ struct LlamaStubConfig {
     size_t file_read_bytes = 0;                // Bytes read by state_seq_load_file
     size_t file_token_count = 0;               // Tokens in file
     bool file_operation_succeeds = true;       // Controls if file ops succeed
+
+    // Embedding operations
+    int32_t n_embd = 0;                        // Embedding dimension (0 = no embeddings)
+    int32_t pooling_type = LLAMA_POOLING_TYPE_NONE;  // Pooling type
+    std::vector<float> embeddings;             // Embedding values to return
+    bool embeddings_available = false;         // Controls if llama_get_embeddings returns valid ptr
 };
 
 // Global stub configuration accessor

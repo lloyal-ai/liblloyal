@@ -100,6 +100,27 @@ jobs:
           echo "✓ Using cached tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
         fi
 
+        # Download nomic-embed-text-v1.5 (67MB) for embedding tests
+        if [ ! -f fixtures/nomic-embed-text-v1.5.Q4_K_M.gguf ]; then
+          echo "Downloading nomic-embed-text-v1.5.Q4_K_M.gguf (67MB)..."
+          curl -fsSL --retry 3 --retry-delay 2 \
+            "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q4_K_M.gguf" \
+            -o fixtures/nomic-embed-text-v1.5.Q4_K_M.gguf
+
+          # Verify GGUF magic bytes
+          echo "Verifying nomic-embed-text-v1.5.Q4_K_M.gguf..."
+          if ! head -c 4 fixtures/nomic-embed-text-v1.5.Q4_K_M.gguf | grep -q "GGUF"; then
+            echo "ERROR: Downloaded file is not a valid GGUF file"
+            echo "File header:"
+            head -c 32 fixtures/nomic-embed-text-v1.5.Q4_K_M.gguf | xxd
+            rm -f fixtures/nomic-embed-text-v1.5.Q4_K_M.gguf
+            exit 1
+          fi
+          echo "✓ nomic-embed-text-v1.5.Q4_K_M.gguf verified"
+        else
+          echo "✓ Using cached nomic-embed-text-v1.5.Q4_K_M.gguf"
+        fi
+
         echo "All test models ready"
 
     - name: Configure CMake for integration tests
@@ -137,6 +158,19 @@ jobs:
         # Run only tests that require coherent models
         ./build_integration/IntegrationRunner --success \
           --test-case="Empirical:*,RoPE Invariant:*"
+
+    - name: Run integration tests (embedding model)
+      working-directory: tests
+      env:
+        LLAMA_TEST_MODEL: ${{ github.workspace }}/tests/fixtures/tiny-random-llama.gguf
+        LLAMA_EMBED_MODEL: ${{ github.workspace }}/tests/fixtures/nomic-embed-text-v1.5.Q4_K_M.gguf
+      run: |
+        echo "Running embedding tests with nomic-embed-text-v1.5..."
+        echo "Embed model path: $LLAMA_EMBED_MODEL"
+        ls -lh "$LLAMA_EMBED_MODEL"
+        # Run embedding-specific tests
+        ./build_integration/IntegrationRunner --success \
+          --test-case="*Embedding*"
 
     - name: Upload test results
       if: always()
