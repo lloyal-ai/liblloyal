@@ -167,6 +167,14 @@ inline void encode(llama_context *ctx, const llama_token *tokens,
     throw std::runtime_error("decoder::encode - Invalid token array");
   }
 
+  if (n_tokens > n_batch) {
+    LLOYAL_LOG_DEBUG("[decoder::encode] ERROR: n_tokens (%d) > n_batch (%d)",
+                     n_tokens, n_batch);
+    throw std::runtime_error(
+        "decoder::encode - token count exceeds batch size (truncation not "
+        "supported, increase n_batch or reduce input length)");
+  }
+
   // Initialize batch - single sequence
   llama_batch batch = llama_batch_init(n_batch, 0, 1);
   detail::BatchGuard batch_guard(batch);
@@ -175,7 +183,7 @@ inline void encode(llama_context *ctx, const llama_token *tokens,
   lloyal::batch_clear(batch);
 
   // Add ALL tokens with logits=true (required for embedding extraction)
-  for (int32_t i = 0; i < n_tokens && i < n_batch; ++i) {
+  for (int32_t i = 0; i < n_tokens; ++i) {
     lloyal::batch_add(batch, tokens[i], i, {0}, true, n_batch);
   }
 
