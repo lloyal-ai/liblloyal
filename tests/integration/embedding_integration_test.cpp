@@ -46,6 +46,12 @@ struct LlamaBackendGuard {
   ~LlamaBackendGuard() { llama_backend_free(); }
 };
 
+struct ContextGuard {
+  llama_context *ctx;
+  explicit ContextGuard(llama_context *c) : ctx(c) {}
+  ~ContextGuard() { if (ctx) llama_free(ctx); }
+};
+
 // ===== MODEL CAPABILITY TESTS =====
 
 TEST_CASE("Embedding Integration: has_embeddings returns true for LLM models") {
@@ -104,6 +110,7 @@ TEST_CASE("Embedding Integration: context without pooling reports NONE") {
 
   llama_context *ctx = llama_init_from_model(model.get(), ctx_params);
   REQUIRE(ctx != nullptr);
+  ContextGuard ctx_guard(ctx);
 
   // Without explicit pooling, should report no pooling
   bool has_pool = embedding::has_pooling(ctx);
@@ -115,8 +122,6 @@ TEST_CASE("Embedding Integration: context without pooling reports NONE") {
   // Note: Default pooling behavior varies by llama.cpp version
   // Just verify we can query the type without crash
   CHECK(pool_type >= 0);
-
-  llama_free(ctx);
 }
 
 // ===== COSINE SIMILARITY =====
@@ -185,6 +190,52 @@ TEST_CASE("Embedding Integration: L2 normalization produces unit vectors") {
   CHECK(vec[1] == doctest::Approx(0.8f).epsilon(0.0001));
 }
 
+// ===== RUNTIME POOLING TYPE CAST (production use-case) =====
+
+TEST_CASE("Embedding Integration: context creation with runtime pooling type") {
+  REQUIRE_EMBED_MODEL();
+  LlamaBackendGuard backend;
+
+  auto model_params = llama_model_default_params();
+  model_params.n_gpu_layers = 0;
+
+  auto model = ModelRegistry::acquire(EMBED_MODEL, model_params);
+  REQUIRE(model != nullptr);
+
+  // Simulate runtime value from user config (e.g., from JS/TS options)
+  // This tests the production use-case where pooling_type comes as an integer
+  int32_t pooling_type_value = 1;  // LLAMA_POOLING_TYPE_MEAN
+
+  auto ctx_params = llama_context_default_params();
+  ctx_params.n_ctx = 512;
+  ctx_params.n_batch = 512;
+  ctx_params.embeddings = true;
+
+  // CRITICAL: This cast requires 'enum' keyword due to llama.cpp name collision
+  // llama_pooling_type is both an enum type AND a function name
+  // Without 'enum', the compiler thinks we're casting to the function type
+  ctx_params.pooling_type = static_cast<enum llama_pooling_type>(pooling_type_value);
+
+  llama_context *ctx = llama_init_from_model(model.get(), ctx_params);
+  REQUIRE(ctx != nullptr);
+  ContextGuard ctx_guard(ctx);
+
+  // Verify the pooling type was set correctly
+  CHECK(embedding::has_pooling(ctx) == true);
+  CHECK(embedding::pooling_type(ctx) == LLAMA_POOLING_TYPE_MEAN);
+
+  // Verify embeddings work with runtime-configured pooling
+  auto vocab = llama_model_get_vocab(model.get());
+  auto tokens = tokenizer::tokenize(vocab, "Test runtime pooling", true, true);
+  REQUIRE_FALSE(tokens.empty());
+
+  kv::clear_all(ctx);
+  decoder::encode(ctx, tokens, 512);
+
+  auto emb = embedding::get(ctx, embedding::Normalize::L2);
+  CHECK(emb.size() == static_cast<size_t>(embedding::dimension(model.get())));
+}
+
 // ===== EMBEDDING MODEL TESTS (require dedicated embedding model) =====
 
 TEST_CASE("Embedding Integration: extract embeddings from embedding model") {
@@ -206,6 +257,7 @@ TEST_CASE("Embedding Integration: extract embeddings from embedding model") {
 
   llama_context *ctx = llama_init_from_model(model.get(), ctx_params);
   REQUIRE(ctx != nullptr);
+  ContextGuard ctx_guard(ctx);
 
   // Verify pooling is enabled
   CHECK(embedding::has_pooling(ctx) == true);
@@ -233,8 +285,6 @@ TEST_CASE("Embedding Integration: extract embeddings from embedding model") {
   }
   float norm = std::sqrt(norm_sq);
   CHECK(norm == doctest::Approx(1.0f).epsilon(0.01));
-
-  llama_free(ctx);
 }
 
 TEST_CASE(
@@ -256,6 +306,7 @@ TEST_CASE(
 
   llama_context *ctx = llama_init_from_model(model.get(), ctx_params);
   REQUIRE(ctx != nullptr);
+  ContextGuard ctx_guard(ctx);
 
   auto vocab = llama_model_get_vocab(model.get());
 
@@ -289,6 +340,4 @@ TEST_CASE(
 
   // Similar sentences should be reasonably similar (>0.5 for good embedding models)
   CHECK(sim_similar > 0.5f);
-
-  llama_free(ctx);
 }
