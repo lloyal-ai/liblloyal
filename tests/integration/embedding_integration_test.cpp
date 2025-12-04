@@ -86,8 +86,9 @@ TEST_CASE("Embedding Integration: dimension returns model hidden size") {
   int32_t dim = embedding::dimension(model.get());
 
   // Common dimensions: 768 (BERT), 1024, 2048 (SmolLM2), 4096 (Llama)
+  // Note: CI uses tiny-random-llama.gguf with dim=32 for fast testing
   INFO("Embedding dimension: " << dim);
-  CHECK(dim >= 256);  // Minimum reasonable hidden size
+  CHECK(dim > 0);     // Must have positive dimension
   CHECK(dim <= 8192); // Maximum reasonable hidden size
 }
 
