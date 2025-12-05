@@ -18,9 +18,11 @@
 ### Core Abstractions
 
 - **`tokenizer.hpp`**: Tokenization/detokenization with special token handling
-- **`decoder.hpp`**: Token-to-text streaming decoding
+- **`decoder.hpp`**: Token-to-text streaming decoding and embedding encoding
+- **`logits.hpp`**: Zero-copy logits access with lifetime safety checks
 - **`sampler.hpp`**: Advanced sampling with 52 tunable parameters
 - **`kv.hpp`**: KV cache management (operations, defragmentation, compression)
+- **`embedding.hpp`**: Embedding extraction with pooling and L2 normalization
 - **`chat_template.hpp`**: Jinja2-based chat template formatting
 - **`grammar.hpp`**: Grammar-constrained generation with JSON schema support
 - **`model_registry.hpp`**: Model metadata and feature detection
@@ -35,17 +37,29 @@
 
 ```cpp
 #include <lloyal/tokenizer.hpp>
+#include <lloyal/logits.hpp>
 #include <lloyal/sampler.hpp>
 #include <lloyal/kv.hpp>
+#include <lloyal/embedding.hpp>
+#include <lloyal/decoder.hpp>
 
 // Tokenize text
 auto tokens = lloyal::tokenizer::tokenize(vocab, "Hello world", true, false);
+
+// Get logits with safety checks (zero-copy pointer, valid until next decode)
+float* logits = lloyal::logits::get(ctx);  // throws if null/unavailable
 
 // Sample next token
 int token_id = lloyal::sampler::sample(ctx, vocab, params);
 
 // Manage KV cache
 lloyal::kv::clear_range(ctx, 0, 100, 512, 1024);
+
+// Extract embeddings (requires context with embeddings=true, pooling enabled)
+lloyal::kv::clear_all(embed_ctx);
+lloyal::decoder::encode(embed_ctx, tokens, 512);
+auto emb = lloyal::embedding::get(embed_ctx, lloyal::embedding::Normalize::L2);
+float similarity = lloyal::embedding::cosine_similarity(emb1, emb2);
 ```
 
 ## Integration

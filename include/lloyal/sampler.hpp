@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.hpp"
+#include "logits.hpp"
 #include "tokenizer.hpp"
 #include <cstdint>
 #include <ctime>
@@ -118,13 +119,8 @@ inline llama_token greedy(llama_context *ctx, const llama_vocab *vocab) {
 
   // Get last-step logits (index -1)
   // Per llama.cpp maintainers: only works if logits=true was set for that step
-  // in batch
-  const float *logits = llama_get_logits_ith(ctx, -1);
-  if (!logits) {
-    LLOYAL_LOG_DEBUG("[sampler::greedy] ERROR: Failed to get logits (ensure "
-                     "batch had logits=true)");
-    throw std::runtime_error("sampler::greedy - Failed to get logits");
-  }
+  // lloyal::logits::get() handles null checking and throws descriptive errors
+  const float *logits = lloyal::logits::get(ctx, -1);
 
   // Get vocabulary size
   const int n_vocab = llama_vocab_n_tokens(vocab);
@@ -217,11 +213,8 @@ inline llama_token sample_with_params(llama_context *ctx,
                      "using grammar-constrained sampling");
 
     // Get logits and build token data array
-    const float *logits = llama_get_logits_ith(ctx, -1);
-    if (!logits) {
-      throw std::runtime_error(
-          "sampler::sample_with_params - Failed to get logits");
-    }
+    // lloyal::logits::get() handles null checking and throws descriptive errors
+    const float *logits = lloyal::logits::get(ctx, -1);
 
     const int n_vocab = llama_vocab_n_tokens(vocab);
     if (n_vocab <= 0) {
@@ -299,11 +292,8 @@ inline llama_token sample_with_params(llama_context *ctx,
                    "lightweight chain approach");
 
   // Get logits
-  const float *logits = llama_get_logits_ith(ctx, -1);
-  if (!logits) {
-    throw std::runtime_error(
-        "sampler::sample_with_params - Failed to get logits");
-  }
+  // lloyal::logits::get() handles null checking and throws descriptive errors
+  const float *logits = lloyal::logits::get(ctx, -1);
 
   const int n_vocab = llama_vocab_n_tokens(vocab);
   if (n_vocab <= 0) {
