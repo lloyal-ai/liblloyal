@@ -20,7 +20,7 @@
  *   // DO NOT store across decode() calls
  */
 
-#include <llama.h>
+#include <llama/llama.h>
 #include <stdexcept>
 
 namespace lloyal::logits {
