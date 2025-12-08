@@ -427,3 +427,47 @@ TEST_CASE("KV: read_file - operation fails throws") {
 
   CHECK_THROWS_AS(read_file(&ctx, 0, "test.llama"), std::runtime_error);
 }
+
+// ===== SEQUENCE COPY TESTS (System 2) =====
+
+TEST_CASE("KV: seq_cp null context guard") {
+  resetStubConfig();
+  seq_cp(nullptr, 0, 1, 0, 100);
+  CHECK_FALSE(llamaStubConfig().seq_cp_called);
+}
+
+TEST_CASE("KV: seq_cp parameter propagation") {
+  resetStubConfig();
+  llama_context ctx{};
+  seq_cp(&ctx, 0, 1, 10, 50);
+  CHECK(llamaStubConfig().seq_cp_called);
+  CHECK(llamaStubConfig().seq_cp_src == 0);
+  CHECK(llamaStubConfig().seq_cp_dst == 1);
+  CHECK(llamaStubConfig().seq_cp_p0 == 10);
+  CHECK(llamaStubConfig().seq_cp_p1 == 50);
+}
+
+TEST_CASE("KV: seq_cp default parameters") {
+  resetStubConfig();
+  llama_context ctx{};
+  seq_cp(&ctx, 0, 1);  // p0=0, p1=-1 defaults
+  CHECK(llamaStubConfig().seq_cp_called);
+  CHECK(llamaStubConfig().seq_cp_p0 == 0);
+  CHECK(llamaStubConfig().seq_cp_p1 == -1);
+}
+
+// ===== SEQUENCE KEEP TESTS (System 2) =====
+
+TEST_CASE("KV: seq_keep null context guard") {
+  resetStubConfig();
+  seq_keep(nullptr, 0);
+  CHECK_FALSE(llamaStubConfig().seq_keep_called);
+}
+
+TEST_CASE("KV: seq_keep single sequence") {
+  resetStubConfig();
+  llama_context ctx{};
+  seq_keep(&ctx, 7);
+  CHECK(llamaStubConfig().seq_keep_called);
+  CHECK(llamaStubConfig().seq_keep_seq == 7);
+}

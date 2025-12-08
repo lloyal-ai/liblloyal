@@ -91,6 +91,8 @@ extern "C" {
     bool llama_memory_seq_rm(llama_memory_t mem, llama_seq_id seq, llama_pos p0, llama_pos p1);
     llama_pos llama_memory_seq_pos_max(llama_memory_t mem, llama_seq_id seq);
     void llama_memory_clear(llama_memory_t mem, bool clear_kv);  // Phase 3: clear KV cache
+    void llama_memory_seq_cp(llama_memory_t mem, llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1);  // System 2: branch copy
+    void llama_memory_seq_keep(llama_memory_t mem, llama_seq_id seq);  // System 2: prune other sequences
 
     // Per-sequence state operations
     size_t llama_state_seq_get_size(llama_context* ctx, llama_seq_id seq);
@@ -177,6 +179,7 @@ extern "C" {
     );
     llama_token llama_sampler_sample(llama_sampler* smpl, llama_context* ctx, int32_t idx);
     void llama_sampler_free(llama_sampler* smpl);
+    llama_sampler* llama_sampler_clone(llama_sampler* smpl);  // System 2: clone for fork
 
     // Grammar sampler operations (for vendored common_sampler)
     llama_sampler* llama_sampler_init_grammar(const llama_vocab* vocab, const char* grammar_str, const char* grammar_root);
@@ -214,6 +217,17 @@ struct LlamaStubConfig {
     llama_pos pos_max = -1;                    // Max position in KV cache (-1 = empty)
     bool rm_ok = true;                         // Whether llama_memory_seq_rm succeeds
 
+    // Sequence copy tracking (System 2)
+    bool seq_cp_called = false;
+    llama_seq_id seq_cp_src = -1;
+    llama_seq_id seq_cp_dst = -1;
+    llama_pos seq_cp_p0 = -1;
+    llama_pos seq_cp_p1 = -1;
+
+    // Sequence keep tracking (System 2)
+    bool seq_keep_called = false;
+    llama_seq_id seq_keep_seq = -1;
+
     // Per-sequence state operations
     size_t per_seq_size = 0;                   // Per-sequence state size (0 = triggers fallback)
     size_t per_seq_rw = 0;                     // Per-sequence read/write bytes (0 = triggers fallback)
@@ -249,6 +263,10 @@ struct LlamaStubConfig {
     int vocab_size_value = 0;                  // Vocabulary size
     std::set<llama_token> eog_tokens;          // End-of-generation tokens
     llama_token sample_result = 1;             // Token returned by llama_sampler_sample
+
+    // Sampler clone tracking (System 2)
+    bool sampler_clone_called = false;
+    llama_sampler* sampler_clone_result = nullptr;
 
     // Chat template and special tokens
     std::string chat_template;                 // Model's chat template string

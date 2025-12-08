@@ -99,6 +99,22 @@ void llama_memory_clear(llama_memory_t /*mem*/, bool /*clear_kv*/) {
   // Real behavior validated in integration tests
 }
 
+void llama_memory_seq_cp(llama_memory_t /*mem*/, llama_seq_id src,
+                         llama_seq_id dst, llama_pos p0, llama_pos p1) {
+  auto& cfg = llamaStubConfig();
+  cfg.seq_cp_called = true;
+  cfg.seq_cp_src = src;
+  cfg.seq_cp_dst = dst;
+  cfg.seq_cp_p0 = p0;
+  cfg.seq_cp_p1 = p1;
+}
+
+void llama_memory_seq_keep(llama_memory_t /*mem*/, llama_seq_id seq) {
+  auto& cfg = llamaStubConfig();
+  cfg.seq_keep_called = true;
+  cfg.seq_keep_seq = seq;
+}
+
 // ===== PER-SEQUENCE STATE OPERATIONS =====
 
 size_t llama_state_seq_get_size(llama_context * /*ctx*/, llama_seq_id /*seq*/) {
@@ -473,6 +489,13 @@ llama_token llama_sampler_sample(llama_sampler * /*smpl*/,
 
 void llama_sampler_free(llama_sampler * /*smpl*/) {
   // Stub - no-op
+}
+
+llama_sampler *llama_sampler_clone(llama_sampler *smpl) {
+  auto& cfg = llamaStubConfig();
+  cfg.sampler_clone_called = true;
+  // Return null if input is null, otherwise return configured result
+  return smpl ? cfg.sampler_clone_result : nullptr;
 }
 
 // ===== GRAMMAR SAMPLER OPERATIONS (For vendored common_sampler) =====
