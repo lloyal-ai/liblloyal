@@ -28,6 +28,7 @@ add_executable(TestRunner
   model_registry_test.cpp
   kv_test.cpp
   decoder_test.cpp
+  decoder_seq_test.cpp
   tokenizer_test.cpp
   sampler_test.cpp
   chat_template_test.cpp
@@ -100,6 +101,7 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
     integration/chat_template_integration_test.cpp
     integration/kv_file_persistence_test.cpp
     integration/embedding_integration_test.cpp
+    integration/multi_sequence_integration_test.cpp
   )
 
   # Create llama/ subdirectory and symlink headers so #include <llama/llama.h> works

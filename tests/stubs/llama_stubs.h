@@ -228,6 +228,10 @@ struct LlamaStubConfig {
     int decode_call_count = 0;                 // Track number of decode calls
     int batch_free_call_count = 0;             // Track RAII cleanup
 
+    // Sequence ID tracking (for multi-sequence tests)
+    llama_seq_id last_batch_seq_id = -1;       // Last seq_id seen in batch (first token)
+    llama_seq_id all_batches_used_seq_id = -1; // -1=unset, -2=mixed, else=consistent seq_id
+
     // Tokenization operations (two-pass simulation)
     std::vector<llama_token> tokenize_result;  // Tokens to return
     bool tokenize_succeeds = true;             // Controls if tokenization succeeds

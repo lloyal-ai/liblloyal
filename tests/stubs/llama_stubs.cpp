@@ -214,8 +214,26 @@ void llama_batch_free(llama_batch batch) {
 
 // ===== DECODE OPERATIONS =====
 
-int llama_decode(llama_context * /*ctx*/, llama_batch /*batch*/) {
+int llama_decode(llama_context * /*ctx*/, llama_batch batch) {
   g_stub_config.decode_call_count++;
+
+  // Track seq_id from batch (for multi-sequence tests)
+  if (batch.n_tokens > 0 && batch.seq_id && batch.seq_id[0]) {
+    llama_seq_id seq = batch.seq_id[0][0];  // First token's first seq_id
+    g_stub_config.last_batch_seq_id = seq;
+
+    // Track if all batches use consistent seq_id
+    if (g_stub_config.all_batches_used_seq_id == -1) {
+      // First batch - set the seq_id
+      g_stub_config.all_batches_used_seq_id = seq;
+    } else if (g_stub_config.all_batches_used_seq_id >= 0 &&
+               g_stub_config.all_batches_used_seq_id != seq) {
+      // Different seq_id than previous batches - mark as mixed
+      g_stub_config.all_batches_used_seq_id = -2;
+    }
+    // If already -2 (mixed), leave it as -2
+  }
+
   return g_stub_config.decode_result;
 }
 

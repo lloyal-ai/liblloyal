@@ -33,7 +33,8 @@ struct BatchGuard {
  */
 inline void add_tokens_to_batch(llama_batch &batch, const llama_token *tokens,
                                 int32_t start_idx, int32_t n_eval,
-                                int32_t n_past, int32_t capacity) {
+                                int32_t n_past, int32_t capacity,
+                                llama_seq_id seq_id = 0) {
   // Clear batch using helpers.hpp function
   lloyal::batch_clear(batch);
 
@@ -42,8 +43,8 @@ inline void add_tokens_to_batch(llama_batch &batch, const llama_token *tokens,
     const int32_t pos = n_past + i;
     const bool want_logits = (i == n_eval - 1);
 
-    // Add token to sequence 0 (single-sequence design)
-    lloyal::batch_add(batch, tokens[start_idx + i], pos, {0}, want_logits,
+    // Add token to specified sequence
+    lloyal::batch_add(batch, tokens[start_idx + i], pos, {seq_id}, want_logits,
                       capacity);
   }
 }
@@ -60,17 +61,47 @@ namespace lloyal::decoder {
  * 3. For each chunk: clear batch, add tokens, call llama_decode
  * 4. Automatic batch cleanup via RAII guard
  *
+ * ## Sequence ID Parameter
+ *
+ * The `seq_id` parameter specifies which KV cache sequence to update.
+ * Default is 0 (single-sequence mode, backward compatible).
+ *
+ * Use different seq_ids for:
+ * - Parallel generations (multiple steppers, each with own seq_id)
+ * - Branching/tree search (System 2)
+ * - Shared prefix optimization (decode prefix to seq_id=0, copy to others)
+ *
+ * ## IMPORTANT: n_seq_max Clarification
+ *
+ * There are TWO different n_seq_max parameters - don't confuse them:
+ *
+ * 1. `llama_batch_init(n_tokens, embd, n_seq_max)`
+ *    - Controls how many sequences A SINGLE TOKEN can belong to
+ *    - Keep at 1 for normal decode (one token → one sequence)
+ *    - Only increase for beam search where one token updates multiple branches
+ *
+ * 2. `llama_context_params.n_seq_max`
+ *    - Controls max TOTAL sequences (distinct KV cache states)
+ *    - Increase for parallel generations or tree search
+ *
+ * Example: 4 parallel steppers, each decoding its own branch
+ *   - Context n_seq_max: 4 (four distinct sequences)
+ *   - Batch n_seq_max: 1 (each token belongs to one sequence)
+ *   - Call: decode_tokens(ctx, tokens, n, pos, batch, seq_id=stepper_id)
+ *
  * @param ctx Llama context (must be initialized)
  * @param tokens Token array to decode
  * @param n_tokens Number of tokens in array
  * @param n_past Position to start decoding from (KV cache position)
  * @param n_batch Batch size for chunking
+ * @param seq_id Sequence ID to update in KV cache (default: 0)
  * @throws std::runtime_error if decode fails
  *
  * CRITICAL: Call kv::remove_range() BEFORE this function, never after.
  */
 inline void decode_tokens(llama_context *ctx, const llama_token *tokens,
-                          int32_t n_tokens, int32_t n_past, int32_t n_batch) {
+                          int32_t n_tokens, int32_t n_past, int32_t n_batch,
+                          llama_seq_id seq_id = 0) {
   LLOYAL_LOG_DEBUG(
       "[decoder::decode_tokens] Processing %d tokens at position %d", n_tokens,
       n_past);
@@ -97,7 +128,7 @@ inline void decode_tokens(llama_context *ctx, const llama_token *tokens,
 
     // Add chunk to batch
     detail::add_tokens_to_batch(batch, tokens, processed, n_eval, n_past,
-                                n_batch);
+                                n_batch, seq_id);
 
     // Decode chunk (updates KV cache)
     if (llama_decode(ctx, batch) != 0) {
@@ -122,9 +153,10 @@ inline void decode_tokens(llama_context *ctx, const llama_token *tokens,
  */
 inline void decode_tokens(llama_context *ctx,
                           const std::vector<llama_token> &tokens,
-                          int32_t n_past, int32_t n_batch) {
+                          int32_t n_past, int32_t n_batch,
+                          llama_seq_id seq_id = 0) {
   decode_tokens(ctx, tokens.data(), static_cast<int32_t>(tokens.size()), n_past,
-                n_batch);
+                n_batch, seq_id);
 }
 
 /**
