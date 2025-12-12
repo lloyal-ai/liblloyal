@@ -54,22 +54,38 @@ target_compile_options(TestRunner PRIVATE -Wall -Wextra)
 # Optional: Enable sanitizers (pass -DLLOYAL_ENABLE_SANITIZERS=ON to cmake)
 option(LLOYAL_ENABLE_SANITIZERS "Enable AddressSanitizer and UBSan" OFF)
 if(LLOYAL_ENABLE_SANITIZERS)
-  message(STATUS "Enabling sanitizers (AddressSanitizer + UBSan + Integer + Float)")
-  target_compile_options(TestRunner PRIVATE
-    -fsanitize=address
-    -fsanitize=undefined
-    -fsanitize=integer              # Catches unsigned overflow & implicit truncation
-    -fsanitize=float-divide-by-zero # Catches float division by zero
-    -fno-sanitize=unsigned-shift-base  # Allow shifting into sign bit (common in bit manipulation)
-    -fno-omit-frame-pointer
-    -g
-  )
-  target_link_options(TestRunner PRIVATE
-    -fsanitize=address
-    -fsanitize=undefined
-    -fsanitize=integer
-    -fsanitize=float-divide-by-zero
-  )
+  # Detect compiler for sanitizer flag compatibility
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(STATUS "Enabling sanitizers (Clang: ASan + UBSan + Integer + Float)")
+    target_compile_options(TestRunner PRIVATE
+      -fsanitize=address
+      -fsanitize=undefined
+      -fsanitize=integer              # Clang-only: catches unsigned overflow & implicit truncation
+      -fsanitize=float-divide-by-zero # Clang-only: catches float division by zero
+      -fno-sanitize=unsigned-shift-base  # Clang-only: allow shifting into sign bit
+      -fno-omit-frame-pointer
+      -g
+    )
+    target_link_options(TestRunner PRIVATE
+      -fsanitize=address
+      -fsanitize=undefined
+      -fsanitize=integer
+      -fsanitize=float-divide-by-zero
+    )
+  else()
+    # GCC: only supports address and undefined sanitizers
+    message(STATUS "Enabling sanitizers (GCC: ASan + UBSan)")
+    target_compile_options(TestRunner PRIVATE
+      -fsanitize=address
+      -fsanitize=undefined
+      -fno-omit-frame-pointer
+      -g
+    )
+    target_link_options(TestRunner PRIVATE
+      -fsanitize=address
+      -fsanitize=undefined
+    )
+  endif()
 endif()
 
 # Optional: Custom target for running tests
