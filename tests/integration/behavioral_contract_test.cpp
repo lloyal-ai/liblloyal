@@ -1,5 +1,6 @@
 #include <cstdlib>
 #include <doctest/doctest.h>
+#include "test_config.hpp"
 #include <llama/llama.h>
 #include <lloyal/decoder.hpp>
 #include <lloyal/kv.hpp>
@@ -49,7 +50,7 @@ TEST_CASE("Behavioral: Tokenization produces consistent token IDs") {
   LlamaBackendGuard backend;
 
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0; // CPU only for determinism
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers(); // CPU only for determinism
 
   auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
   REQUIRE(model != nullptr);
@@ -89,7 +90,7 @@ TEST_CASE("Behavioral: KV cache state size is stable") {
   LlamaBackendGuard backend;
 
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
 
   auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
   REQUIRE(model != nullptr);
@@ -170,7 +171,7 @@ TEST_CASE("Behavioral: KV cache serialization round-trip preserves state") {
   LlamaBackendGuard backend;
 
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
 
   auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
   REQUIRE(model != nullptr);
@@ -227,7 +228,7 @@ TEST_CASE("Behavioral: Greedy sampling is deterministic") {
   LlamaBackendGuard backend;
 
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
 
   auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
   REQUIRE(model != nullptr);
@@ -273,7 +274,7 @@ TEST_CASE("Behavioral: Detokenization produces consistent text") {
   LlamaBackendGuard backend;
 
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
 
   auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
   REQUIRE(model != nullptr);
@@ -301,7 +302,7 @@ TEST_CASE("Behavioral: Batch decode processing is consistent") {
   LlamaBackendGuard backend;
 
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
 
   auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
   REQUIRE(model != nullptr);
@@ -330,7 +331,7 @@ TEST_CASE("Behavioral: Error conditions produce expected behavior") {
   LlamaBackendGuard backend;
 
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
 
   auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
   REQUIRE(model != nullptr);

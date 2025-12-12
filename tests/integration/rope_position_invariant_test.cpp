@@ -1,6 +1,7 @@
 // File: packages/liblloyal/tests/integration/rope_position_invariant_test.cpp
 
 #include <doctest/doctest.h>
+#include "test_config.hpp"
 #include <llama/llama.h>
 #include <lloyal/decoder.hpp>
 #include <lloyal/model_registry.hpp>
@@ -104,7 +105,7 @@ TEST_CASE("RoPE Invariant: Clear+reseed produces contiguous positions") {
 
   // === SETUP ===
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0; // CPU for determinism
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers(); // CPU for determinism
 
   auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
   REQUIRE(model != nullptr);

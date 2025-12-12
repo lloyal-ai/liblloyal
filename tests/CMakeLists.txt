@@ -33,6 +33,8 @@ add_executable(TestRunner
   sampler_test.cpp
   chat_template_test.cpp
   embedding_test.cpp
+  metrics_test.cpp
+  branch_test.cpp
   stubs/llama_stubs.cpp
 )
 
@@ -52,16 +54,21 @@ target_compile_options(TestRunner PRIVATE -Wall -Wextra)
 # Optional: Enable sanitizers (pass -DLLOYAL_ENABLE_SANITIZERS=ON to cmake)
 option(LLOYAL_ENABLE_SANITIZERS "Enable AddressSanitizer and UBSan" OFF)
 if(LLOYAL_ENABLE_SANITIZERS)
-  message(STATUS "Enabling sanitizers (AddressSanitizer + UBSan)")
+  message(STATUS "Enabling sanitizers (AddressSanitizer + UBSan + Integer + Float)")
   target_compile_options(TestRunner PRIVATE
     -fsanitize=address
     -fsanitize=undefined
+    -fsanitize=integer              # Catches unsigned overflow & implicit truncation
+    -fsanitize=float-divide-by-zero # Catches float division by zero
+    -fno-sanitize=unsigned-shift-base  # Allow shifting into sign bit (common in bit manipulation)
     -fno-omit-frame-pointer
     -g
   )
   target_link_options(TestRunner PRIVATE
     -fsanitize=address
     -fsanitize=undefined
+    -fsanitize=integer
+    -fsanitize=float-divide-by-zero
   )
 endif()
 
@@ -81,14 +88,6 @@ option(LLOYAL_BUILD_INTEGRATION_TESTS "Build integration tests with real llama.c
 if(LLOYAL_BUILD_INTEGRATION_TESTS)
   message(STATUS "Building integration tests with real llama.cpp")
 
-  # Default to liblloyal's vendored pre-built xcframework (can be overridden)
-  if(NOT DEFINED LLAMA_CPP_FRAMEWORK_PATH)
-    # Pin to specific llama.cpp version (tag b6870, commit 338074c3)
-    set(LLAMA_CPP_VERSION "b6870")
-    set(LLAMA_CPP_FRAMEWORK_PATH "lib/${LLAMA_CPP_VERSION}/llama.xcframework/macos-arm64_x86_64/llama.framework")
-    message(STATUS "Using vendored llama.cpp framework: ${LLAMA_CPP_VERSION} (${LLAMA_CPP_FRAMEWORK_PATH})")
-  endif()
-
   # Integration test executable
   add_executable(IntegrationRunner
     integration/main.cpp
@@ -102,39 +101,114 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
     integration/kv_file_persistence_test.cpp
     integration/embedding_integration_test.cpp
     integration/multi_sequence_integration_test.cpp
+    integration/mcts_integration_test.cpp
+    integration/branch_integration_test.cpp
   )
 
-  # Create llama/ subdirectory and symlink headers so #include <llama/llama.h> works
-  file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/include/llama)
-  execute_process(
-    COMMAND ${CMAKE_COMMAND} -E create_symlink
-      ${CMAKE_CURRENT_SOURCE_DIR}/${LLAMA_CPP_FRAMEWORK_PATH}/Headers/llama.h
-      ${CMAKE_CURRENT_BINARY_DIR}/include/llama/llama.h
-  )
-  execute_process(
-    COMMAND ${CMAKE_COMMAND} -E create_symlink
-      ${CMAKE_CURRENT_SOURCE_DIR}/${LLAMA_CPP_FRAMEWORK_PATH}/Headers/ggml.h
-      ${CMAKE_CURRENT_BINARY_DIR}/include/llama/ggml.h
-  )
+  # Support two modes:
+  # 1. LLAMA_CPP_DYLIB + LLAMA_CPP_INCLUDE_DIR: Use dylib directly (e.g., from lloyal.node build)
+  # 2. LLAMA_CPP_FRAMEWORK_PATH: Use pre-built xcframework (default)
 
-  target_include_directories(IntegrationRunner PRIVATE
-    ../include                              # liblloyal headers
-    ${CMAKE_CURRENT_BINARY_DIR}/include     # For llama/llama.h
-    ${LLAMA_CPP_FRAMEWORK_PATH}/Headers     # For other headers
-  )
+  if(DEFINED LLAMA_CPP_DYLIB AND DEFINED LLAMA_CPP_INCLUDE_DIR)
+    # Mode 1: Use dylib directly (shares same binary as lloyal.node)
+    # This is useful for:
+    # - Testing against the exact same llama.cpp build as lloyal.node
+    # - FFI hardening verification
+    # - Avoiding xcframework rebuild after llama.cpp upgrade
+    message(STATUS "Using llama.cpp dylib: ${LLAMA_CPP_DYLIB}")
+    message(STATUS "Using llama.cpp headers: ${LLAMA_CPP_INCLUDE_DIR}")
 
-  target_link_libraries(IntegrationRunner PRIVATE
-    "-framework Foundation"
-    "-F${CMAKE_CURRENT_SOURCE_DIR}/${LLAMA_CPP_FRAMEWORK_PATH}/.."
-    "-framework llama"
-    doctest::doctest
-  )
+    # Create llama/ subdirectory and symlink headers so #include <llama/llama.h> works
+    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/include/llama)
+    execute_process(
+      COMMAND ${CMAKE_COMMAND} -E create_symlink
+        ${LLAMA_CPP_INCLUDE_DIR}/llama.h
+        ${CMAKE_CURRENT_BINARY_DIR}/include/llama/llama.h
+    )
+    # ggml.h might be in a different location (ggml/include/)
+    if(DEFINED LLAMA_CPP_GGML_INCLUDE_DIR)
+      execute_process(
+        COMMAND ${CMAKE_COMMAND} -E create_symlink
+          ${LLAMA_CPP_GGML_INCLUDE_DIR}/ggml.h
+          ${CMAKE_CURRENT_BINARY_DIR}/include/llama/ggml.h
+      )
+    elseif(EXISTS "${LLAMA_CPP_INCLUDE_DIR}/../ggml/include/ggml.h")
+      execute_process(
+        COMMAND ${CMAKE_COMMAND} -E create_symlink
+          ${LLAMA_CPP_INCLUDE_DIR}/../ggml/include/ggml.h
+          ${CMAKE_CURRENT_BINARY_DIR}/include/llama/ggml.h
+      )
+    endif()
 
-  # Set RPATH so framework can be found at runtime
-  set_target_properties(IntegrationRunner PROPERTIES
-    BUILD_RPATH "${CMAKE_CURRENT_SOURCE_DIR}/${LLAMA_CPP_FRAMEWORK_PATH}/.."
-    INSTALL_RPATH "${CMAKE_CURRENT_SOURCE_DIR}/${LLAMA_CPP_FRAMEWORK_PATH}/.."
-  )
+    # Get ggml include dir (usually sibling to llama include)
+    if(NOT DEFINED LLAMA_CPP_GGML_INCLUDE_DIR)
+      get_filename_component(_LLAMA_PARENT ${LLAMA_CPP_INCLUDE_DIR} DIRECTORY)
+      set(LLAMA_CPP_GGML_INCLUDE_DIR "${_LLAMA_PARENT}/ggml/include")
+    endif()
+
+    target_include_directories(IntegrationRunner PRIVATE
+      ../include                              # liblloyal headers
+      ${CMAKE_CURRENT_BINARY_DIR}/include     # For llama/llama.h
+      ${LLAMA_CPP_INCLUDE_DIR}                # Direct access to llama headers
+      ${LLAMA_CPP_GGML_INCLUDE_DIR}           # ggml headers (ggml-cpu.h, etc.)
+    )
+
+    # Get directory containing the dylib for RPATH
+    get_filename_component(LLAMA_DYLIB_DIR ${LLAMA_CPP_DYLIB} DIRECTORY)
+
+    target_link_libraries(IntegrationRunner PRIVATE
+      "-framework Foundation"
+      ${LLAMA_CPP_DYLIB}
+      doctest::doctest
+    )
+
+    # Set RPATH so dylib can be found at runtime
+    set_target_properties(IntegrationRunner PROPERTIES
+      BUILD_RPATH "${LLAMA_DYLIB_DIR}"
+      INSTALL_RPATH "${LLAMA_DYLIB_DIR}"
+    )
+
+  else()
+    # Mode 2: Use pre-built xcframework (default)
+    if(NOT DEFINED LLAMA_CPP_FRAMEWORK_PATH)
+      # Pin to specific llama.cpp version (tag b6870, commit 338074c3)
+      set(LLAMA_CPP_VERSION "b6870")
+      set(LLAMA_CPP_FRAMEWORK_PATH "lib/${LLAMA_CPP_VERSION}/llama.xcframework/macos-arm64_x86_64/llama.framework")
+      message(STATUS "Using vendored llama.cpp framework: ${LLAMA_CPP_VERSION} (${LLAMA_CPP_FRAMEWORK_PATH})")
+    endif()
+
+    # Create llama/ subdirectory and symlink headers so #include <llama/llama.h> works
+    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/include/llama)
+    execute_process(
+      COMMAND ${CMAKE_COMMAND} -E create_symlink
+        ${CMAKE_CURRENT_SOURCE_DIR}/${LLAMA_CPP_FRAMEWORK_PATH}/Headers/llama.h
+        ${CMAKE_CURRENT_BINARY_DIR}/include/llama/llama.h
+    )
+    execute_process(
+      COMMAND ${CMAKE_COMMAND} -E create_symlink
+        ${CMAKE_CURRENT_SOURCE_DIR}/${LLAMA_CPP_FRAMEWORK_PATH}/Headers/ggml.h
+        ${CMAKE_CURRENT_BINARY_DIR}/include/llama/ggml.h
+    )
+
+    target_include_directories(IntegrationRunner PRIVATE
+      ../include                              # liblloyal headers
+      ${CMAKE_CURRENT_BINARY_DIR}/include     # For llama/llama.h
+      ${LLAMA_CPP_FRAMEWORK_PATH}/Headers     # For other headers
+    )
+
+    target_link_libraries(IntegrationRunner PRIVATE
+      "-framework Foundation"
+      "-F${CMAKE_CURRENT_SOURCE_DIR}/${LLAMA_CPP_FRAMEWORK_PATH}/.."
+      "-framework llama"
+      doctest::doctest
+    )
+
+    # Set RPATH so framework can be found at runtime
+    set_target_properties(IntegrationRunner PROPERTIES
+      BUILD_RPATH "${CMAKE_CURRENT_SOURCE_DIR}/${LLAMA_CPP_FRAMEWORK_PATH}/.."
+      INSTALL_RPATH "${CMAKE_CURRENT_SOURCE_DIR}/${LLAMA_CPP_FRAMEWORK_PATH}/.."
+    )
+  endif()
 
   # Optional: Add test to CTest
   add_test(NAME integration_tests COMMAND IntegrationRunner)

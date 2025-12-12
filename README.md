@@ -17,16 +17,50 @@
 
 ### Core Abstractions
 
+- **`branch.hpp`**: **Foundational primitive** for tree search (MCTS/LATS/PUCT) - consolidates KV, grammar, sampler, metrics, logits into single forkable handle
 - **`tokenizer.hpp`**: Tokenization/detokenization with special token handling
-- **`decoder.hpp`**: Token-to-text streaming decoding and embedding encoding
+- **`decoder.hpp`**: Token-to-text streaming decoding with multi-sequence support
 - **`logits.hpp`**: Zero-copy logits access with lifetime safety checks
 - **`sampler.hpp`**: Advanced sampling with 52 tunable parameters
-- **`kv.hpp`**: KV cache management (operations, defragmentation, compression)
+- **`kv.hpp`**: KV cache management including sequence operations (copy, remove, pos_max)
 - **`embedding.hpp`**: Embedding extraction with pooling and L2 normalization
 - **`chat_template.hpp`**: Jinja2-based chat template formatting
-- **`grammar.hpp`**: Grammar-constrained generation with JSON schema support
+- **`grammar.hpp`**: Grammar-constrained generation with JSON schema support + sampler cloning
+- **`metrics.hpp`**: Distribution metrics (surprisal, entropy, perplexity) with handle-based tracking
 - **`model_registry.hpp`**: Model metadata and feature detection
 - **`helpers.hpp`**: Batch utilities, string operations, parameter conversions
+
+### System 2 Support (LATS/MCTS/PUCT Tree Search)
+
+**Recommended:** Use `branch.hpp` for tree search - it consolidates all forkable state:
+
+```cpp
+#include <lloyal/branch.hpp>
+
+// Create root branch after prefill
+auto root = branch::create(ctx, model, 0, prefill_len, params, 512, nullptr, &store);
+branch::capture_logits(root, &store);
+
+// Fork: clones KV, grammar, sampler, metrics, logits atomically
+auto child = branch::fork(root, new_seq_id, &store);
+
+// Get policy priors for PUCT (grammar-masked, renormalized)
+auto priors = branch::get_legal_priors(child, &store);
+
+// Sample and advance
+llama_token token = branch::sample(child, &store);
+branch::accept_token(child, token, &store);
+branch::decode_and_capture(child, &token, 1, &store);
+
+// Cleanup losing branches
+branch::prune(child, &store);
+```
+
+**Lower-level primitives** (used internally by branch.hpp):
+- **Multi-sequence decoding**: `decode_tokens()` accepts `seq_id` for parallel branches
+- **KV sequence ops**: `seq_cp()` (O(1) fork), `seq_keep()`, `pos_max()`, `remove_range()`
+- **Grammar cloning**: `clone_sampler()` for forking grammar state across branches
+- **Metrics cloning**: `clone_perplexity()` for forking perplexity trackers across branches
 
 ### Vendored Dependencies
 
@@ -36,12 +70,14 @@
 ## Usage
 
 ```cpp
+#include <lloyal/branch.hpp>      // Tree search primitive (recommended for MCTS/PUCT)
 #include <lloyal/tokenizer.hpp>
 #include <lloyal/logits.hpp>
 #include <lloyal/sampler.hpp>
 #include <lloyal/kv.hpp>
 #include <lloyal/embedding.hpp>
 #include <lloyal/decoder.hpp>
+#include <lloyal/metrics.hpp>
 
 // Tokenize text
 auto tokens = lloyal::tokenizer::tokenize(vocab, "Hello world", true, false);
@@ -51,6 +87,16 @@ float* logits = lloyal::logits::get(ctx);  // throws if null/unavailable
 
 // Sample next token
 int token_id = lloyal::sampler::sample(ctx, vocab, params);
+
+// Compute distribution metrics
+float entropy = lloyal::metrics::model_entropy(logits, n_vocab);
+float surprisal = lloyal::metrics::model_surprisal(logits, n_vocab, token_id);
+
+// Track perplexity across generation (handle-based for fork support)
+auto ppl = lloyal::metrics::create_perplexity();
+lloyal::metrics::add_surprisal(ppl, surprisal);
+float perplexity = lloyal::metrics::get_ppl(ppl);
+lloyal::metrics::free_perplexity(ppl);
 
 // Manage KV cache
 lloyal::kv::clear_range(ctx, 0, 100, 512, 1024);

@@ -160,4 +160,43 @@ inline llama_sampler *clone_sampler(llama_sampler *smpl) {
   return cloned;
 }
 
+/**
+ * Free a grammar sampler
+ *
+ * @param smpl Sampler to free (safe to call with nullptr)
+ */
+inline void free_sampler(llama_sampler* smpl) {
+  if (smpl) {
+    llama_sampler_free(smpl);
+  }
+}
+
+/**
+ * Apply grammar constraint to candidates
+ *
+ * Modifies candidates in-place, masking tokens that violate grammar.
+ *
+ * @param smpl Grammar sampler
+ * @param cur_p Candidate array (modified in-place)
+ */
+inline void apply(llama_sampler* smpl, llama_token_data_array* cur_p) {
+  if (smpl && cur_p) {
+    llama_sampler_apply(smpl, cur_p);
+  }
+}
+
+/**
+ * Accept a token into grammar state
+ *
+ * Advances the grammar parser state.
+ *
+ * @param smpl Grammar sampler
+ * @param token Token to accept
+ */
+inline void accept(llama_sampler* smpl, llama_token token) {
+  if (smpl) {
+    llama_sampler_accept(smpl, token);
+  }
+}
+
 } // namespace lloyal::grammar

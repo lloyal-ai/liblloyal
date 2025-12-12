@@ -1,6 +1,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <doctest/doctest.h>
+#include "test_config.hpp"
 #include <llama/llama.h>
 #include <lloyal/decoder.hpp>
 #include <lloyal/grammar.hpp>
@@ -97,7 +98,7 @@ TEST_CASE(
 
   // Load model
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0; // CPU only
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers(); // CPU only
   auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
   REQUIRE(model != nullptr);
 
@@ -153,7 +154,7 @@ TEST_CASE("Integration: greedy sampling with real model") {
   LlamaBackendGuard backend;
 
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
   auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
   REQUIRE(model != nullptr);
 
@@ -195,7 +196,7 @@ TEST_CASE("Integration: sample_with_params with real model (no grammar)") {
   LlamaBackendGuard backend;
 
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
   auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
   REQUIRE(model != nullptr);
 
@@ -246,7 +247,7 @@ TEST_CASE("Integration: llama_sampler_apply constrains logits with grammar "
   LlamaBackendGuard backend;
 
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
   auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
   REQUIRE(model != nullptr);
 
@@ -318,7 +319,7 @@ TEST_CASE("Integration: llama_sampler_accept advances grammar state (Part 2)") {
   LlamaBackendGuard backend;
 
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
   auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
   REQUIRE(model != nullptr);
 
@@ -399,7 +400,7 @@ TEST_CASE(
   LlamaBackendGuard backend;
 
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
   auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
   REQUIRE(model != nullptr);
 
@@ -466,7 +467,7 @@ TEST_CASE("Integration: typical_p sampling parameter") {
   LlamaBackendGuard backend;
 
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
   auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
   REQUIRE(model != nullptr);
 

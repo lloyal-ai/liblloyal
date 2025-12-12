@@ -1,6 +1,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <doctest/doctest.h>
+#include "test_config.hpp"
 #include <llama/llama.h>
 #include <lloyal/kv.hpp>
 #include <lloyal/model_registry.hpp>
@@ -44,7 +45,7 @@ TEST_CASE("Integration: ModelRegistry respects n_gpu_layers parameter") {
 
   SUBCASE("n_gpu_layers = 0 (CPU only)") {
     auto model_params = llama_model_default_params();
-    model_params.n_gpu_layers = 0; // Force CPU
+    model_params.n_gpu_layers = TestConfig::n_gpu_layers(); // Force CPU
 
     auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
     REQUIRE(model != nullptr);
@@ -74,7 +75,7 @@ TEST_CASE("Integration: ModelRegistry respects use_mmap parameter") {
   SUBCASE("use_mmap = true (memory mapped loading)") {
     auto model_params = llama_model_default_params();
     model_params.use_mmap = true;
-    model_params.n_gpu_layers = 0; // CPU for determinism
+    model_params.n_gpu_layers = TestConfig::n_gpu_layers(); // CPU for determinism
 
     auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
     REQUIRE(model != nullptr);
@@ -86,7 +87,7 @@ TEST_CASE("Integration: ModelRegistry respects use_mmap parameter") {
   SUBCASE("use_mmap = false (direct loading)") {
     auto model_params = llama_model_default_params();
     model_params.use_mmap = false;
-    model_params.n_gpu_layers = 0; // CPU for determinism
+    model_params.n_gpu_layers = TestConfig::n_gpu_layers(); // CPU for determinism
 
     auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
     REQUIRE(model != nullptr);
@@ -129,7 +130,7 @@ TEST_CASE("Integration: llama_init_from_model respects n_ctx parameter") {
   LlamaBackendGuard backend;
 
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0; // CPU for determinism
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers(); // CPU for determinism
 
   auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
   REQUIRE(model != nullptr);
@@ -167,7 +168,7 @@ TEST_CASE("Integration: llama_init_from_model respects n_batch parameter") {
   LlamaBackendGuard backend;
 
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
 
   auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
   REQUIRE(model != nullptr);
@@ -210,7 +211,7 @@ TEST_CASE(
   LlamaBackendGuard backend;
 
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
 
   auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
   REQUIRE(model != nullptr);

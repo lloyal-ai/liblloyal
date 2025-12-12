@@ -2,6 +2,7 @@
 // Ported from: packages/@calibrate/calibrate-ndk/tests/integration/ClearAndReseed_Validation.cpp
 
 #include <doctest/doctest.h>
+#include "test_config.hpp"
 #include <lloyal/model_registry.hpp>
 #include <lloyal/tokenizer.hpp>
 #include <lloyal/decoder.hpp>
@@ -127,7 +128,7 @@ TEST_CASE("Empirical: clearAndReseed preserves perplexity") {
 
     // === SETUP ===
     auto model_params = llama_model_default_params();
-    model_params.n_gpu_layers = 0;  // CPU for determinism
+    model_params.n_gpu_layers = TestConfig::n_gpu_layers();  // CPU for determinism
 
     auto model = model_registry::acquire(MODEL_PATH, model_params);
     REQUIRE(model != nullptr);

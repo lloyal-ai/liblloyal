@@ -29,7 +29,8 @@ using llama_token = int32_t;
 struct llama_batch {
     int32_t n_tokens;
     llama_token* token;
-    int32_t* pos;
+    float* embd;
+    llama_pos* pos;
     int32_t* n_seq_id;
     llama_seq_id** seq_id;
     int8_t* logits;

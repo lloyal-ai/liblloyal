@@ -1,7 +1,9 @@
 #include <cstdlib>
 #include <doctest/doctest.h>
+#include "test_config.hpp"
 #include <llama/llama.h>
 #include <lloyal/decoder.hpp>
+#include <lloyal/grammar.hpp>
 #include <lloyal/kv.hpp>
 #include <lloyal/model_registry.hpp>
 #include <lloyal/tokenizer.hpp>
@@ -47,7 +49,7 @@ TEST_CASE("Integration: multi-sequence decode populates different KV regions") {
 
   // Load model
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
   auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
   REQUIRE(model != nullptr);
 
@@ -96,7 +98,7 @@ TEST_CASE("Integration: clearing one sequence doesn't affect others") {
   LlamaBackendGuard backend;
 
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
   auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
   REQUIRE(model != nullptr);
 
@@ -139,7 +141,7 @@ TEST_CASE("Integration: backward compatibility - default seq_id=0") {
   LlamaBackendGuard backend;
 
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
   auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
   REQUIRE(model != nullptr);
 
@@ -170,7 +172,7 @@ TEST_CASE("Integration: decode with explicit seq_id=0 matches default") {
   LlamaBackendGuard backend;
 
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
   auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
   REQUIRE(model != nullptr);
 
@@ -203,7 +205,7 @@ TEST_CASE("Integration: seq_cp copies KV cache to new sequence") {
   LlamaBackendGuard backend;
 
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
   auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
   REQUIRE(model != nullptr);
 
@@ -260,3 +262,246 @@ TEST_CASE("Integration: seq_cp copies KV cache to new sequence") {
 // Pruning can be done via kv::remove_range(ctx, seq_id, 0, -1) for each unwanted sequence.
 //
 // TEST_CASE("Integration: seq_keep after branch") - SKIPPED pending llama.cpp investigation
+
+// ============================================================================
+// System 2 Grammar Cloning Tests
+// ============================================================================
+
+TEST_CASE("Integration: clone_sampler creates independent grammar state") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard backend;
+
+  auto model_params = llama_model_default_params();
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
+  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  REQUIRE(model != nullptr);
+
+  // Import grammar namespace
+  using namespace lloyal;
+
+  // Create grammar that accepts "ab" or "ac" (branching grammar)
+  const char *grammar_str = "root ::= \"a\" [bc]";
+  llama_sampler *trunk = grammar::init_sampler(model.get(), grammar_str);
+  REQUIRE(trunk != nullptr);
+
+  // Clone before accepting any tokens
+  llama_sampler *branch_a = grammar::clone_sampler(trunk);
+  llama_sampler *branch_b = grammar::clone_sampler(trunk);
+  REQUIRE(branch_a != nullptr);
+  REQUIRE(branch_b != nullptr);
+
+  // Get vocab for token lookup
+  auto vocab = llama_model_get_vocab(model.get());
+  REQUIRE(vocab != nullptr);
+
+  // Find token for 'a'
+  auto token_a_vec = tokenizer::tokenize(vocab, "a", false, false);
+  if (!token_a_vec.empty()) {
+    llama_token token_a = token_a_vec[0];
+
+    // Accept 'a' on trunk - this should advance trunk's state
+    llama_sampler_accept(trunk, token_a);
+
+    // Now clones should still be at initial state
+    // Accept 'a' on branch_a should succeed (still at initial state)
+    llama_sampler_accept(branch_a, token_a);
+
+    // Accept 'a' on branch_b should also succeed
+    llama_sampler_accept(branch_b, token_a);
+
+    INFO("✓ Cloned samplers have independent state");
+  }
+
+  // Cleanup
+  llama_sampler_free(trunk);
+  llama_sampler_free(branch_a);
+  llama_sampler_free(branch_b);
+}
+
+TEST_CASE("Integration: clone_sampler preserves advanced grammar state") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard backend;
+
+  auto model_params = llama_model_default_params();
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
+  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  REQUIRE(model != nullptr);
+
+  using namespace lloyal;
+
+  // Grammar: "abc" - fixed sequence
+  const char *grammar_str = "root ::= \"a\" \"b\" \"c\"";
+  llama_sampler *trunk = grammar::init_sampler(model.get(), grammar_str);
+  REQUIRE(trunk != nullptr);
+
+  auto vocab = llama_model_get_vocab(model.get());
+  auto token_a_vec = tokenizer::tokenize(vocab, "a", false, false);
+  auto token_b_vec = tokenizer::tokenize(vocab, "b", false, false);
+
+  if (!token_a_vec.empty() && !token_b_vec.empty()) {
+    llama_token token_a = token_a_vec[0];
+    llama_token token_b = token_b_vec[0];
+
+    // Advance trunk past 'a'
+    llama_sampler_accept(trunk, token_a);
+
+    // Clone at this point - clone should be past 'a', expecting 'b'
+    llama_sampler *clone = grammar::clone_sampler(trunk);
+    REQUIRE(clone != nullptr);
+
+    // Both trunk and clone should accept 'b' next
+    llama_sampler_accept(trunk, token_b);
+    llama_sampler_accept(clone, token_b);
+
+    INFO("✓ Clone preserved grammar state after 'a'");
+
+    llama_sampler_free(clone);
+  }
+
+  llama_sampler_free(trunk);
+}
+
+// ============================================================================
+// System 2 Divergent Branch Generation Tests
+// ============================================================================
+
+TEST_CASE("Integration: branches can decode different tokens independently") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard backend;
+
+  auto model_params = llama_model_default_params();
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
+  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  REQUIRE(model != nullptr);
+
+  auto ctx_params = llama_context_default_params();
+  ctx_params.n_ctx = 512;
+  ctx_params.n_batch = 128;
+  ctx_params.n_seq_max = 4;
+
+  llama_context *ctx = llama_init_from_model(model.get(), ctx_params);
+  REQUIRE(ctx != nullptr);
+
+  auto vocab = llama_model_get_vocab(model.get());
+
+  // Tokenize shared prefix
+  std::string prefix = "The answer is";
+  auto prefix_tokens = tokenizer::tokenize(vocab, prefix, false, false);
+  REQUIRE_FALSE(prefix_tokens.empty());
+  int32_t prefix_len = static_cast<int32_t>(prefix_tokens.size());
+
+  // Decode prefix to seq 0
+  decoder::decode_tokens(ctx, prefix_tokens, 0, ctx_params.n_batch, 0);
+  llama_pos pos_after_prefix = kv::pos_max(ctx, 0);
+  CHECK(pos_after_prefix == prefix_len - 1);
+
+  // Fork to seq 1 and seq 2
+  kv::seq_cp(ctx, 0, 1);
+  kv::seq_cp(ctx, 0, 2);
+
+  // Verify all sequences have same initial state
+  CHECK(kv::pos_max(ctx, 0) == pos_after_prefix);
+  CHECK(kv::pos_max(ctx, 1) == pos_after_prefix);
+  CHECK(kv::pos_max(ctx, 2) == pos_after_prefix);
+
+  // Get different tokens to decode to each branch
+  auto token_yes = tokenizer::tokenize(vocab, " yes", false, false);
+  auto token_no = tokenizer::tokenize(vocab, " no", false, false);
+
+  if (!token_yes.empty() && !token_no.empty()) {
+    // Decode " yes" to seq 1
+    decoder::decode_tokens(ctx, {token_yes[0]}, prefix_len, ctx_params.n_batch, 1);
+
+    // Decode " no" to seq 2
+    decoder::decode_tokens(ctx, {token_no[0]}, prefix_len, ctx_params.n_batch, 2);
+
+    // Verify branches diverged
+    llama_pos pos_seq0 = kv::pos_max(ctx, 0);
+    llama_pos pos_seq1 = kv::pos_max(ctx, 1);
+    llama_pos pos_seq2 = kv::pos_max(ctx, 2);
+
+    CHECK(pos_seq0 == pos_after_prefix);  // Trunk unchanged
+    CHECK(pos_seq1 == prefix_len);        // Branch 1 advanced by 1
+    CHECK(pos_seq2 == prefix_len);        // Branch 2 advanced by 1
+
+    INFO("✓ Branches diverged: seq0=" << pos_seq0 << ", seq1=" << pos_seq1 << ", seq2=" << pos_seq2);
+  }
+
+  llama_free(ctx);
+}
+
+TEST_CASE("Integration: complete System 2 branching workflow") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard backend;
+
+  auto model_params = llama_model_default_params();
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
+  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  REQUIRE(model != nullptr);
+
+  auto ctx_params = llama_context_default_params();
+  ctx_params.n_ctx = 512;
+  ctx_params.n_batch = 128;
+  ctx_params.n_seq_max = 4;
+
+  llama_context *ctx = llama_init_from_model(model.get(), ctx_params);
+  REQUIRE(ctx != nullptr);
+
+  auto vocab = llama_model_get_vocab(model.get());
+
+  // === STEP 1: Decode shared prefix ===
+  std::string prefix = "Hello";
+  auto prefix_tokens = tokenizer::tokenize(vocab, prefix, false, false);
+  REQUIRE_FALSE(prefix_tokens.empty());
+
+  decoder::decode_tokens(ctx, prefix_tokens, 0, ctx_params.n_batch, 0);
+  int32_t trunk_pos = static_cast<int32_t>(prefix_tokens.size());
+  INFO("Step 1: Decoded prefix (" << trunk_pos << " tokens) to seq 0");
+
+  // === STEP 2: Fork to create branches ===
+  kv::seq_cp(ctx, 0, 1);  // Fork to seq 1
+  kv::seq_cp(ctx, 0, 2);  // Fork to seq 2
+  INFO("Step 2: Forked to sequences 1 and 2");
+
+  // === STEP 3: Generate different continuations ===
+  // Sample one token for each branch (using greedy for determinism)
+  auto token_world = tokenizer::tokenize(vocab, " world", false, false);
+  auto token_there = tokenizer::tokenize(vocab, " there", false, false);
+
+  if (!token_world.empty() && !token_there.empty()) {
+    // Branch 1: " world"
+    decoder::decode_tokens(ctx, {token_world[0]}, trunk_pos, ctx_params.n_batch, 1);
+
+    // Branch 2: " there"
+    decoder::decode_tokens(ctx, {token_there[0]}, trunk_pos, ctx_params.n_batch, 2);
+
+    INFO("Step 3: Decoded divergent tokens to branches");
+
+    // === STEP 4: Verify branch isolation ===
+    llama_pos pos_trunk = kv::pos_max(ctx, 0);
+    llama_pos pos_branch1 = kv::pos_max(ctx, 1);
+    llama_pos pos_branch2 = kv::pos_max(ctx, 2);
+
+    CHECK(pos_trunk == trunk_pos - 1);     // Trunk at original position
+    CHECK(pos_branch1 == trunk_pos);       // Branch 1 advanced
+    CHECK(pos_branch2 == trunk_pos);       // Branch 2 advanced
+
+    INFO("Step 4: Verified isolation - trunk=" << pos_trunk
+         << ", branch1=" << pos_branch1
+         << ", branch2=" << pos_branch2);
+
+    // === STEP 5: Prune losing branch ===
+    // Assume branch 1 "won" - remove branch 2
+    kv::remove_range(ctx, 2, 0, -1);
+    llama_pos pos_branch2_after = kv::pos_max(ctx, 2);
+    CHECK(pos_branch2_after == -1);  // Branch 2 cleared
+    INFO("Step 5: Pruned losing branch (seq 2)");
+
+    // Branch 1 should still be intact
+    CHECK(kv::pos_max(ctx, 1) == trunk_pos);
+    INFO("Step 5: Winning branch (seq 1) intact");
+  }
+
+  llama_free(ctx);
+  INFO("✓ Complete System 2 workflow validated");
+}

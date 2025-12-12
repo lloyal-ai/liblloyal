@@ -1,6 +1,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <doctest/doctest.h>
+#include "test_config.hpp"
 #include <llama/llama.h>
 #include <lloyal/decoder.hpp>
 #include <lloyal/embedding.hpp>
@@ -59,7 +60,7 @@ TEST_CASE("Embedding Integration: has_embeddings returns true for LLM models") {
   LlamaBackendGuard backend;
 
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
 
   auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
   REQUIRE(model != nullptr);
@@ -78,7 +79,7 @@ TEST_CASE("Embedding Integration: dimension returns model hidden size") {
   LlamaBackendGuard backend;
 
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
 
   auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
   REQUIRE(model != nullptr);
@@ -99,7 +100,7 @@ TEST_CASE("Embedding Integration: context without pooling reports NONE") {
   LlamaBackendGuard backend;
 
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
 
   auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
   REQUIRE(model != nullptr);
@@ -198,7 +199,7 @@ TEST_CASE("Embedding Integration: context creation with runtime pooling type") {
   LlamaBackendGuard backend;
 
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
 
   auto model = ModelRegistry::acquire(EMBED_MODEL, model_params);
   REQUIRE(model != nullptr);
@@ -244,7 +245,7 @@ TEST_CASE("Embedding Integration: extract embeddings from embedding model") {
   LlamaBackendGuard backend;
 
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
 
   auto model = ModelRegistry::acquire(EMBED_MODEL, model_params);
   REQUIRE(model != nullptr);
@@ -294,7 +295,7 @@ TEST_CASE(
   LlamaBackendGuard backend;
 
   auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
 
   auto model = ModelRegistry::acquire(EMBED_MODEL, model_params);
   REQUIRE(model != nullptr);

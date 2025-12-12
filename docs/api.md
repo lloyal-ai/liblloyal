@@ -25,15 +25,491 @@
 
 ## Table of Contents
 
+- [Branch (Foundational Primitive)](#branch-foundational-primitive)
 - [Model Registry](#model-registry)
 - [Tokenizer](#tokenizer)
 - [Decoder](#decoder)
+- [Logits](#logits)
 - [Sampler](#sampler)
 - [KV Cache](#kv-cache)
+- [KV Sequence Ops (System 2)](#kv-sequence-ops-system-2)
 - [Chat Template](#chat-template)
 - [Grammar](#grammar)
+- [Metrics](#metrics)
 - [Embedding](#embedding)
 - [Helpers](#helpers)
+
+---
+
+## Branch (Foundational Primitive)
+
+**Header:** `lloyal/branch.hpp`
+
+The Branch primitive consolidates all forkable state (KV cache, grammar, sampler chain, metrics, logits) into a single handle-based API. This is the foundational primitive for MCTS/LATS tree search and multi-sequence generation.
+
+### Design Overview
+
+**Handle Format:** `BranchHandle = (generation << 16) | index`
+- Upper 16 bits: generation counter (prevents ABA bugs on slot reuse)
+- Lower 16 bits: slot index (max 65535 branches)
+- Value 0 is invalid/null handle
+
+**Fork Semantics:**
+- `fork()` clones ALL state atomically: KV cache, grammar, sampler chain, metrics, logits
+- No manual juggling of individual components
+- Each branch is fully independent after fork
+
+**Memory Management:**
+- `BranchStore` provides handle table with freelist for efficient pooling
+- Generation counters prevent use-after-free bugs
+- RAII `Branch` wrapper available for automatic cleanup
+
+---
+
+### Types
+
+#### `BranchHandle`
+```cpp
+using BranchHandle = uint32_t;
+constexpr BranchHandle INVALID_HANDLE = 0;
+```
+
+Opaque handle to a branch. Always check against `INVALID_HANDLE` before use.
+
+---
+
+#### `BranchState`
+```cpp
+struct BranchState {
+    llama_context* ctx;           // Context (not owned)
+    const llama_model* model;     // Model (not owned)
+    llama_seq_id seq_id;          // KV cache sequence ID
+    llama_pos position;           // Current position in sequence
+    llama_sampler* sampler_chain; // Penalties + temp + dist (owned)
+    llama_sampler* grammar;       // Grammar sampler (owned, optional)
+    metrics::PerplexityHandle ppl;// Perplexity tracker (owned)
+    std::vector<float> logits_snapshot;  // Captured logits
+    bool has_logits;              // True after capture_logits/decode_and_capture
+    int n_batch;                  // Batch size for decode
+    int n_vocab;                  // Vocabulary size
+};
+```
+
+Internal state managed by handles. Access via `BranchStore::get()`.
+
+---
+
+#### `BranchStore`
+```cpp
+class BranchStore {
+public:
+    explicit BranchStore(size_t initial_capacity = 16);
+    ~BranchStore();
+
+    BranchHandle allocate();
+    void release(BranchHandle handle);
+    BranchState* get(BranchHandle handle);
+    const BranchState* get(BranchHandle handle) const;
+};
+```
+
+Handle table with generation counters and freelist. Thread safety requires external synchronization.
+
+---
+
+#### `shutdown_global_store()`
+```cpp
+void shutdown_global_store();
+```
+
+Explicitly destroy the global store before static destructors run. Call this during application shutdown to ensure deterministic cleanup order.
+
+**When to Use:**
+- At end of `main()` before `return`
+- In shutdown handlers before other globals are destroyed
+
+**Why:** Branches hold raw pointers to `llama_context` and `llama_model`. If the global store outlives llama.cpp cleanup (e.g., `llama_backend_free()`), branch destruction will access freed memory. This function ensures branches are destroyed while their dependencies are still valid.
+
+**Example:**
+```cpp
+int main() {
+    llama_backend_init();
+
+    // ... use branches with global store ...
+
+    // Cleanup in correct order
+    branch::shutdown_global_store();  // First: destroy branches
+    llama_backend_free();              // Then: destroy llama.cpp globals
+    return 0;
+}
+```
+
+---
+
+### Core Functions
+
+#### `create()`
+```cpp
+template <SamplingParamsLike P>
+BranchHandle create(
+    llama_context* ctx,
+    const llama_model* model,
+    llama_seq_id seq_id,
+    llama_pos start_pos,
+    const P& params,
+    int n_batch = 512,
+    const char* grammar_str = nullptr,
+    BranchStore* store = nullptr
+);
+```
+
+Create a new branch with initialized sampler chain, optional grammar, and perplexity tracker.
+
+**Parameters:**
+- `ctx` - Llama context (not owned, must outlive branch)
+- `model` - Llama model for sampler/grammar initialization
+- `seq_id` - Sequence ID for KV cache
+- `start_pos` - Starting position (typically after prefill)
+- `params` - Sampling parameters (temperature, top_k, penalties, etc.)
+- `n_batch` - Batch size for decode operations
+- `grammar_str` - Optional GBNF grammar string
+- `store` - Optional store (nullptr = use global store)
+
+**Returns:** Branch handle, or `INVALID_HANDLE` on failure
+
+---
+
+#### `fork()`
+```cpp
+BranchHandle fork(
+    BranchHandle source,
+    llama_seq_id new_seq_id,
+    BranchStore* store = nullptr
+);
+```
+
+Fork a branch to a new sequence. Clones all state atomically:
+- KV cache (via `seq_cp` - O(1))
+- Sampler chain (via `llama_sampler_clone`)
+- Grammar sampler (via `grammar::clone_sampler`)
+- Perplexity tracker (via `metrics::clone_perplexity`)
+- Logits snapshot (deep copy)
+
+**Parameters:**
+- `source` - Source branch handle
+- `new_seq_id` - Sequence ID for the new branch
+- `store` - Optional store
+
+**Returns:** New branch handle, or `INVALID_HANDLE` on failure
+
+**Performance:** O(1) for KV cache (tag copy, not data copy)
+
+---
+
+#### `prune()`
+```cpp
+void prune(BranchHandle handle, BranchStore* store = nullptr);
+```
+
+Remove branch from KV cache and free all resources. Use when a branch is no longer needed (e.g., losing MCTS branch).
+
+---
+
+#### `destroy()`
+```cpp
+void destroy(BranchHandle handle, BranchStore* store = nullptr);
+```
+
+Free branch resources without removing from KV cache. Use only if KV cache cleanup is handled separately.
+
+---
+
+### Decode Operations
+
+#### `decode_batch()`
+```cpp
+void decode_batch(
+    BranchHandle handle,
+    const llama_token* tokens,
+    size_t n_tokens,
+    BranchStore* store = nullptr
+);
+```
+
+Decode multiple tokens into the branch's sequence. Updates position but does NOT capture logits.
+
+---
+
+#### `decode_one()`
+```cpp
+void decode_one(
+    BranchHandle handle,
+    llama_token token,
+    BranchStore* store = nullptr
+);
+```
+
+Decode a single token with zero heap allocation. Uses stack-allocated `llama_batch` internally. Optimal for MCTS inner loops where a single token is decoded per step.
+
+**Performance:** No `llama_batch_init()`/`llama_batch_free()` overhead.
+
+---
+
+#### `capture_logits()`
+```cpp
+void capture_logits(BranchHandle handle, BranchStore* store = nullptr);
+```
+
+Capture current context logits into the branch's snapshot. Use after prefill to initialize root branch.
+
+**Throws:** `std::runtime_error` if logits unavailable.
+
+---
+
+#### `decode_and_capture_batch()`
+```cpp
+void decode_and_capture_batch(
+    BranchHandle handle,
+    const llama_token* tokens,
+    size_t n_tokens,
+    BranchStore* store = nullptr
+);
+```
+
+Decode multiple tokens AND capture logits atomically. Use for batch prefill with logits capture.
+
+---
+
+#### `decode_and_capture_one()`
+```cpp
+void decode_and_capture_one(
+    BranchHandle handle,
+    llama_token token,
+    BranchStore* store = nullptr
+);
+```
+
+Decode a single token AND capture logits with zero heap allocation. This is the primary decode function for MCTS tree search—optimal for the expand step where one token is decoded per branch.
+
+---
+
+### Sampling Operations
+
+#### `sample()`
+```cpp
+llama_token sample(BranchHandle handle, BranchStore* store = nullptr);
+```
+
+Sample from the branch using its sampler chain (applies grammar first if present).
+
+**Returns:** Sampled token, or `-1` if no logits captured or sampling fails
+
+**Requires:** Prior call to `capture_logits()` or `decode_and_capture()`
+
+---
+
+#### `accept_token()`
+```cpp
+void accept_token(
+    BranchHandle handle,
+    llama_token token,
+    BranchStore* store = nullptr
+);
+```
+
+Accept a token to advance grammar and sampler chain state. Also updates perplexity tracker.
+
+---
+
+#### `apply_grammar()`
+```cpp
+void apply_grammar(
+    BranchHandle handle,
+    float* logits,
+    int n_vocab,
+    BranchStore* store = nullptr
+);
+```
+
+Apply grammar constraints to an external logits buffer.
+
+---
+
+### Policy Prior Functions (PUCT Support)
+
+#### `get_legal_priors()`
+```cpp
+std::vector<std::pair<llama_token, float>> get_legal_priors(
+    BranchHandle handle,
+    BranchStore* store = nullptr
+);
+```
+
+Get grammar-masked candidate tokens with renormalized probabilities. Essential for proper PUCT: policy priors should only cover legal moves.
+
+**Returns:** Vector of (token, probability) pairs for legal moves only. Probabilities sum to 1.0.
+
+---
+
+#### `get_legal_logsumexp()`
+```cpp
+float get_legal_logsumexp(BranchHandle handle, BranchStore* store = nullptr);
+```
+
+Compute logsumexp over legal (grammar-masked) logits. Used for efficient prior computation.
+
+---
+
+#### `is_token_legal()`
+```cpp
+bool is_token_legal(
+    BranchHandle handle,
+    llama_token token,
+    BranchStore* store = nullptr
+);
+```
+
+Check if a token is legal under the current grammar. O(grammar_complexity), not O(n_vocab).
+
+**Parameters:**
+- `token` - Token to check
+- `store` - Optional store
+
+**Returns:** `true` if token is legal (grammar allows it or no grammar), `false` otherwise
+
+**Use Case:** Pre-filter candidate tokens before computing priors in MCTS selection.
+
+---
+
+#### `get_token_prior_assume_legal()`
+```cpp
+float get_token_prior_assume_legal(
+    BranchHandle handle,
+    llama_token token,
+    float logsumexp,
+    BranchStore* store = nullptr
+);
+```
+
+Compute prior probability for a token **assuming it's already known to be legal**. O(1) lookup.
+
+**Parameters:**
+- `token` - Token to compute prior for (must be legal)
+- `logsumexp` - Pre-computed value from `get_legal_logsumexp()`
+- `store` - Optional store
+
+**Returns:** Probability in [0,1]
+
+**⚠️ WARNING:** If token is illegal, returns garbage (undefined behavior). Use `is_token_legal()` first or `get_token_prior()` for safe version.
+
+**Performance:** O(1) - optimal for MCTS inner loops where tokens are pre-validated.
+
+---
+
+#### `get_token_prior()`
+```cpp
+float get_token_prior(
+    BranchHandle handle,
+    llama_token token,
+    float logsumexp,
+    BranchStore* store = nullptr
+);
+```
+
+Compute prior probability for a specific token from grammar-masked logits (safe version).
+
+**Parameters:**
+- `token` - Token to compute prior for
+- `logsumexp` - Pre-computed value from `get_legal_logsumexp()`
+
+**Returns:** Probability in [0,1], or 0 if token is illegal
+
+**Implementation:** Calls `is_token_legal()` internally, then `get_token_prior_assume_legal()`
+
+---
+
+### State Accessors
+
+```cpp
+llama_seq_id get_seq_id(BranchHandle handle, BranchStore* store = nullptr);
+llama_pos get_position(BranchHandle handle, BranchStore* store = nullptr);
+float get_perplexity(BranchHandle handle, BranchStore* store = nullptr);
+int get_n_vocab(BranchHandle handle, BranchStore* store = nullptr);
+const float* get_logits(BranchHandle handle, BranchStore* store = nullptr);
+```
+
+---
+
+### RAII Wrapper
+
+```cpp
+class Branch {
+public:
+    // Factory
+    template <SamplingParamsLike P>
+    static Branch create(ctx, model, seq_id, start_pos, params, n_batch, grammar_str, store);
+
+    // Operations
+    Branch fork(llama_seq_id new_seq_id);
+    void prune();
+    void decode_batch(const llama_token* tokens, size_t n);
+    void decode_one(llama_token token);
+    void decode_and_capture_batch(const llama_token* tokens, size_t n);
+    void decode_and_capture_one(llama_token token);
+    llama_token sample();
+    void accept(llama_token token);
+    const float* logits() const;
+
+    // Accessors
+    llama_seq_id seq_id() const;
+    llama_pos position() const;
+    float perplexity() const;
+    int n_vocab() const;
+    bool valid() const;
+    BranchHandle handle() const;
+};
+```
+
+RAII wrapper that automatically calls `prune()` on destruction. Move-only (non-copyable).
+
+---
+
+### Complete Example
+
+```cpp
+#include <lloyal/branch.hpp>
+
+// Setup
+BranchStore store(32);  // Pool for up to 32 branches
+SamplingParams params;
+params.temperature = 0.8f;
+params.top_k = 40;
+
+// Create root after prefill
+auto root = branch::create(ctx, model, 0, prefill_len, params, 512, nullptr, &store);
+branch::capture_logits(root, &store);
+
+// Fork for MCTS exploration
+auto child1 = branch::fork(root, 1, &store);
+auto child2 = branch::fork(root, 2, &store);
+
+// Sample and expand child1
+llama_token token1 = branch::sample(child1, &store);
+branch::accept_token(child1, token1, &store);
+branch::decode_and_capture_one(child1, token1, &store);
+
+// Get policy priors for PUCT
+auto priors = branch::get_legal_priors(child1, &store);
+for (auto& [token, prob] : priors) {
+    // prob is renormalized over legal moves
+}
+
+// Prune losing branch
+branch::prune(child2, &store);
+
+// Continue with winner
+float ppl = branch::get_perplexity(child1, &store);
+```
 
 ---
 
@@ -188,7 +664,8 @@ void decode_tokens(
     llama_context* ctx,
     const std::vector<llama_token>& tokens,
     int32_t n_past,
-    int32_t n_batch
+    int32_t n_batch,
+    llama_seq_id seq_id = 0
 );
 ```
 
@@ -199,17 +676,91 @@ Process tokens through model to update KV cache.
 - `tokens` - Tokens to process
 - `n_past` - KV cache position to start at
 - `n_batch` - Chunk size for batching (from `ctx_params.n_batch`)
+- `seq_id` - Sequence ID to update (default: 0). Use different IDs for parallel/branched generation
 
 **Behavior:**
 - Automatically chunks tokens into `n_batch`-sized batches
 - Sets `logits=true` on last token of each batch
-- Updates KV cache at positions `[n_past, n_past + tokens.size())`
+- Updates KV cache at positions `[n_past, n_past + tokens.size())` for specified sequence
 
 **Throws:** `std::runtime_error` on decode failure
 
+---
+
+### `decode_one()`
+
+```cpp
+void decode_one(
+    llama_context* ctx,
+    llama_token tok,
+    llama_pos pos,
+    llama_seq_id seq_id = 0,
+    bool want_logits = true
+);
+```
+
+Process a single token with zero heap allocation. Uses stack-allocated `llama_batch` internally.
+
+**Parameters:**
+- `ctx` - Llama context
+- `tok` - Token to decode
+- `pos` - Position in KV cache
+- `seq_id` - Sequence ID (default: 0)
+- `want_logits` - Whether to compute logits (default: true)
+
+**Performance:** No `llama_batch_init()`/`llama_batch_free()` overhead—optimal for MCTS inner loops.
+
+**Throws:** `std::runtime_error` on decode failure or NULL context
+
+---
+
+## Logits
+
+**Header:** `lloyal/logits.hpp`
+
+Zero-copy access to model logits with lifetime safety checks.
+
+### `get()`
+
+```cpp
+float* get(llama_context* ctx, int idx = -1);
+```
+
+Get pointer to logits array for the specified batch index.
+
+**Parameters:**
+- `ctx` - Llama context
+- `idx` - Batch index (-1 = last token in batch)
+
+**Returns:** Pointer to logits array of size `n_vocab`, or `nullptr` if unavailable
+
+**Lifetime:** Valid until next `llama_decode()` call. Copy if you need to persist.
+
 **Example:**
 ```cpp
-// Decode prompt
+decoder::decode_tokens(ctx, tokens, 0, 512);
+float* logits = logits::get(ctx);  // Get logits for last token
+if (logits) {
+    // Use logits before next decode
+    float entropy = metrics::model_entropy(logits, n_vocab);
+}
+```
+
+---
+
+**System 2 (Multi-Sequence) Usage:**
+```cpp
+// Context must be created with n_seq_max > 1
+ctx_params.n_seq_max = 4;  // Support up to 4 parallel sequences
+
+// Decode to different sequences
+decoder::decode_tokens(ctx, tokens_a, pos_a, 512, 0);  // seq 0
+decoder::decode_tokens(ctx, tokens_b, pos_b, 512, 1);  // seq 1
+```
+
+**Example:**
+```cpp
+// Decode prompt (single sequence)
 decoder::decode_tokens(ctx, prompt_tokens, 0, 512);
 
 // Decode generated token
@@ -503,6 +1054,164 @@ Clear metadata only, keeping buffer allocations. Faster than `clear_all()` when 
 
 ---
 
+## KV Sequence Ops (System 2)
+
+**Header:** `lloyal/kv.hpp`
+
+Operations for multi-sequence KV cache management, enabling LATS/MCTS tree search.
+
+**Prerequisites:**
+- Context created with `ctx_params.n_seq_max > 1`
+- Different sequence IDs (0, 1, 2, ...) for parallel branches
+
+### `seq_cp()`
+
+```cpp
+void seq_cp(
+    llama_context* ctx,
+    llama_seq_id src,
+    llama_seq_id dst,
+    llama_pos p0 = 0,
+    llama_pos p1 = -1
+);
+```
+
+Copy KV cache from source sequence to destination (O(1) tag copy).
+
+**Parameters:**
+- `ctx` - Llama context
+- `src` - Source sequence ID
+- `dst` - Destination sequence ID
+- `p0` - Start position (default: 0)
+- `p1` - End position (default: -1 = to end)
+
+**Use Case:** Fork a stepper for tree search without duplicating model weights or KV data.
+
+**Performance:** O(1) - copies sequence tags, not actual K/V tensors.
+
+**Example:**
+```cpp
+// Decode shared prefix to seq 0
+decoder::decode_tokens(ctx, prefix_tokens, 0, 512, 0);
+
+// Fork to sequences 1 and 2 for parallel exploration
+kv::seq_cp(ctx, 0, 1);  // seq 0 → seq 1
+kv::seq_cp(ctx, 0, 2);  // seq 0 → seq 2
+
+// Each branch can now decode independently
+decoder::decode_tokens(ctx, branch_a_tokens, prefix_len, 512, 1);
+decoder::decode_tokens(ctx, branch_b_tokens, prefix_len, 512, 2);
+```
+
+---
+
+### `seq_keep()`
+
+```cpp
+void seq_keep(llama_context* ctx, llama_seq_id seq);
+```
+
+Keep only the specified sequence, removing all others.
+
+**Parameters:**
+- `ctx` - Llama context
+- `seq` - Sequence ID to keep (all others removed)
+
+**⚠️ WARNING: Does NOT work for MCTS/tree search cleanup.**
+
+When branches share KV slots via `seq_cp()`, `seq_keep()` only removes sequence tags—the underlying slots remain occupied. This means:
+- `pos_max()` will still return positions for "removed" sequences
+- Memory is NOT reclaimed
+- The KV cache slots cannot be reused
+
+**Correct MCTS cleanup pattern:** Use `remove_range()` on each losing branch individually via `branch::prune()` or the RAII `Branch` destructor.
+
+**Valid Use Case:** Cleaning up truly independent sequences that were decoded separately (not forked via `seq_cp`).
+
+**Example (independent sequences only):**
+```cpp
+// Decode completely separate sequences (NOT forked)
+decoder::decode_tokens(ctx, tokens_a, 0, 512, 0);  // seq 0
+decoder::decode_tokens(ctx, tokens_b, 0, 512, 1);  // seq 1 (independent)
+
+// seq_keep works here because sequences don't share slots
+kv::seq_keep(ctx, 0);  // Remove seq 1
+```
+
+**For MCTS/tree search, use Branch primitive instead:**
+```cpp
+// Correct: RAII handles cleanup via remove_range()
+{
+    Branch child = parent.fork(new_seq_id);
+    // ... explore ...
+} // ~Branch calls prune() which uses remove_range()
+
+// Or for winner: release_kv() preserves KV, prevents prune
+ReleasedKV winner = best_branch.release_kv();
+// Other branches auto-cleanup via RAII
+```
+
+---
+
+### `pos_max()`
+
+```cpp
+llama_pos pos_max(llama_context* ctx, llama_seq_id seq);
+```
+
+Get maximum position in KV cache for a sequence.
+
+**Parameters:**
+- `ctx` - Llama context
+- `seq` - Sequence ID
+
+**Returns:** Maximum position (number of tokens - 1), or `-1` if sequence is empty.
+
+**Example:**
+```cpp
+llama_pos current_len = kv::pos_max(ctx, 0);
+if (current_len >= n_ctx - 10) {
+    // Approaching context limit, trigger reseed
+    kv::clear_and_reseed(ctx, sinks, tail, n_batch);
+}
+```
+
+---
+
+### `remove_range()`
+
+```cpp
+bool remove_range(
+    llama_context* ctx,
+    llama_seq_id seq,
+    llama_pos p0,
+    llama_pos p1
+);
+```
+
+Remove token range from KV cache sequence.
+
+**Parameters:**
+- `ctx` - Llama context
+- `seq` - Sequence ID
+- `p0` - Start position (inclusive)
+- `p1` - End position (exclusive), or `-1` for end of cache
+
+**Returns:** `true` on success, `false` on failure
+
+**CRITICAL:** Call BEFORE `llama_decode()`, not after.
+
+**Example:**
+```cpp
+// Remove tokens 100-200 from sequence 0
+kv::remove_range(ctx, 0, 100, 200);
+
+// Remove everything from position 50 onwards
+kv::remove_range(ctx, 0, 50, -1);
+```
+
+---
+
 ### StreamingLLM Support
 
 #### `StreamingLlmState`
@@ -621,7 +1330,7 @@ Validate Jinja2 template syntax. Returns `false` on error (never throws).
 
 **Header:** `lloyal/grammar.hpp`
 
-GBNF grammar-constrained generation for structured output.
+GBNF grammar-constrained generation for structured output. Includes System 2 primitives for two-phase sampling and sampler cloning.
 
 ### `from_json_schema()`
 
@@ -649,6 +1358,332 @@ auto vocab = llama_model_get_vocab(model);
 llama_sampler* grammar_sampler = llama_sampler_init_grammar(vocab, gbnf.c_str(), "root");
 llama_token next = sampler::sample_with_params(ctx, model, params, grammar_sampler);
 llama_sampler_free(grammar_sampler);
+```
+
+---
+
+### `init_sampler()`
+
+```cpp
+llama_sampler* init_sampler(
+    const llama_model* model,
+    const std::string& grammar_str,
+    const std::string& root_rule = "root"
+);
+```
+
+Initialize a grammar sampler from GBNF grammar string.
+
+**Parameters:**
+- `model` - Llama model (for vocab extraction)
+- `grammar_str` - GBNF grammar string
+- `root_rule` - Root rule name (default: "root")
+
+**Returns:** Grammar sampler, or `nullptr` on failure
+
+**Ownership:** Caller owns returned sampler and must call `llama_sampler_free()`
+
+**Example:**
+```cpp
+std::string gbnf = grammar::from_json_schema(schema);
+llama_sampler* sampler = grammar::init_sampler(model, gbnf);
+
+// Two-phase sampling:
+// 1. Apply grammar mask (doesn't advance state)
+llama_sampler_apply(sampler, &candidates);
+
+// 2. Accept token (advances parser state)
+llama_sampler_accept(sampler, chosen_token);
+
+llama_sampler_free(sampler);
+```
+
+---
+
+### `clone_sampler()`
+
+```cpp
+llama_sampler* clone_sampler(llama_sampler* smpl);
+```
+
+Clone a grammar sampler (deep copy including parser state).
+
+**Parameters:**
+- `smpl` - Source sampler to clone
+
+**Returns:** New sampler with identical state, or `nullptr` if input was null
+
+**Ownership:** Caller owns returned sampler and must call `llama_sampler_free()`
+
+**Use Case:** Fork a stepper for tree search, preserving grammar position.
+
+**Example:**
+```cpp
+// Create initial sampler
+llama_sampler* trunk_sampler = grammar::init_sampler(model, gbnf);
+
+// Generate some tokens, advancing grammar state
+llama_sampler_accept(trunk_sampler, token1);
+llama_sampler_accept(trunk_sampler, token2);
+
+// Fork for branching
+llama_sampler* branch_a = grammar::clone_sampler(trunk_sampler);
+llama_sampler* branch_b = grammar::clone_sampler(trunk_sampler);
+
+// Each branch can now diverge independently
+llama_sampler_accept(branch_a, token_a);
+llama_sampler_accept(branch_b, token_b);
+
+// Cleanup
+llama_sampler_free(trunk_sampler);
+llama_sampler_free(branch_a);
+llama_sampler_free(branch_b);
+```
+
+**System 2 Integration:**
+```cpp
+// When forking a stepper:
+// 1. Copy KV cache: kv::seq_cp(ctx, src_seq, dst_seq)
+// 2. Clone sampler: new_sampler = grammar::clone_sampler(sampler)
+// 3. Clone other stepper state (PRNG, history, etc.)
+```
+
+---
+
+## Metrics
+
+**Header:** `lloyal/metrics.hpp`
+
+Distribution metrics for test-time alignment: surprisal, entropy, and perplexity. Ported from `tsampler/metrics.ts` with identical validated algorithms.
+
+### Stateless Functions
+
+#### `model_surprisal()`
+
+```cpp
+float model_surprisal(
+    const float* logits,
+    int n_vocab,
+    int picked_id,
+    Base base = Base::Nats
+);
+```
+
+Compute model-level surprisal for a picked token.
+
+**Parameters:**
+- `logits` - Full vocabulary logits (before sampling filters)
+- `n_vocab` - Vocabulary size
+- `picked_id` - Token ID that was sampled
+- `base` - `Base::Nats` (natural log) or `Base::Bits` (log₂)
+
+**Returns:** Surprisal ≥ 0, or `INFINITY` if invalid
+
+**Interpretation:**
+- Higher surprisal = more surprising token (lower probability)
+- Use model logits (before temperature/top-k/p) to measure model's inherent uncertainty
+
+**Example:**
+```cpp
+float* logits = lloyal::logits::get(ctx);
+int n_vocab = llama_vocab_n_tokens(vocab);
+llama_token token = sample(logits);
+
+float s = metrics::model_surprisal(logits, n_vocab, token);
+if (s > 5.0f) {
+    // High uncertainty - consider retrieval
+}
+```
+
+---
+
+#### `model_entropy()`
+
+```cpp
+float model_entropy(
+    const float* logits,
+    int n_vocab,
+    Base base = Base::Nats
+);
+```
+
+Compute model-level entropy of distribution.
+
+**Parameters:**
+- `logits` - Full vocabulary logits (before sampling filters)
+- `n_vocab` - Vocabulary size
+- `base` - `Base::Nats` (natural log) or `Base::Bits` (log₂)
+
+**Returns:** Entropy ≥ 0, or `INFINITY` if invalid
+
+**Interpretation:**
+- Higher entropy = flatter distribution (more uncertain)
+- Lower entropy = peaked distribution (more confident)
+
+**Example:**
+```cpp
+float h = metrics::model_entropy(logits, n_vocab);
+if (h < 2.0f) {
+    // Collapsed distribution -> widen search
+} else if (h > 5.0f) {
+    // Too flat -> focus sampling
+}
+```
+
+---
+
+#### `sampling_surprisal()`
+
+```cpp
+float sampling_surprisal(
+    const float* candidate_logits,
+    const int32_t* candidate_ids,
+    int n_candidates,
+    int picked_id,
+    Base base = Base::Nats
+);
+```
+
+Compute sampling-level surprisal within filtered candidate set (after top-k/p/temperature).
+
+---
+
+#### `sampling_entropy()`
+
+```cpp
+float sampling_entropy(
+    const float* candidate_logits,
+    int n_candidates,
+    Base base = Base::Nats
+);
+```
+
+Compute sampling-level entropy of candidate distribution.
+
+---
+
+### Handle-Based Perplexity Tracking
+
+Handle-based API for RollingPerplexity that supports `clone()` for MCTS fork.
+
+#### `create_perplexity()`
+
+```cpp
+PerplexityHandle create_perplexity();
+```
+
+Create a new rolling perplexity tracker.
+
+**Returns:** Handle to the perplexity tracker
+
+---
+
+#### `add_surprisal()`
+
+```cpp
+void add_surprisal(PerplexityHandle handle, float surprisal);
+```
+
+Add token surprisal to running average. Non-finite values are ignored.
+
+---
+
+#### `get_ppl()`
+
+```cpp
+float get_ppl(PerplexityHandle handle);
+```
+
+Get current perplexity: `exp(average surprisal)`.
+
+**Returns:** Perplexity, or `INFINITY` if no samples
+
+---
+
+#### `get_count()`
+
+```cpp
+int get_count(PerplexityHandle handle);
+```
+
+Get number of tokens added to tracker.
+
+---
+
+#### `reset_perplexity()`
+
+```cpp
+void reset_perplexity(PerplexityHandle handle);
+```
+
+Reset tracker to initial state (start new sequence).
+
+---
+
+#### `clone_perplexity()`
+
+```cpp
+PerplexityHandle clone_perplexity(PerplexityHandle handle);
+```
+
+Clone perplexity tracker for MCTS fork. Creates a new tracker with identical state.
+
+**Returns:** New handle with cloned state, or 0 if invalid source
+
+**Example:**
+```cpp
+// Fork branch - clone all state
+kv::seq_cp(ctx, src_seq, dst_seq);
+auto new_grammar = grammar::clone_sampler(grammar_handle);
+auto new_ppl = metrics::clone_perplexity(ppl_handle);
+```
+
+---
+
+#### `free_perplexity()`
+
+```cpp
+void free_perplexity(PerplexityHandle handle);
+```
+
+Free perplexity tracker.
+
+---
+
+### Complete Example
+
+```cpp
+#include <lloyal/metrics.hpp>
+#include <lloyal/logits.hpp>
+
+// Track perplexity during generation
+auto ppl = metrics::create_perplexity();
+
+for (int i = 0; i < max_tokens; ++i) {
+    float* logits = lloyal::logits::get(ctx);
+
+    // Sample token
+    llama_token token = sample(logits);
+
+    // Track surprisal
+    float s = metrics::model_surprisal(logits, n_vocab, token);
+    metrics::add_surprisal(ppl, s);
+
+    // Optional: Check entropy for adaptive sampling
+    float h = metrics::model_entropy(logits, n_vocab);
+    if (h < 1.0f) {
+        // Very confident - can reduce temperature
+    }
+
+    // Decode token...
+}
+
+float perplexity = metrics::get_ppl(ppl);
+if (perplexity > 50.0f) {
+    // High perplexity - consider retrieval augmentation
+}
+
+metrics::free_perplexity(ppl);
 ```
 
 ---

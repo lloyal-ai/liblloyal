@@ -11,6 +11,7 @@
  */
 
 #include <doctest/doctest.h>
+#include "test_config.hpp"
 #include <lloyal/helpers.hpp>
 #include <lloyal/tokenizer.hpp>
 #include <lloyal/nlohmann/json.hpp>
@@ -54,7 +55,7 @@ TEST_CASE("ChatTemplate Integration: verify TinyLlama metadata flags") {
   LlamaBackendGuard backend;
 
   auto params = llama_model_default_params();
-  params.n_gpu_layers = 0;
+  params.n_gpu_layers = TestConfig::n_gpu_layers();
 
   llama_model *model = llama_model_load_from_file(TINYLLAMA_PATH, params);
   REQUIRE(model != nullptr);
@@ -77,7 +78,7 @@ TEST_CASE("ChatTemplate Integration: extract template from TinyLlama") {
   LlamaBackendGuard backend;
 
   auto params = llama_model_default_params();
-  params.n_gpu_layers = 0;
+  params.n_gpu_layers = TestConfig::n_gpu_layers();
 
   llama_model *model = llama_model_load_from_file(TINYLLAMA_PATH, params);
   REQUIRE(model != nullptr);
@@ -101,7 +102,7 @@ TEST_CASE("ChatTemplate Integration: format with TinyLlama template") {
   LlamaBackendGuard backend;
 
   auto params = llama_model_default_params();
-  params.n_gpu_layers = 0;
+  params.n_gpu_layers = TestConfig::n_gpu_layers();
 
   llama_model *model = llama_model_load_from_file(TINYLLAMA_PATH, params);
   REQUIRE(model != nullptr);
@@ -128,7 +129,7 @@ TEST_CASE("ChatTemplate Integration: multi-turn conversation with TinyLlama") {
   LlamaBackendGuard backend;
 
   auto params = llama_model_default_params();
-  params.n_gpu_layers = 0;
+  params.n_gpu_layers = TestConfig::n_gpu_layers();
 
   llama_model *model = llama_model_load_from_file(TINYLLAMA_PATH, params);
   REQUIRE(model != nullptr);
@@ -155,7 +156,7 @@ TEST_CASE("ChatTemplate Integration: tokenization round-trip with metadata") {
   LlamaBackendGuard backend;
 
   auto params = llama_model_default_params();
-  params.n_gpu_layers = 0;
+  params.n_gpu_layers = TestConfig::n_gpu_layers();
 
   llama_model *model = llama_model_load_from_file(TINYLLAMA_PATH, params);
   REQUIRE(model != nullptr);
@@ -193,7 +194,7 @@ TEST_CASE("ChatTemplate Integration: stop tokens extraction") {
   LlamaBackendGuard backend;
 
   auto params = llama_model_default_params();
-  params.n_gpu_layers = 0;
+  params.n_gpu_layers = TestConfig::n_gpu_layers();
 
   llama_model *model = llama_model_load_from_file(TINYLLAMA_PATH, params);
   REQUIRE(model != nullptr);
@@ -216,7 +217,7 @@ TEST_CASE("ChatTemplate Integration: custom template override") {
   LlamaBackendGuard backend;
 
   auto params = llama_model_default_params();
-  params.n_gpu_layers = 0;
+  params.n_gpu_layers = TestConfig::n_gpu_layers();
 
   llama_model *model = llama_model_load_from_file(MODEL_PATH, params);
   REQUIRE(model != nullptr);
@@ -249,7 +250,7 @@ TEST_CASE("ChatTemplate Integration: long conversation (50 turns)") {
   LlamaBackendGuard backend;
 
   auto params = llama_model_default_params();
-  params.n_gpu_layers = 0;
+  params.n_gpu_layers = TestConfig::n_gpu_layers();
 
   llama_model *model = llama_model_load_from_file(MODEL_PATH, params);
   REQUIRE(model != nullptr);
@@ -283,7 +284,7 @@ TEST_CASE("ChatTemplate Integration: very long message content") {
   LlamaBackendGuard backend;
 
   auto params = llama_model_default_params();
-  params.n_gpu_layers = 0;
+  params.n_gpu_layers = TestConfig::n_gpu_layers();
 
   llama_model *model = llama_model_load_from_file(MODEL_PATH, params);
   REQUIRE(model != nullptr);
@@ -308,7 +309,7 @@ TEST_CASE("ChatTemplate Integration: special characters in content") {
   LlamaBackendGuard backend;
 
   auto params = llama_model_default_params();
-  params.n_gpu_layers = 0;
+  params.n_gpu_layers = TestConfig::n_gpu_layers();
 
   llama_model *model = llama_model_load_from_file(MODEL_PATH, params);
   REQUIRE(model != nullptr);
@@ -329,7 +330,7 @@ TEST_CASE("ChatTemplate Integration: unicode and emoji content") {
   LlamaBackendGuard backend;
 
   auto params = llama_model_default_params();
-  params.n_gpu_layers = 0;
+  params.n_gpu_layers = TestConfig::n_gpu_layers();
 
   llama_model *model = llama_model_load_from_file(MODEL_PATH, params);
   REQUIRE(model != nullptr);

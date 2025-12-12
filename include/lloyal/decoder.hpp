@@ -9,6 +9,27 @@
 #include <vector>
 
 /**
+ * LLOYAL_STACK_BATCH - Controls llama_batch construction strategy
+ *
+ * When 1 (default): Use zero-allocation stack-constructed batch in decode_one()
+ *   - Fastest: no heap allocation per decode
+ *   - Risk: breaks if llama_batch struct layout changes
+ *
+ * When 0: Use thread_local batch via llama_batch_init()
+ *   - Slightly slower: one-time init per thread
+ *   - Safe: uses llama.cpp's own initializer, handles new fields
+ *
+ * If build breaks after llama.cpp update due to llama_batch changes:
+ *   1. Set LLOYAL_STACK_BATCH=0 to unblock immediately
+ *   2. Update decode_one() to match new struct layout
+ *   3. Update ABI stability test assertions
+ *   4. Re-enable LLOYAL_STACK_BATCH=1
+ */
+#ifndef LLOYAL_STACK_BATCH
+#define LLOYAL_STACK_BATCH 1
+#endif
+
+/**
  * Decoder Anti-Corruption Layer (Header-Only)
  *
  * Purpose: Single point of contact with llama.cpp decode APIs to isolate batch
@@ -157,6 +178,63 @@ inline void decode_tokens(llama_context *ctx,
                           llama_seq_id seq_id = 0) {
   decode_tokens(ctx, tokens.data(), static_cast<int32_t>(tokens.size()), n_past,
                 n_batch, seq_id);
+}
+
+/**
+ * Decode a single token with zero heap allocation (when LLOYAL_STACK_BATCH=1)
+ *
+ * Uses stack-allocated llama_batch to avoid llama_batch_init() overhead.
+ * This is the fast path for MCTS single-token expansion.
+ *
+ * If LLOYAL_STACK_BATCH=0, uses thread_local batch for ABI safety.
+ *
+ * @param ctx Llama context
+ * @param tok Token to decode
+ * @param pos Position in KV cache
+ * @param seq_id Sequence ID (default: 0)
+ * @param want_logits Request logits for this token (default: true)
+ * @throws std::runtime_error if decode fails
+ */
+inline void decode_one(llama_context *ctx, llama_token tok, llama_pos pos,
+                       llama_seq_id seq_id = 0, bool want_logits = true) {
+  if (!ctx) {
+    throw std::runtime_error("decoder::decode_one - NULL context");
+  }
+
+#if LLOYAL_STACK_BATCH
+  // Fast path: zero-allocation stack-constructed batch
+  // WARNING: ABI-fragile - breaks if llama_batch struct layout changes
+  llama_token tok_arr[1] = {tok};
+  llama_pos pos_arr[1] = {pos};
+  int32_t n_seq_id_arr[1] = {1};
+  llama_seq_id seq_arr[1] = {seq_id};
+  llama_seq_id *seq_ptrs[1] = {seq_arr};
+  int8_t logits_arr[1] = {static_cast<int8_t>(want_logits)};
+
+  llama_batch batch{};
+  batch.n_tokens = 1;
+  batch.token = tok_arr;
+  batch.embd = nullptr;
+  batch.pos = pos_arr;
+  batch.n_seq_id = n_seq_id_arr;
+  batch.seq_id = seq_ptrs;
+  batch.logits = logits_arr;
+#else
+  // Safe path: thread_local batch via llama.cpp's own initializer
+  // Handles any new fields with defaults, survives ABI changes
+  thread_local llama_batch batch = llama_batch_init(1, 0, 1);
+
+  batch.n_tokens = 1;
+  batch.token[0] = tok;
+  batch.pos[0] = pos;
+  batch.n_seq_id[0] = 1;
+  batch.seq_id[0][0] = seq_id;
+  batch.logits[0] = static_cast<int8_t>(want_logits);
+#endif
+
+  if (llama_decode(ctx, batch) != 0) {
+    throw std::runtime_error("decoder::decode_one - llama_decode failed");
+  }
 }
 
 /**

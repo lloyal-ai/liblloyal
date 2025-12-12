@@ -16,6 +16,12 @@ Production patterns for building LLM applications with liblloyal.
   - [Sliding Window with Re-decode](#sliding-window-with-re-decode)
   - [State Checkpointing](#state-checkpointing)
   - [Multi-User Serving](#multi-user-serving)
+- [System 2: Tree Search with Branch Primitive](#system-2-tree-search-with-branch-primitive)
+  - [Why Branch?](#why-branch)
+  - [Branch Setup](#branch-setup)
+  - [PUCT Implementation](#puct-implementation)
+  - [Complete PUCT Example](#complete-puct-example)
+- [Legacy: Manual Tree Search](#legacy-manual-tree-search)
 - [Structured Output](#structured-output)
 - [Best Practices](#best-practices)
 - [Troubleshooting](#troubleshooting)
@@ -573,6 +579,574 @@ auto data = lloyal::kv::read_file(ctx, 0, "/tmp/received_session.llama");
 - Validate restored state by checking `kv::pos_max()` matches token count
 - Session files are model-specific—ensure same model is used for save/load
 - File size roughly equals KV cache size (context length × model dimensions)
+
+---
+
+## System 2: Tree Search with Branch Primitive
+
+System 2 thinking patterns like Language Agent Tree Search (LATS) and Monte Carlo Tree Search (MCTS) require exploring multiple generation branches in parallel. liblloyal provides the **Branch primitive** as the foundational abstraction for efficient tree search.
+
+### Why Branch?
+
+The Branch primitive (`lloyal/branch.hpp`) consolidates all forkable state into a single handle:
+
+| Without Branch | With Branch |
+|---------------|-------------|
+| Manual `seq_cp()` for KV cache | `branch::fork()` handles it |
+| Manual `clone_sampler()` for grammar | Automatic |
+| Manual `clone_perplexity()` for metrics | Automatic |
+| Manual logits copying | Automatic via `decode_and_capture_one()` |
+| Heap allocation per decode | Zero allocation with `decode_one()` |
+| Manual position tracking | `branch::get_position()` |
+| Manual resource cleanup | RAII or `branch::prune()` |
+
+**Benefits:**
+- **Atomic fork:** All state cloned in one call, no partial state bugs
+- **Handle-based:** Generation counters prevent use-after-free
+- **Pooled allocation:** BranchStore freelist avoids malloc churn
+- **PUCT support:** `get_legal_priors()` returns grammar-masked probabilities
+
+### Branch Setup
+
+```cpp
+#include <lloyal/branch.hpp>
+
+// Create store with capacity for parallel branches
+lloyal::branch::BranchStore store(32);
+
+// Context must support multiple sequences
+auto ctx_params = llama_context_default_params();
+ctx_params.n_ctx = 4096;
+ctx_params.n_seq_max = 32;  // Match store capacity
+llama_context* ctx = llama_init_from_model(model.get(), ctx_params);
+
+// Sampling parameters
+SamplingParams params;
+params.temperature = 0.8f;
+params.top_k = 40;
+
+// Prefill prompt to sequence 0
+auto prompt_tokens = lloyal::tokenizer::tokenize(model.get(), prompt);
+lloyal::decoder::decode_tokens(ctx, prompt_tokens, 0, 512, 0);
+llama_pos prefill_len = static_cast<llama_pos>(prompt_tokens.size());
+
+// Create root branch
+auto root = lloyal::branch::create(
+    ctx, model.get(), 0, prefill_len, params, 512,
+    nullptr,  // No grammar (or pass GBNF string)
+    &store
+);
+
+// Capture logits from prefill
+lloyal::branch::capture_logits(root, &store);
+```
+
+### PUCT Implementation
+
+PUCT (Predictor + Upper Confidence bounds applied to Trees) uses policy priors from the model's logits:
+
+```cpp
+// PUCT formula: Q + c_puct * P(a|s) * sqrt(N_parent) / (1 + N_child)
+
+float compute_puct(
+    float q_value,           // Exploitation: average value
+    float prior,             // P(a|s): policy prior from softmax(logits)
+    int parent_visits,
+    int child_visits,
+    float c_puct = 1.0f
+) {
+    if (child_visits == 0) {
+        // Unvisited: use prior only (infinite UCB)
+        return c_puct * prior * std::sqrt(parent_visits + 1);
+    }
+    float exploitation = q_value;
+    float exploration = c_puct * prior * std::sqrt(parent_visits) / (1 + child_visits);
+    return exploitation + exploration;
+}
+```
+
+**Getting policy priors from Branch:**
+
+```cpp
+// Method 1: Get all legal priors (for expansion)
+auto priors = lloyal::branch::get_legal_priors(parent_handle, &store);
+// Returns vector<pair<token, probability>> for legal moves only
+
+// Method 2: Get single token prior (for selection)
+float logsumexp = lloyal::branch::get_legal_logsumexp(parent_handle, &store);
+
+// Safe version (checks legality):
+float prior = lloyal::branch::get_token_prior(parent_handle, token, logsumexp, &store);
+
+// Fast version (assumes token is legal - use in MCTS inner loops):
+if (lloyal::branch::is_token_legal(parent_handle, token, &store)) {
+    float prior = lloyal::branch::get_token_prior_assume_legal(parent_handle, token, logsumexp, &store);
+}
+```
+
+### Complete PUCT Example
+
+```cpp
+#include <lloyal/branch.hpp>
+#include <lloyal/tokenizer.hpp>
+#include <lloyal/decoder.hpp>
+#include <cmath>
+#include <vector>
+#include <algorithm>
+
+using namespace lloyal;
+
+struct PUCTNode {
+    branch::BranchHandle branch = branch::INVALID_HANDLE;
+    int parent_idx = -1;
+    std::vector<int> children;
+    llama_token token = -1;         // Token that led here
+
+    // PUCT statistics
+    int visits = 0;
+    float total_value = 0.0f;
+    float prior = 0.0f;             // P(a|s) from parent's logits
+    bool terminal = false;
+
+    float q_value() const {
+        return visits > 0 ? total_value / visits : 0.0f;
+    }
+};
+
+class PUCTSearch {
+private:
+    llama_context* ctx_;
+    const llama_model* model_;
+    branch::BranchStore store_;
+    std::vector<PUCTNode> nodes_;
+    int next_seq_id_ = 1;
+    float c_puct_ = 1.0f;
+
+public:
+    PUCTSearch(llama_context* ctx, const llama_model* model, int capacity = 64)
+        : ctx_(ctx), model_(model), store_(capacity) {
+        nodes_.reserve(capacity);
+    }
+
+    // Initialize root from prefilled context
+    void init_root(llama_pos prefill_len, const SamplingParams& params) {
+        PUCTNode root;
+        root.branch = branch::create(
+            ctx_, model_, 0, prefill_len, params, 512, nullptr, &store_
+        );
+        branch::capture_logits(root.branch, &store_);
+        root.prior = 1.0f;  // Root has no parent prior
+        nodes_.push_back(root);
+    }
+
+    // One MCTS iteration: select → expand → evaluate → backprop
+    void iterate() {
+        // SELECT: Follow best PUCT path to leaf
+        int node_idx = 0;
+        while (!nodes_[node_idx].children.empty() && !nodes_[node_idx].terminal) {
+            node_idx = select_child(node_idx);
+        }
+
+        // EXPAND: Add one child
+        if (!nodes_[node_idx].terminal) {
+            int child_idx = expand(node_idx);
+            if (child_idx >= 0) {
+                node_idx = child_idx;
+            }
+        }
+
+        // EVALUATE: Use perplexity as value (lower = better)
+        float ppl = branch::get_perplexity(nodes_[node_idx].branch, &store_);
+        float value = 1.0f / (1.0f + std::log(ppl));  // Transform to [0,1]
+
+        // BACKPROP
+        backpropagate(node_idx, value);
+    }
+
+    // Get best sequence of tokens
+    std::vector<llama_token> get_best_sequence() const {
+        std::vector<llama_token> result;
+        int idx = 0;
+
+        while (!nodes_[idx].children.empty()) {
+            // Follow most visited child
+            int best_child = *std::max_element(
+                nodes_[idx].children.begin(),
+                nodes_[idx].children.end(),
+                [this](int a, int b) {
+                    return nodes_[a].visits < nodes_[b].visits;
+                }
+            );
+            result.push_back(nodes_[best_child].token);
+            idx = best_child;
+        }
+
+        return result;
+    }
+
+private:
+    int select_child(int parent_idx) {
+        const auto& parent = nodes_[parent_idx];
+        float best_puct = -std::numeric_limits<float>::infinity();
+        int best_child = parent.children[0];
+
+        for (int child_idx : parent.children) {
+            const auto& child = nodes_[child_idx];
+            float puct = compute_puct(
+                child.q_value(),
+                child.prior,
+                parent.visits,
+                child.visits,
+                c_puct_
+            );
+            if (puct > best_puct) {
+                best_puct = puct;
+                best_child = child_idx;
+            }
+        }
+
+        return best_child;
+    }
+
+    int expand(int parent_idx) {
+        auto& parent = nodes_[parent_idx];
+
+        // Get legal moves with policy priors
+        auto priors = branch::get_legal_priors(parent.branch, &store_);
+        if (priors.empty()) {
+            parent.terminal = true;
+            return -1;
+        }
+
+        // Pick highest-prior unexpanded move
+        // (In full impl, would track which tokens already expanded)
+        auto& [token, prior] = priors[0];
+
+        // Fork branch for child
+        llama_seq_id new_seq = next_seq_id_++;
+        auto child_handle = branch::fork(parent.branch, new_seq, &store_);
+        if (child_handle == branch::INVALID_HANDLE) {
+            return -1;
+        }
+
+        // Advance child: accept token, decode, capture new logits
+        branch::accept_token(child_handle, token, &store_);
+        branch::decode_and_capture_one(child_handle, token, &store_);
+
+        // Check for EOS
+        const llama_vocab* vocab = llama_model_get_vocab(model_);
+        bool is_terminal = llama_vocab_is_eog(vocab, token);
+
+        // Create node
+        PUCTNode child;
+        child.branch = child_handle;
+        child.parent_idx = parent_idx;
+        child.token = token;
+        child.prior = prior;
+        child.terminal = is_terminal;
+
+        int child_idx = static_cast<int>(nodes_.size());
+        nodes_.push_back(child);
+        parent.children.push_back(child_idx);
+
+        return child_idx;
+    }
+
+    void backpropagate(int node_idx, float value) {
+        while (node_idx >= 0) {
+            nodes_[node_idx].visits++;
+            nodes_[node_idx].total_value += value;
+            node_idx = nodes_[node_idx].parent_idx;
+        }
+    }
+
+    float compute_puct(float q, float prior, int parent_n, int child_n, float c) const {
+        if (child_n == 0) {
+            return c * prior * std::sqrt(parent_n + 1);
+        }
+        return q + c * prior * std::sqrt(parent_n) / (1 + child_n);
+    }
+};
+
+// Usage
+int main() {
+    // ... setup ctx, model, prefill ...
+
+    PUCTSearch search(ctx, model.get(), 64);
+
+    SamplingParams params;
+    params.temperature = 0.8f;
+    search.init_root(prefill_len, params);
+
+    // Run PUCT iterations
+    for (int i = 0; i < 100; ++i) {
+        search.iterate();
+    }
+
+    // Get best sequence
+    auto best_tokens = search.get_best_sequence();
+    std::string output = tokenizer::detokenize_batch(model.get(), best_tokens);
+}
+```
+
+**Key Points:**
+- `branch::fork()` clones everything atomically (KV, grammar, sampler, metrics, logits)
+- `branch::decode_and_capture_one()` decodes single tokens with zero heap allocation
+- `branch::get_legal_priors()` returns grammar-masked softmax probabilities
+- `branch::get_token_prior_assume_legal()` is O(1) for MCTS inner loops
+- `branch::get_perplexity()` provides evaluation signal
+- RAII `Branch` class handles cleanup automatically
+
+---
+
+## Legacy: Manual Tree Search
+
+> **Note:** The Branch primitive (above) is the recommended approach. This section documents the lower-level primitives for reference.
+
+### Multi-Sequence Setup
+
+```cpp
+// Context with multi-sequence support
+auto ctx_params = llama_context_default_params();
+ctx_params.n_ctx = 4096;
+ctx_params.n_seq_max = 8;  // Support up to 8 parallel branches
+
+llama_context* ctx = llama_init_from_model(model.get(), ctx_params);
+```
+
+**Key insight:** Each sequence (seq_id 0, 1, 2, ...) has its own position tracking in the KV cache, but they share the same memory pool. This enables efficient branching.
+
+### Branching with KV Sequence Copy
+
+Fork a generation path using O(1) sequence copy:
+
+```cpp
+#include <lloyal/kv.hpp>
+#include <lloyal/decoder.hpp>
+
+// Decode shared prefix to sequence 0
+auto prefix_tokens = lloyal::tokenizer::tokenize(model, prompt);
+lloyal::decoder::decode_tokens(ctx, prefix_tokens, 0, 512, 0);
+int32_t prefix_len = static_cast<int32_t>(prefix_tokens.size());
+
+// Fork: Copy seq 0 to sequences 1, 2, 3 (O(1) operation)
+lloyal::kv::seq_cp(ctx, 0, 1);
+lloyal::kv::seq_cp(ctx, 0, 2);
+lloyal::kv::seq_cp(ctx, 0, 3);
+
+// Now each sequence can diverge independently
+// Decode different continuations to each branch
+lloyal::decoder::decode_tokens(ctx, {token_a}, prefix_len, 512, 0);
+lloyal::decoder::decode_tokens(ctx, {token_b}, prefix_len, 512, 1);
+lloyal::decoder::decode_tokens(ctx, {token_c}, prefix_len, 512, 2);
+lloyal::decoder::decode_tokens(ctx, {token_d}, prefix_len, 512, 3);
+
+// Query each branch's position
+llama_pos pos_0 = lloyal::kv::pos_max(ctx, 0);  // prefix_len
+llama_pos pos_1 = lloyal::kv::pos_max(ctx, 1);  // prefix_len
+```
+
+**Performance:** `seq_cp()` is O(1) - it copies sequence tags, not actual K/V tensor data. This makes branching extremely fast.
+
+### Grammar State Cloning
+
+When using grammar-constrained generation, clone the grammar sampler state when forking:
+
+```cpp
+#include <lloyal/grammar.hpp>
+
+// Initialize grammar from JSON schema
+std::string gbnf = lloyal::grammar::from_json_schema(R"({
+    "type": "object",
+    "properties": {
+        "action": {"type": "string"},
+        "confidence": {"type": "number"}
+    }
+})");
+
+llama_sampler* trunk_sampler = lloyal::grammar::init_sampler(model.get(), gbnf);
+
+// Generate some tokens on trunk, advancing grammar state
+llama_sampler_accept(trunk_sampler, token1);
+llama_sampler_accept(trunk_sampler, token2);
+
+// Fork grammar state for each branch
+llama_sampler* branch_0_sampler = lloyal::grammar::clone_sampler(trunk_sampler);
+llama_sampler* branch_1_sampler = lloyal::grammar::clone_sampler(trunk_sampler);
+llama_sampler* branch_2_sampler = lloyal::grammar::clone_sampler(trunk_sampler);
+
+// Each branch can now diverge while maintaining valid grammar
+llama_sampler_accept(branch_0_sampler, next_token_0);
+llama_sampler_accept(branch_1_sampler, next_token_1);
+// ...
+
+// Cleanup when branches complete
+llama_sampler_free(trunk_sampler);
+llama_sampler_free(branch_0_sampler);
+llama_sampler_free(branch_1_sampler);
+llama_sampler_free(branch_2_sampler);
+```
+
+### Complete Tree Search Example
+
+Full example implementing a simple best-of-N sampling with branching:
+
+```cpp
+#include <lloyal/model_registry.hpp>
+#include <lloyal/tokenizer.hpp>
+#include <lloyal/decoder.hpp>
+#include <lloyal/sampler.hpp>
+#include <lloyal/kv.hpp>
+#include <lloyal/grammar.hpp>
+
+struct Branch {
+    llama_seq_id seq_id;
+    int32_t position;
+    std::vector<llama_token> tokens;
+    float score;
+    llama_sampler* grammar;  // nullptr if no grammar
+};
+
+class TreeSearchGenerator {
+private:
+    llama_context* ctx_;
+    std::shared_ptr<llama_model> model_;
+    int32_t n_batch_;
+    int max_branches_;
+
+public:
+    TreeSearchGenerator(
+        std::shared_ptr<llama_model> model,
+        int32_t n_ctx,
+        int32_t n_batch,
+        int max_branches
+    ) : model_(model), n_batch_(n_batch), max_branches_(max_branches) {
+        auto ctx_params = llama_context_default_params();
+        ctx_params.n_ctx = n_ctx;
+        ctx_params.n_seq_max = max_branches;
+        ctx_ = llama_init_from_model(model_.get(), ctx_params);
+    }
+
+    ~TreeSearchGenerator() {
+        if (ctx_) llama_free(ctx_);
+    }
+
+    std::string generate_best_of_n(
+        const std::string& prompt,
+        int n_branches,
+        int max_tokens,
+        const std::string& grammar_str = ""
+    ) {
+        // Decode prompt to seq 0
+        auto prompt_tokens = lloyal::tokenizer::tokenize(model_.get(), prompt);
+        lloyal::decoder::decode_tokens(ctx_, prompt_tokens, 0, n_batch_, 0);
+        int32_t prefix_len = static_cast<int32_t>(prompt_tokens.size());
+
+        // Create branches
+        std::vector<Branch> branches;
+        for (int i = 0; i < n_branches; ++i) {
+            Branch b;
+            b.seq_id = static_cast<llama_seq_id>(i);
+            b.position = prefix_len;
+            b.score = 0.0f;
+            b.grammar = nullptr;
+
+            if (i > 0) {
+                // Fork KV from trunk
+                lloyal::kv::seq_cp(ctx_, 0, b.seq_id);
+            }
+
+            if (!grammar_str.empty()) {
+                b.grammar = lloyal::grammar::init_sampler(model_.get(), grammar_str);
+            }
+
+            branches.push_back(b);
+        }
+
+        // Generate in parallel
+        auto vocab = llama_model_get_vocab(model_.get());
+        SamplingParams params;
+        params.temperature = 0.8f;
+        params.top_k = 40;
+
+        for (int step = 0; step < max_tokens; ++step) {
+            for (auto& branch : branches) {
+                // Sample next token for this branch
+                // Note: In real impl, you'd need to decode first if needed
+                llama_token next = lloyal::sampler::sample_with_params(
+                    ctx_, vocab, params, branch.grammar
+                );
+
+                if (lloyal::tokenizer::is_eog(vocab, next)) {
+                    continue;  // Branch complete
+                }
+
+                branch.tokens.push_back(next);
+
+                // Decode token to this branch's sequence
+                std::vector<llama_token> single = {next};
+                lloyal::decoder::decode_tokens(
+                    ctx_, single, branch.position, n_batch_, branch.seq_id
+                );
+                branch.position++;
+
+                // Accept token in grammar if present
+                if (branch.grammar) {
+                    llama_sampler_accept(branch.grammar, next);
+                }
+
+                // Update score (simplified - real scoring would be more complex)
+                branch.score += 1.0f;
+            }
+        }
+
+        // Find best branch
+        auto best = std::max_element(branches.begin(), branches.end(),
+            [](const Branch& a, const Branch& b) { return a.score < b.score; });
+
+        std::string result = lloyal::tokenizer::detokenize_batch(
+            model_.get(), best->tokens
+        );
+
+        // Cleanup grammar samplers
+        for (auto& branch : branches) {
+            if (branch.grammar) {
+                llama_sampler_free(branch.grammar);
+            }
+        }
+
+        // Prune losing branches individually
+        // NOTE: seq_keep() does NOT work for forked branches (they share KV slots).
+        // Must use remove_range() on each losing branch.
+        for (auto& branch : branches) {
+            if (branch.seq_id != best->seq_id) {
+                // Remove KV cache entries for this branch
+                lloyal::kv::remove_range(ctx_, branch.seq_id, 0, -1);
+            }
+        }
+
+        return result;
+    }
+};
+
+// Usage
+auto model = lloyal::model_registry::acquire("model.gguf", llama_model_default_params());
+TreeSearchGenerator gen(model, 4096, 512, 4);
+
+std::string result = gen.generate_best_of_n(
+    "Write a haiku about programming:",
+    4,      // 4 parallel branches
+    50      // max 50 tokens per branch
+);
+```
+
+**Key Points:**
+- `seq_cp()` is O(1) - cheap to create branches
+- Each branch maintains independent position tracking
+- Grammar state must be cloned separately with `clone_sampler()`
+- Use `remove_range()` on each losing branch to prune (**not** `seq_keep()`—it doesn't work for forked branches)
+- Context `n_seq_max` must be >= number of parallel branches
+- **Recommendation:** Use the Branch primitive (above) instead of manual sequence management
 
 ---
 
