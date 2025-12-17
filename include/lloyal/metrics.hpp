@@ -417,4 +417,154 @@ inline void free_perplexity(PerplexityHandle handle) {
   detail::get_registry().erase(handle);
 }
 
+// ============================================================================
+// Branch-Level Metrics (unified model + sampling tracking)
+// ============================================================================
+
+using BranchMetricsHandle = int32_t;
+
+namespace detail {
+
+struct BranchMetricsState {
+  PerplexityState model;    // Model-level (raw logits before filters)
+  PerplexityState sampling; // Sampling-level (post top-k/p/temp)
+};
+
+inline std::unordered_map<BranchMetricsHandle, BranchMetricsState>&
+get_branch_metrics_registry() {
+  static std::unordered_map<BranchMetricsHandle, BranchMetricsState> registry;
+  return registry;
+}
+
+inline BranchMetricsHandle& get_next_branch_metrics_handle() {
+  static BranchMetricsHandle next = 1;
+  return next;
+}
+
+}  // namespace detail
+
+/**
+ * Create unified branch metrics tracker
+ *
+ * Tracks both model-level (raw logits) and sampling-level (filtered) perplexity
+ * in a single handle for atomic clone/free operations.
+ *
+ * @returns Handle to the branch metrics tracker
+ */
+inline BranchMetricsHandle create_branch_metrics() {
+  BranchMetricsHandle h = detail::get_next_branch_metrics_handle()++;
+  detail::get_branch_metrics_registry()[h] = detail::BranchMetricsState{};
+  return h;
+}
+
+/**
+ * Free branch metrics tracker
+ *
+ * @param handle Branch metrics handle
+ */
+inline void free_branch_metrics(BranchMetricsHandle handle) {
+  detail::get_branch_metrics_registry().erase(handle);
+}
+
+/**
+ * Clone branch metrics tracker (for fork/branching)
+ *
+ * Creates a new tracker with identical state for both model and sampling levels.
+ * Use when forking a branch to preserve metrics history.
+ *
+ * @param handle Source branch metrics handle
+ * @returns New handle with cloned state, or 0 if invalid source
+ */
+inline BranchMetricsHandle clone_branch_metrics(BranchMetricsHandle handle) {
+  auto& registry = detail::get_branch_metrics_registry();
+  auto it = registry.find(handle);
+  if (it == registry.end()) return 0;
+
+  BranchMetricsHandle new_handle = detail::get_next_branch_metrics_handle()++;
+  registry[new_handle] = it->second;  // Copy both model and sampling state
+  return new_handle;
+}
+
+/**
+ * Add model-level surprisal (from raw logits before filters)
+ *
+ * @param handle Branch metrics handle
+ * @param surprisal Token surprisal in nats (from model_surprisal)
+ */
+inline void add_model_surprisal(BranchMetricsHandle handle, float surprisal) {
+  auto& registry = detail::get_branch_metrics_registry();
+  auto it = registry.find(handle);
+  if (it == registry.end()) return;
+  if (!std::isfinite(surprisal)) return;
+  it->second.model.nll_sum_nats += std::max(0.0f, surprisal);
+  it->second.model.count++;
+}
+
+/**
+ * Get model-level perplexity (from raw logits)
+ *
+ * @param handle Branch metrics handle
+ * @returns exp(average surprisal), Infinity if no samples
+ */
+inline float get_model_ppl(BranchMetricsHandle handle) {
+  auto& registry = detail::get_branch_metrics_registry();
+  auto it = registry.find(handle);
+  if (it == registry.end() || it->second.model.count == 0) {
+    return std::numeric_limits<float>::infinity();
+  }
+  return std::exp(it->second.model.nll_sum_nats /
+                  static_cast<float>(it->second.model.count));
+}
+
+/**
+ * Add sampling-level surprisal (from filtered distribution)
+ *
+ * @param handle Branch metrics handle
+ * @param surprisal Token surprisal in nats (from sampling_surprisal)
+ */
+inline void add_sampling_surprisal(BranchMetricsHandle handle, float surprisal) {
+  auto& registry = detail::get_branch_metrics_registry();
+  auto it = registry.find(handle);
+  if (it == registry.end()) return;
+  if (!std::isfinite(surprisal)) return;
+  it->second.sampling.nll_sum_nats += std::max(0.0f, surprisal);
+  it->second.sampling.count++;
+}
+
+/**
+ * Get sampling-level perplexity (from filtered distribution)
+ *
+ * @param handle Branch metrics handle
+ * @returns exp(average surprisal), Infinity if no samples
+ */
+inline float get_sampling_ppl(BranchMetricsHandle handle) {
+  auto& registry = detail::get_branch_metrics_registry();
+  auto it = registry.find(handle);
+  if (it == registry.end() || it->second.sampling.count == 0) {
+    return std::numeric_limits<float>::infinity();
+  }
+  return std::exp(it->second.sampling.nll_sum_nats /
+                  static_cast<float>(it->second.sampling.count));
+}
+
+/**
+ * Get number of tokens in model-level tracker
+ */
+inline int get_model_count(BranchMetricsHandle handle) {
+  auto& registry = detail::get_branch_metrics_registry();
+  auto it = registry.find(handle);
+  if (it == registry.end()) return 0;
+  return it->second.model.count;
+}
+
+/**
+ * Get number of tokens in sampling-level tracker
+ */
+inline int get_sampling_count(BranchMetricsHandle handle) {
+  auto& registry = detail::get_branch_metrics_registry();
+  auto it = registry.find(handle);
+  if (it == registry.end()) return 0;
+  return it->second.sampling.count;
+}
+
 }  // namespace lloyal::metrics

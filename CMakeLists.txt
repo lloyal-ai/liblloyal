@@ -56,6 +56,15 @@ else()
     message(WARNING "liblloyal: llama.cpp target not found. Consumer must provide llama target.")
 endif()
 
+# remux dependency (for boundary detection in System 2 MCTS)
+# Consumer must provide remux target or locate remux
+if(TARGET remux)
+    target_link_libraries(liblloyal INTERFACE remux)
+    message(STATUS "liblloyal: Found remux target")
+else()
+    message(WARNING "liblloyal: remux target not found. Consumer must provide remux target for boundary detection.")
+endif()
+
 # =============================================================================
 # Version Check for llama.cpp
 # =============================================================================

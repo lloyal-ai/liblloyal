@@ -3,7 +3,7 @@
 #include "common.hpp"
 #include "helpers.hpp"
 #include <llama/llama.h>
-#include <nlohmann/json.hpp>
+#include "nlohmann/json.hpp"  // Relative path to vendored nlohmann/json.hpp
 #include <string>
 #include <vector>
 

@@ -29,6 +29,7 @@
  *   branch::free(root);
  */
 
+#include "boundaries.hpp"
 #include "common.hpp"
 #include "decoder.hpp"
 #include "grammar.hpp"
@@ -42,6 +43,7 @@
 #include <cstdint>
 #include <cstring>    // std::memcpy
 #include <ctime>      // std::time
+#include <deque>      // std::deque (pointer stability for BranchStore)
 #include <limits>     // std::numeric_limits
 #include <mutex>
 #include <stdexcept>  // std::runtime_error
@@ -93,12 +95,20 @@ struct BranchState {
 
   // Sampling chain (penalties + PRNG + filters) - owned
   llama_sampler* sampler_chain = nullptr;
+  bool has_dist_sampler = false;  // True if chain ends with dist (temp > 0), false if greedy
 
   // Grammar sampler (optional) - owned
   llama_sampler* grammar = nullptr;
 
-  // Perplexity tracker - owned via handle
-  metrics::PerplexityHandle ppl = 0;
+  // Boundary tracker (optional) - owned
+  boundaries::BoundaryTracker* boundary_tracker = nullptr;
+
+  // Unified metrics (model + sampling perplexity) - owned via handle
+  metrics::BranchMetricsHandle metrics = 0;
+
+  // Last sampled token and candidates (for sampling-level metrics)
+  llama_token last_token = -1;
+  std::vector<llama_token_data> last_candidates;
 
   // Logits snapshot (owned, copied on decode_and_capture)
   std::vector<float> logits_snapshot;
@@ -108,6 +118,9 @@ struct BranchState {
   // MEMORY NOTE: For large vocab models (128k tokens), each branch uses:
   //   - logits_snapshot: n_vocab * 4 bytes (~512KB)
   //   - candidates_buffer: n_vocab * sizeof(llama_token_data) (~1.5-2MB)
+  //   - last_candidates: up to n_vocab * sizeof(llama_token_data) after filtering
+  //     (typically much smaller: ~40 tokens with top_k=40, ~480 bytes)
+  //     Worst case: full vocab if no filtering (~1.5-2MB), actual: usually <<1%
   // For deep MCTS trees, consider using a shared scratch arena instead.
   // TODO: Move to per-thread or SessionContext scratch for MCTS scaling.
   std::vector<llama_token_data> candidates_buffer;
@@ -224,7 +237,9 @@ public:
     slot.position = 0;
     slot.sampler_chain = nullptr;
     slot.grammar = nullptr;
-    slot.ppl = 0;
+    slot.metrics = 0;
+    slot.last_token = -1;
+    slot.last_candidates.clear();
     slot.logits_snapshot.clear();
     slot.has_logits = false;
     slot.candidates_buffer.clear();  // Clear contents, capacity preserved for reuse
@@ -270,13 +285,17 @@ private:
       grammar::free_sampler(slot.grammar);
       slot.grammar = nullptr;
     }
-    if (slot.ppl != 0) {
-      metrics::free_perplexity(slot.ppl);
-      slot.ppl = 0;
+    if (slot.boundary_tracker) {
+      delete slot.boundary_tracker;
+      slot.boundary_tracker = nullptr;
+    }
+    if (slot.metrics != 0) {
+      metrics::free_branch_metrics(slot.metrics);
+      slot.metrics = 0;
     }
   }
 
-  std::vector<BranchState> slots_;
+  std::deque<BranchState> slots_;  // deque ensures pointer stability (no invalidation on resize)
   std::vector<uint16_t> freelist_;
 };
 
@@ -345,6 +364,7 @@ inline BranchHandle create(
     const P& params,
     int n_batch = 512,
     const char* grammar_str = nullptr,
+    boundaries::BoundaryTracker* boundary_tracker = nullptr,
     BranchStore* store = nullptr) {
   if (!ctx || !model) {
     LLOYAL_LOG_DEBUG("[branch::create] NULL ctx or model");
@@ -379,13 +399,21 @@ inline BranchHandle create(
   // Handles temp <= 0 as greedy mode automatically
   state->sampler_chain = sampler::create_chain(params);
 
+  // Track chain type for safe reseeding (general branch property, not MCTS-specific)
+  // Greedy chains (temp <= 0) don't have dist sampler, reseeding would corrupt them
+  float temperature = ::lloyal::detail::as_value(params.temperature, 0.8f);
+  state->has_dist_sampler = (temperature > 0.0f);
+
   // Create grammar sampler if grammar string provided
   if (grammar_str && grammar_str[0] != '\0') {
     state->grammar = grammar::init_sampler(model, grammar_str);
   }
 
-  // Create perplexity tracker
-  state->ppl = metrics::create_perplexity();
+  // Take ownership of boundary tracker if provided
+  state->boundary_tracker = boundary_tracker;
+
+  // Create unified metrics tracker (model + sampling)
+  state->metrics = metrics::create_branch_metrics();
 
   LLOYAL_LOG_DEBUG("[branch::create] Created branch handle=%u seq=%d pos=%d",
                    handle, seq_id, start_pos);
@@ -454,6 +482,7 @@ inline BranchHandle fork(
   // Clone sampler chain via anti-corruption layer
   if (src->sampler_chain) {
     dst->sampler_chain = sampler::clone_chain(src->sampler_chain);
+    dst->has_dist_sampler = src->has_dist_sampler;  // Preserve chain type
   }
 
   // Clone grammar
@@ -461,10 +490,19 @@ inline BranchHandle fork(
     dst->grammar = grammar::clone_sampler(src->grammar);
   }
 
-  // Clone perplexity tracker
-  if (src->ppl != 0) {
-    dst->ppl = metrics::clone_perplexity(src->ppl);
+  // Clone boundary tracker
+  if (src->boundary_tracker) {
+    dst->boundary_tracker = src->boundary_tracker->clone().release();
   }
+
+  // Clone unified metrics (model + sampling)
+  if (src->metrics != 0) {
+    dst->metrics = metrics::clone_branch_metrics(src->metrics);
+  }
+
+  // Copy last token and candidates (shallow copy)
+  dst->last_token = src->last_token;
+  dst->last_candidates = src->last_candidates;
 
   // Copy logits snapshot and validity flag
   dst->logits_snapshot = src->logits_snapshot;
@@ -708,7 +746,19 @@ inline llama_token sample(BranchHandle handle, BranchStore* store = nullptr) {
     return -1;
   }
 
-  return cur_p.data[cur_p.selected].id;
+  llama_token token = cur_p.data[cur_p.selected].id;
+
+  // Capture filtered candidates for sampling metrics
+  // After BOTH grammar and sampler chain - this is the actual sampling distribution
+  state->last_token = token;
+  state->last_candidates.clear();
+  state->last_candidates.reserve(cur_p.size);
+
+  for (size_t i = 0; i < cur_p.size; i++) {
+    state->last_candidates.push_back(cur_p.data[i]);
+  }
+
+  return token;
 }
 
 /**
@@ -733,12 +783,36 @@ inline void accept_token(
     sampler::accept(state->sampler_chain, token);
   }
 
-  // Update perplexity (only if logits have been captured)
+  // Update model-level perplexity (from raw logits)
   // Guard on has_logits to avoid computing surprisal from zero-filled buffer
-  if (state->ppl != 0 && state->has_logits) {
-    float surprisal = metrics::model_surprisal(
+  if (state->metrics != 0 && state->has_logits) {
+    float model_surprisal = metrics::model_surprisal(
         state->logits_snapshot.data(), state->n_vocab, token);
-    metrics::add_surprisal(state->ppl, surprisal);
+    metrics::add_model_surprisal(state->metrics, model_surprisal);
+  }
+
+  // Update sampling-level perplexity (from filtered candidates)
+  if (state->metrics != 0 && !state->last_candidates.empty() &&
+      token == state->last_token) {
+    // Extract filtered logits and IDs from candidates
+    std::vector<float> candidate_logits;
+    std::vector<int32_t> candidate_ids;
+    candidate_logits.reserve(state->last_candidates.size());
+    candidate_ids.reserve(state->last_candidates.size());
+
+    for (const auto& cand : state->last_candidates) {
+      candidate_logits.push_back(cand.logit);
+      candidate_ids.push_back(cand.id);
+    }
+
+    // Compute sampling-level surprisal
+    float sampling_surprisal = metrics::sampling_surprisal(
+        candidate_logits.data(),
+        candidate_ids.data(),
+        static_cast<int>(candidate_logits.size()),
+        token
+    );
+    metrics::add_sampling_surprisal(state->metrics, sampling_surprisal);
   }
 }
 
@@ -1026,13 +1100,80 @@ inline llama_pos get_position(BranchHandle handle, BranchStore* store = nullptr)
   return state ? state->position : -1;
 }
 
+/**
+ * Get model-level perplexity (backwards compatible)
+ *
+ * Returns perplexity from raw logits (before sampler filters).
+ * For sampling-level perplexity, use get_sampling_perplexity().
+ */
 inline float get_perplexity(BranchHandle handle, BranchStore* store = nullptr) {
   BranchStore& s = store ? *store : detail::global_store();
   const BranchState* state = s.get(handle);
-  if (!state || state->ppl == 0) {
+  if (!state || state->metrics == 0) {
     return std::numeric_limits<float>::infinity();
   }
-  return metrics::get_ppl(state->ppl);
+  return metrics::get_model_ppl(state->metrics);
+}
+
+/**
+ * Get sampling-level perplexity (from filtered distribution)
+ *
+ * Returns perplexity from the distribution actually sampled from
+ * (after top-k/p/temp/penalties). Useful for PUCT priors and
+ * monitoring sampler chain impact.
+ *
+ * @param handle Branch handle
+ * @param store Branch store (uses global if nullptr)
+ * @returns Sampling-level perplexity, Infinity if no samples
+ */
+inline float get_sampling_perplexity(BranchHandle handle, BranchStore* store = nullptr) {
+  BranchStore& s = store ? *store : detail::global_store();
+  const BranchState* state = s.get(handle);
+  if (!state || state->metrics == 0) {
+    return std::numeric_limits<float>::infinity();
+  }
+  return metrics::get_sampling_ppl(state->metrics);
+}
+
+/**
+ * Get last token's prior from filtered distribution (for PUCT)
+ *
+ * Returns P(token) from the sampling distribution (post top-k/p/temp).
+ * This is the correct prior for PUCT since it matches what was actually sampled.
+ *
+ * @param handle Branch handle
+ * @param store Branch store (uses global if nullptr)
+ * @returns Probability of last sampled token, 0.0 if unavailable
+ */
+inline float get_last_sampling_prior(BranchHandle handle, BranchStore* store = nullptr) {
+  BranchStore& s = store ? *store : detail::global_store();
+  const BranchState* state = s.get(handle);
+
+  if (!state || state->last_candidates.empty() || state->last_token < 0) {
+    return 0.0f;
+  }
+
+  // Extract candidates
+  std::vector<float> candidate_logits;
+  std::vector<int32_t> candidate_ids;
+  candidate_logits.reserve(state->last_candidates.size());
+  candidate_ids.reserve(state->last_candidates.size());
+
+  for (const auto& cand : state->last_candidates) {
+    candidate_logits.push_back(cand.logit);
+    candidate_ids.push_back(cand.id);
+  }
+
+  // Compute surprisal from filtered distribution
+  float surprisal = metrics::sampling_surprisal(
+      candidate_logits.data(),
+      candidate_ids.data(),
+      static_cast<int>(candidate_logits.size()),
+      state->last_token
+  );
+
+  // Convert to probability: P = exp(-surprisal)
+  return std::exp(-surprisal);
 }
 
 inline int get_n_vocab(BranchHandle handle, BranchStore* store = nullptr) {
@@ -1062,7 +1203,7 @@ struct ReleasedKV {
  * IMPORTANT: Caller owns these resources and must free them:
  * - sampler::free_chain(sampler_chain)
  * - grammar::free_sampler(grammar)  // if non-null
- * - metrics::free_perplexity(ppl)   // if non-zero
+ * - metrics::free_branch_metrics(metrics)   // if non-zero
  */
 struct ReleasedFull {
   llama_context* ctx;
@@ -1071,7 +1212,7 @@ struct ReleasedFull {
   llama_pos position;
   llama_sampler* sampler_chain;  // Caller owns - must call sampler::free_chain()
   llama_sampler* grammar;        // Caller owns - must call grammar::free_sampler() if non-null
-  metrics::PerplexityHandle ppl; // Caller owns - must call metrics::free_perplexity() if non-zero
+  metrics::BranchMetricsHandle metrics;  // Caller owns - must call metrics::free_branch_metrics() if non-zero
 };
 
 // ============================================================================
@@ -1137,9 +1278,10 @@ public:
       const P& params,
       int n_batch = 512,
       const char* grammar_str = nullptr,
+      boundaries::BoundaryTracker* boundary_tracker = nullptr,
       BranchStore* store = nullptr) {
     BranchStore* s = store ? store : &detail::global_store();
-    BranchHandle h = branch::create(ctx, model, seq_id, start_pos, params, n_batch, grammar_str, s);
+    BranchHandle h = branch::create(ctx, model, seq_id, start_pos, params, n_batch, grammar_str, boundary_tracker, s);
     return Branch(s, h);
   }
 
@@ -1212,7 +1354,7 @@ public:
       st->position,
       std::exchange(st->sampler_chain, nullptr),
       std::exchange(st->grammar, nullptr),
-      std::exchange(st->ppl, 0),
+      std::exchange(st->metrics, 0),
     };
 
     // Now safe to destroy - nothing left to free

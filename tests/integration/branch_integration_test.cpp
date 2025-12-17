@@ -146,7 +146,7 @@ TEST_CASE("branch integration: create and destroy") {
   TestParams params;
 
   // Create branch
-  BranchHandle h = create(ctx, model.get(), 0, 0, params, 64, nullptr, &store);
+  BranchHandle h = create(ctx, model.get(), 0, 0, params, 64, nullptr, nullptr, &store);
   CHECK(h != INVALID_HANDLE);
 
   BranchState* state = store.get(h);
@@ -188,7 +188,7 @@ TEST_CASE("branch integration: decode updates position") {
   BranchStore store(8);
   TestParams params;
 
-  BranchHandle h = create(ctx, model.get(), 0, 0, params, 64, nullptr, &store);
+  BranchHandle h = create(ctx, model.get(), 0, 0, params, 64, nullptr, nullptr, &store);
   REQUIRE(h != INVALID_HANDLE);
 
   // Tokenize something
@@ -233,7 +233,7 @@ TEST_CASE("branch integration: decode_and_capture captures logits") {
   BranchStore store(8);
   TestParams params;
 
-  BranchHandle h = create(ctx, model.get(), 0, 0, params, 64, nullptr, &store);
+  BranchHandle h = create(ctx, model.get(), 0, 0, params, 64, nullptr, nullptr, &store);
   REQUIRE(h != INVALID_HANDLE);
 
   // Before decode, logits should be empty/zero
@@ -291,7 +291,7 @@ TEST_CASE("branch integration: fork creates independent branch") {
   TestParams params;
 
   // Create parent branch and decode some tokens
-  BranchHandle parent = create(ctx, model.get(), 0, 0, params, 64, nullptr, &store);
+  BranchHandle parent = create(ctx, model.get(), 0, 0, params, 64, nullptr, nullptr, &store);
   REQUIRE(parent != INVALID_HANDLE);
 
   const llama_vocab* vocab = llama_model_get_vocab(model.get());
@@ -405,7 +405,7 @@ TEST_CASE("branch integration: prune removes KV entries") {
   TestParams params;
 
   // Create branch and decode
-  BranchHandle h = create(ctx, model.get(), 0, 0, params, 64, nullptr, &store);
+  BranchHandle h = create(ctx, model.get(), 0, 0, params, 64, nullptr, nullptr, &store);
   REQUIRE(h != INVALID_HANDLE);
 
   const llama_vocab* vocab = llama_model_get_vocab(model.get());
@@ -459,7 +459,7 @@ TEST_CASE("branch integration: RAII Branch wrapper") {
 
   {
     // Create via RAII wrapper
-    Branch b = Branch::create(ctx, model.get(), 0, 0, params, 64, nullptr, &store);
+    Branch b = Branch::create(ctx, model.get(), 0, 0, params, 64, nullptr, nullptr, &store);
     CHECK(b.valid());
     raw_handle = b.handle();
     CHECK(store.get(raw_handle) != nullptr);
@@ -509,7 +509,7 @@ TEST_CASE("branch integration: sample and accept token") {
   TestParams params;
   params.temperature = 0.0f;  // Greedy for reproducibility
 
-  BranchHandle h = create(ctx, model.get(), 0, 0, params, 64, nullptr, &store);
+  BranchHandle h = create(ctx, model.get(), 0, 0, params, 64, nullptr, nullptr, &store);
   REQUIRE(h != INVALID_HANDLE);
 
   const llama_vocab* vocab = llama_model_get_vocab(model.get());
@@ -556,7 +556,7 @@ TEST_CASE("branch integration: perplexity tracking across fork") {
   BranchStore store(8);
   TestParams params;
 
-  BranchHandle parent = create(ctx, model.get(), 0, 0, params, 64, nullptr, &store);
+  BranchHandle parent = create(ctx, model.get(), 0, 0, params, 64, nullptr, nullptr, &store);
   REQUIRE(parent != INVALID_HANDLE);
 
   // Decode prompt
@@ -575,7 +575,7 @@ TEST_CASE("branch integration: perplexity tracking across fork") {
   // Add to parent's perplexity tracker
   BranchState* pstate = store.get(parent);
   REQUIRE(pstate);
-  metrics::add_surprisal(pstate->ppl, surprisal);
+  metrics::add_model_surprisal(pstate->metrics, surprisal);
 
   float parent_ppl = get_perplexity(parent, &store);
   CHECK(std::isfinite(parent_ppl));
@@ -591,7 +591,7 @@ TEST_CASE("branch integration: perplexity tracking across fork") {
   // Add more surprisal to child only
   BranchState* cstate = store.get(child);
   REQUIRE(cstate);
-  metrics::add_surprisal(cstate->ppl, 2.0f);
+  metrics::add_model_surprisal(cstate->metrics, 2.0f);
 
   // Parent unchanged, child changed
   CHECK(std::abs(get_perplexity(parent, &store) - parent_ppl) < 0.001f);
@@ -631,7 +631,7 @@ TEST_CASE("branch scoping: logits snapshots are independent memory") {
   TestParams params;
 
   // Create branch and decode a token
-  BranchHandle branch = create(ctx, model.get(), 0, 0, params, 64, nullptr, &store);
+  BranchHandle branch = create(ctx, model.get(), 0, 0, params, 64, nullptr, nullptr, &store);
   REQUIRE(branch != INVALID_HANDLE);
 
   const llama_vocab* vocab = llama_model_get_vocab(model.get());
@@ -698,7 +698,7 @@ TEST_CASE("branch scoping: decode updates only target branch logits") {
   REQUIRE(!prompt.empty());
 
   // Create parent and decode prompt
-  BranchHandle parent = create(ctx, model.get(), 0, 0, params, 64, nullptr, &store);
+  BranchHandle parent = create(ctx, model.get(), 0, 0, params, 64, nullptr, nullptr, &store);
   decode_and_capture_one(parent, prompt[0], &store);
 
   // Fork to child
@@ -778,7 +778,7 @@ TEST_CASE("branch scoping: concurrent captures preserve isolation") {
   REQUIRE(!prompt.empty());
 
   // Create root and decode
-  BranchHandle root = create(ctx, model.get(), 0, 0, params, 64, nullptr, &store);
+  BranchHandle root = create(ctx, model.get(), 0, 0, params, 64, nullptr, nullptr, &store);
   decode_and_capture_one(root, prompt[0], &store);
 
   // Create 4 branches

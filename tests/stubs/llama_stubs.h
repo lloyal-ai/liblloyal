@@ -165,6 +165,8 @@ extern "C" {
     llama_sampler_chain_params llama_sampler_chain_default_params();
     llama_sampler* llama_sampler_chain_init(llama_sampler_chain_params params);
     void llama_sampler_chain_add(llama_sampler* chain, llama_sampler* smpl);
+    int llama_sampler_chain_n(llama_sampler* chain);
+    llama_sampler* llama_sampler_chain_remove(llama_sampler* chain, int32_t i);
     llama_sampler* llama_sampler_init_greedy();
     llama_sampler* llama_sampler_init_temp(float temp);
     llama_sampler* llama_sampler_init_dist(uint32_t seed);

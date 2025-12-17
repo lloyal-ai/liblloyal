@@ -104,6 +104,15 @@ option(LLOYAL_BUILD_INTEGRATION_TESTS "Build integration tests with real llama.c
 if(LLOYAL_BUILD_INTEGRATION_TESTS)
   message(STATUS "Building integration tests with real llama.cpp")
 
+  # Fetch remux (required for boundaries.hpp)
+  # Using SSH for private repo (works locally with SSH keys + in CI with deploy keys)
+  FetchContent_Declare(
+    remux
+    GIT_REPOSITORY git@github.com:lloyal-ai/remux-cpp.git
+    GIT_TAG        main
+  )
+  FetchContent_MakeAvailable(remux)
+
   # Integration test executable
   add_executable(IntegrationRunner
     integration/main.cpp
@@ -176,6 +185,7 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
       "-framework Foundation"
       ${LLAMA_CPP_DYLIB}
       doctest::doctest
+      remux::remux
     )
 
     # Set RPATH so dylib can be found at runtime
@@ -217,6 +227,7 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
       "-F${CMAKE_CURRENT_SOURCE_DIR}/${LLAMA_CPP_FRAMEWORK_PATH}/.."
       "-framework llama"
       doctest::doctest
+      remux::remux
     )
 
     # Set RPATH so framework can be found at runtime

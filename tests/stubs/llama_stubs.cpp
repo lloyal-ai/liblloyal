@@ -446,6 +446,14 @@ void llama_sampler_chain_add(llama_sampler * /*chain*/,
   // Stub - no-op
 }
 
+int llama_sampler_chain_n(llama_sampler * /*chain*/) {
+  return 2; // Stub - return dummy chain length
+}
+
+llama_sampler *llama_sampler_chain_remove(llama_sampler * /*chain*/, int32_t /*i*/) {
+  return reinterpret_cast<llama_sampler *>(0x5000); // Stub pointer
+}
+
 llama_sampler *llama_sampler_init_greedy() {
   return reinterpret_cast<llama_sampler *>(0x2000); // Stub pointer
 }

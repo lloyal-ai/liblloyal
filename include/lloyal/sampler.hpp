@@ -530,6 +530,35 @@ inline llama_sampler* clone_chain(llama_sampler* chain) {
 }
 
 /**
+ * Reseed the dist sampler in a chain
+ *
+ * Used in MCTS to ensure forked branches generate unique sequences.
+ * Removes the existing dist sampler (last in chain) and adds a new one.
+ *
+ * @param chain Chain to reseed
+ * @param new_seed New seed for randomness
+ */
+inline void reseed_chain(llama_sampler* chain, uint32_t new_seed) {
+  if (!chain) {
+    return;
+  }
+
+  int n = llama_sampler_chain_n(chain);
+  if (n == 0) {
+    return;
+  }
+
+  // Remove last sampler (dist by convention)
+  llama_sampler* old_dist = llama_sampler_chain_remove(chain, n - 1);
+  if (old_dist) {
+    llama_sampler_free(old_dist);
+  }
+
+  // Add new dist with new seed
+  llama_sampler_chain_add(chain, llama_sampler_init_dist(new_seed));
+}
+
+/**
  * Free a sampler chain
  *
  * @param chain Chain to free (safe to call with nullptr)
