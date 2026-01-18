@@ -2,7 +2,7 @@
 
 #include "common.hpp"
 #include "helpers.hpp" // For string_repeat, string_join, string_split
-#include <nlohmann/json.hpp>
+#include <lloyal/nlohmann/json.hpp>
 
 #include <algorithm>
 #include <functional>

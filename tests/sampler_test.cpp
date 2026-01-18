@@ -1,6 +1,7 @@
 #include "llama_stubs.h"
 #include <doctest/doctest.h>
 #include <lloyal/sampler.hpp>
+#include <lloyal/grammar.hpp>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -271,4 +272,35 @@ TEST_CASE("Sampler: sample_with_params(ctx, model, ...) with grammar "
   // Just verify overload accepts grammar parameter
   llama_token result = sample_with_params(&ctx, &model, params, nullptr);
   CHECK(result == 4);
+}
+
+// ===== GRAMMAR CLONE TESTS (System 2) =====
+
+TEST_CASE("Grammar: clone_sampler null input") {
+  resetStubConfig();
+  llama_sampler* result = lloyal::grammar::clone_sampler(nullptr);
+  CHECK(result == nullptr);
+  // Should not call llama_sampler_clone for null input
+  CHECK_FALSE(llamaStubConfig().sampler_clone_called);
+}
+
+TEST_CASE("Grammar: clone_sampler success") {
+  resetStubConfig();
+  llama_sampler dummy{};
+  llama_sampler cloned{};
+  llamaStubConfig().sampler_clone_result = &cloned;
+
+  llama_sampler* result = lloyal::grammar::clone_sampler(&dummy);
+  CHECK(llamaStubConfig().sampler_clone_called);
+  CHECK(result == &cloned);
+}
+
+TEST_CASE("Grammar: clone_sampler failure returns null") {
+  resetStubConfig();
+  llama_sampler dummy{};
+  llamaStubConfig().sampler_clone_result = nullptr;
+
+  llama_sampler* result = lloyal::grammar::clone_sampler(&dummy);
+  CHECK(llamaStubConfig().sampler_clone_called);
+  CHECK(result == nullptr);
 }

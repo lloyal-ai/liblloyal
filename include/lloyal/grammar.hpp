@@ -2,7 +2,9 @@
 
 #include "common.hpp"
 #include "json-schema-to-grammar.hpp"
-#include <nlohmann/json.hpp>
+#include "tokenizer.hpp"
+#include <llama/llama.h>
+#include <lloyal/nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
 
@@ -73,6 +75,127 @@ inline std::string from_json_schema(const std::string &schema_json) {
         std::string("Grammar conversion failed: ") + e.what();
     LLOYAL_LOG_DEBUG("[grammar::from_json_schema] ERROR: %s", errorMsg.c_str());
     throw std::runtime_error(errorMsg);
+  }
+}
+
+// ===== SAMPLER INITIALIZATION =====
+
+/**
+ * Initialize a grammar sampler from GBNF grammar string
+ *
+ * Convenience wrapper that handles vocab extraction from model.
+ *
+ * @param model Llama model (for vocab extraction)
+ * @param grammar_str GBNF grammar string (from from_json_schema or hand-written)
+ * @param root_rule Root rule name (default: "root")
+ * @return Initialized grammar sampler, or nullptr on failure
+ *
+ * OWNERSHIP: Caller owns returned sampler and must call llama_sampler_free()
+ *
+ * EXAMPLE:
+ *   std::string gbnf = grammar::from_json_schema(schema);
+ *   llama_sampler* sampler = grammar::init_sampler(model, gbnf);
+ *   // ... use sampler ...
+ *   llama_sampler_free(sampler);
+ */
+inline llama_sampler *init_sampler(const llama_model *model,
+                                   const std::string &grammar_str,
+                                   const std::string &root_rule = "root") {
+  if (!model) {
+    LLOYAL_LOG_DEBUG("[grammar::init_sampler] ERROR: model is null");
+    return nullptr;
+  }
+
+  if (grammar_str.empty()) {
+    LLOYAL_LOG_DEBUG("[grammar::init_sampler] ERROR: grammar_str is empty");
+    return nullptr;
+  }
+
+  const llama_vocab *vocab = tokenizer::get_vocab(model);
+  if (!vocab) {
+    LLOYAL_LOG_DEBUG("[grammar::init_sampler] ERROR: get_vocab returned null");
+    return nullptr;
+  }
+
+  LLOYAL_LOG_DEBUG("[grammar::init_sampler] Initializing grammar sampler "
+                   "(grammar: %zu bytes, root: %s)",
+                   grammar_str.size(), root_rule.c_str());
+
+  llama_sampler *sampler =
+      llama_sampler_init_grammar(vocab, grammar_str.c_str(), root_rule.c_str());
+
+  if (!sampler) {
+    LLOYAL_LOG_DEBUG("[grammar::init_sampler] ERROR: "
+                     "llama_sampler_init_grammar returned null");
+  }
+
+  return sampler;
+}
+
+/**
+ * Clone a grammar sampler (for fork/branching).
+ *
+ * Creates a deep copy of the sampler including its parser state.
+ * Use when forking a stepper to preserve grammar position.
+ *
+ * @param smpl Source sampler to clone
+ * @return New sampler with same state, or nullptr if input was null
+ *
+ * OWNERSHIP: Caller owns returned sampler and must call llama_sampler_free()
+ */
+inline llama_sampler *clone_sampler(llama_sampler *smpl) {
+  if (!smpl) {
+    LLOYAL_LOG_DEBUG("[grammar::clone_sampler] Input is null, returning null");
+    return nullptr;
+  }
+
+  llama_sampler *cloned = llama_sampler_clone(smpl);
+
+  if (!cloned) {
+    LLOYAL_LOG_DEBUG("[grammar::clone_sampler] ERROR: llama_sampler_clone failed");
+  } else {
+    LLOYAL_LOG_DEBUG("[grammar::clone_sampler] Cloned sampler successfully");
+  }
+
+  return cloned;
+}
+
+/**
+ * Free a grammar sampler
+ *
+ * @param smpl Sampler to free (safe to call with nullptr)
+ */
+inline void free_sampler(llama_sampler* smpl) {
+  if (smpl) {
+    llama_sampler_free(smpl);
+  }
+}
+
+/**
+ * Apply grammar constraint to candidates
+ *
+ * Modifies candidates in-place, masking tokens that violate grammar.
+ *
+ * @param smpl Grammar sampler
+ * @param cur_p Candidate array (modified in-place)
+ */
+inline void apply(llama_sampler* smpl, llama_token_data_array* cur_p) {
+  if (smpl && cur_p) {
+    llama_sampler_apply(smpl, cur_p);
+  }
+}
+
+/**
+ * Accept a token into grammar state
+ *
+ * Advances the grammar parser state.
+ *
+ * @param smpl Grammar sampler
+ * @param token Token to accept
+ */
+inline void accept(llama_sampler* smpl, llama_token token) {
+  if (smpl) {
+    llama_sampler_accept(smpl, token);
   }
 }
 

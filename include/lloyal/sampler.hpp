@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.hpp"
+#include "logits.hpp"
 #include "tokenizer.hpp"
 #include <cstdint>
 #include <ctime>
@@ -118,13 +119,8 @@ inline llama_token greedy(llama_context *ctx, const llama_vocab *vocab) {
 
   // Get last-step logits (index -1)
   // Per llama.cpp maintainers: only works if logits=true was set for that step
-  // in batch
-  const float *logits = llama_get_logits_ith(ctx, -1);
-  if (!logits) {
-    LLOYAL_LOG_DEBUG("[sampler::greedy] ERROR: Failed to get logits (ensure "
-                     "batch had logits=true)");
-    throw std::runtime_error("sampler::greedy - Failed to get logits");
-  }
+  // lloyal::logits::get() handles null checking and throws descriptive errors
+  const float *logits = lloyal::logits::get(ctx, -1);
 
   // Get vocabulary size
   const int n_vocab = llama_vocab_n_tokens(vocab);
@@ -217,11 +213,8 @@ inline llama_token sample_with_params(llama_context *ctx,
                      "using grammar-constrained sampling");
 
     // Get logits and build token data array
-    const float *logits = llama_get_logits_ith(ctx, -1);
-    if (!logits) {
-      throw std::runtime_error(
-          "sampler::sample_with_params - Failed to get logits");
-    }
+    // lloyal::logits::get() handles null checking and throws descriptive errors
+    const float *logits = lloyal::logits::get(ctx, -1);
 
     const int n_vocab = llama_vocab_n_tokens(vocab);
     if (n_vocab <= 0) {
@@ -299,11 +292,8 @@ inline llama_token sample_with_params(llama_context *ctx,
                    "lightweight chain approach");
 
   // Get logits
-  const float *logits = llama_get_logits_ith(ctx, -1);
-  if (!logits) {
-    throw std::runtime_error(
-        "sampler::sample_with_params - Failed to get logits");
-  }
+  // lloyal::logits::get() handles null checking and throws descriptive errors
+  const float *logits = lloyal::logits::get(ctx, -1);
 
   const int n_vocab = llama_vocab_n_tokens(vocab);
   if (n_vocab <= 0) {
@@ -452,6 +442,159 @@ inline llama_token sample_with_params(llama_context *ctx,
   }
 
   return sample_with_params(ctx, vocab, params, grammarSampler);
+}
+
+// ===== PERSISTENT SAMPLER CHAIN PRIMITIVES =====
+//
+// These functions manage persistent sampler chains for use cases like
+// branch-based MCTS where the same chain is reused across multiple samples.
+// Unlike sample_with_params() which creates/destroys a chain per call,
+// these allow chain reuse for better performance.
+
+/**
+ * Create a persistent sampler chain from parameters
+ *
+ * Builds a sampler chain that can be reused for multiple samples.
+ * Handles temperature <= 0 as greedy mode (deterministic argmax).
+ *
+ * @param params Sampling parameters (any SamplingParamsLike type)
+ * @return Owned sampler chain - caller must free with free_chain()
+ */
+template <SamplingParamsLike P>
+inline llama_sampler* create_chain(const P& params) {
+  using detail::as_value;
+
+  // Extract parameters with defaults
+  int32_t penalty_last_n = as_value(params.penalty_last_n, static_cast<int32_t>(64));
+  float penalty_repeat = as_value(params.penalty_repeat, 1.0f);
+  float penalty_freq = as_value(params.penalty_freq, 0.0f);
+  float penalty_present = as_value(params.penalty_present, 0.0f);
+  int32_t top_k = as_value(params.top_k, static_cast<int32_t>(40));
+  float top_p = as_value(params.top_p, 0.95f);
+  float min_p = as_value(params.min_p, 0.05f);
+  float typical_p = as_value(params.typical_p, 1.0f);
+  float temperature = as_value(params.temperature, 0.8f);
+  uint32_t seed = as_value(params.seed, static_cast<uint32_t>(std::time(nullptr)));
+
+  llama_sampler_chain_params chain_params = llama_sampler_chain_default_params();
+  chain_params.no_perf = true;
+  llama_sampler* chain = llama_sampler_chain_init(chain_params);
+
+  if (!chain) {
+    throw std::runtime_error("sampler::create_chain - Failed to create sampler chain");
+  }
+
+  // Add samplers in standard order: penalties → filters → temperature/greedy → dist
+  if (penalty_repeat != 1.0f || penalty_freq != 0.0f || penalty_present != 0.0f) {
+    llama_sampler_chain_add(chain,
+        llama_sampler_init_penalties(penalty_last_n, penalty_repeat, penalty_freq, penalty_present));
+  }
+  if (top_k > 0) {
+    llama_sampler_chain_add(chain, llama_sampler_init_top_k(top_k));
+  }
+  if (typical_p < 1.0f) {
+    llama_sampler_chain_add(chain, llama_sampler_init_typical(typical_p, 1));
+  }
+  if (top_p < 1.0f) {
+    llama_sampler_chain_add(chain, llama_sampler_init_top_p(top_p, 1));
+  }
+  if (min_p > 0.0f) {
+    llama_sampler_chain_add(chain, llama_sampler_init_min_p(min_p, 1));
+  }
+
+  // Temperature handling: temp <= 0 means greedy (deterministic argmax)
+  if (temperature <= 0.0f) {
+    llama_sampler_chain_add(chain, llama_sampler_init_greedy());
+  } else {
+    llama_sampler_chain_add(chain, llama_sampler_init_temp(temperature));
+    llama_sampler_chain_add(chain, llama_sampler_init_dist(seed));
+  }
+
+  return chain;
+}
+
+/**
+ * Clone a sampler chain
+ *
+ * Creates an independent copy of the chain with the same state.
+ * Used when forking branches in MCTS.
+ *
+ * @param chain Source chain to clone
+ * @return Owned clone - caller must free with free_chain()
+ */
+inline llama_sampler* clone_chain(llama_sampler* chain) {
+  if (!chain) {
+    return nullptr;
+  }
+  return llama_sampler_clone(chain);
+}
+
+/**
+ * Reseed the dist sampler in a chain
+ *
+ * Used in MCTS to ensure forked branches generate unique sequences.
+ * Removes the existing dist sampler (last in chain) and adds a new one.
+ *
+ * @param chain Chain to reseed
+ * @param new_seed New seed for randomness
+ */
+inline void reseed_chain(llama_sampler* chain, uint32_t new_seed) {
+  if (!chain) {
+    return;
+  }
+
+  int n = llama_sampler_chain_n(chain);
+  if (n == 0) {
+    return;
+  }
+
+  // Remove last sampler (dist by convention)
+  llama_sampler* old_dist = llama_sampler_chain_remove(chain, n - 1);
+  if (old_dist) {
+    llama_sampler_free(old_dist);
+  }
+
+  // Add new dist with new seed
+  llama_sampler_chain_add(chain, llama_sampler_init_dist(new_seed));
+}
+
+/**
+ * Free a sampler chain
+ *
+ * @param chain Chain to free (safe to call with nullptr)
+ */
+inline void free_chain(llama_sampler* chain) {
+  if (chain) {
+    llama_sampler_free(chain);
+  }
+}
+
+/**
+ * Apply a sampler chain to a candidate array
+ *
+ * Modifies candidates in-place, setting cur_p.selected to the chosen token.
+ *
+ * @param chain Sampler chain to apply
+ * @param cur_p Candidate array (modified in-place)
+ */
+inline void apply(llama_sampler* chain, llama_token_data_array* cur_p) {
+  if (chain && cur_p) {
+    llama_sampler_apply(chain, cur_p);
+  }
+}
+
+/**
+ * Accept a token into the sampler chain
+ *
+ * Updates internal state (e.g., penalty tracking).
+ *
+ * @param chain Sampler chain
+ * @param token Token to accept
+ */
+inline void accept(llama_sampler* chain, llama_token token) {
+  if (chain) {
+    llama_sampler_accept(chain, token);
+  }
 }
 
 } // namespace sampler

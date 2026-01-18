@@ -71,6 +71,50 @@ inline llama_pos pos_max(llama_context *ctx, llama_seq_id seq) {
   return max_pos;
 }
 
+/**
+ * Copy KV cache from one sequence to another (for branching/fork).
+ *
+ * @param ctx llama context
+ * @param src source sequence ID
+ * @param dst destination sequence ID
+ * @param p0 start position (inclusive), default 0
+ * @param p1 end position (exclusive), default -1 (to end)
+ *
+ * Use case: System 2 tree search - fork from trunk without copying model weights
+ */
+inline void seq_cp(llama_context *ctx, llama_seq_id src, llama_seq_id dst,
+                   llama_pos p0 = 0, llama_pos p1 = -1) {
+  if (!ctx) {
+    LLOYAL_LOG_DEBUG("[kv::seq_cp] ERROR: null context");
+    return;
+  }
+
+  llama_memory_t mem = llama_get_memory(ctx);
+  llama_memory_seq_cp(mem, src, dst, p0, p1);
+
+  LLOYAL_LOG_DEBUG("[kv::seq_cp] Copied seq %d → %d [%d, %d)", src, dst, p0, p1);
+}
+
+/**
+ * Keep only one sequence, removing all others.
+ *
+ * @param ctx llama context
+ * @param seq sequence ID to keep
+ *
+ * Use case: After tree search, prune all branches except winner
+ */
+inline void seq_keep(llama_context *ctx, llama_seq_id seq) {
+  if (!ctx) {
+    LLOYAL_LOG_DEBUG("[kv::seq_keep] ERROR: null context");
+    return;
+  }
+
+  llama_memory_t mem = llama_get_memory(ctx);
+  llama_memory_seq_keep(mem, seq);
+
+  LLOYAL_LOG_DEBUG("[kv::seq_keep] Kept only seq %d", seq);
+}
+
 // ===== STATE SNAPSHOT OPERATIONS (with fragmentation fallback) =====
 
 /**
