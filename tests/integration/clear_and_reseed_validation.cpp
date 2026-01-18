@@ -2,6 +2,7 @@
 // Ported from: packages/@calibrate/calibrate-ndk/tests/integration/ClearAndReseed_Validation.cpp
 
 #include <doctest/doctest.h>
+#include "test_config.hpp"
 #include <lloyal/model_registry.hpp>
 #include <lloyal/tokenizer.hpp>
 #include <lloyal/decoder.hpp>
@@ -9,10 +10,135 @@
 #include <llama/llama.h>
 #include <cmath>
 #include <vector>
+#include <string>
 #include <algorithm>
 #include <numeric>
+#include <random>
+#include <chrono>
+#include <iomanip>
+#include <sstream>
 
 using namespace lloyal;
+
+// Helper: Generate UUID for run_id
+static std::string generate_uuid() {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(0, 15);
+
+    const char* hex = "0123456789abcdef";
+    std::string uuid = "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx";
+
+    for (char& c : uuid) {
+        if (c == 'x') {
+            c = hex[dis(gen)];
+        } else if (c == 'y') {
+            c = hex[(dis(gen) & 0x3) | 0x8];
+        }
+    }
+    return uuid;
+}
+
+// Helper: Get ISO8601 timestamp
+static std::string get_timestamp() {
+    auto now = std::chrono::system_clock::now();
+    auto time_t_now = std::chrono::system_clock::to_time_t(now);
+    std::stringstream ss;
+    ss << std::put_time(std::gmtime(&time_t_now), "%Y-%m-%dT%H:%M:%SZ");
+    return ss.str();
+}
+
+// Helper: Extract model metadata from filename
+struct ModelMetadata {
+    std::string filename;
+    std::string model_name;
+    std::string quantization;
+    std::string size_estimate;
+};
+
+static ModelMetadata extract_model_metadata(const char* path) {
+    ModelMetadata meta;
+
+    // Extract filename from path
+    std::string full_path(path);
+    auto pos = full_path.find_last_of("/\\");
+    meta.filename = (pos != std::string::npos) ? full_path.substr(pos + 1) : full_path;
+
+    // Extract quantization (Q4_K_M, Q8_0, F16, etc.) - case insensitive
+    std::string fname = meta.filename;
+    std::string fname_lower = fname;
+    std::transform(fname_lower.begin(), fname_lower.end(), fname_lower.begin(), ::tolower);
+
+    if (fname_lower.find("q4_k_m") != std::string::npos) {
+        meta.quantization = "Q4_K_M";
+    } else if (fname_lower.find("q8_0") != std::string::npos) {
+        meta.quantization = "Q8_0";
+    } else if (fname_lower.find("f16") != std::string::npos || fname_lower.find("fp16") != std::string::npos) {
+        meta.quantization = "F16";
+    } else if (fname_lower.find("f32") != std::string::npos || fname_lower.find("fp32") != std::string::npos) {
+        meta.quantization = "F32";
+    } else {
+        meta.quantization = "unknown";
+    }
+
+    // Extract model name (strip quantization and .gguf) - case insensitive
+    meta.model_name = fname;
+    size_t quant_pos = fname_lower.find("-q");
+    if (quant_pos == std::string::npos) {
+        quant_pos = fname_lower.find("-f");  // Also handle -F16, -F32
+    }
+    if (quant_pos != std::string::npos) {
+        meta.model_name = fname.substr(0, quant_pos);
+    }
+    size_t gguf_pos = meta.model_name.find(".gguf");
+    if (gguf_pos != std::string::npos) {
+        meta.model_name = meta.model_name.substr(0, gguf_pos);
+    }
+
+    // Estimate size from name (1.7B, 3B, etc.) - using fname_lower already created above
+
+    if (fname_lower.find("135m") != std::string::npos || fname_lower.find("0.1b") != std::string::npos) {
+        meta.size_estimate = "135M";
+    } else if (fname_lower.find("360m") != std::string::npos) {
+        meta.size_estimate = "360M";
+    } else if (fname_lower.find("0.5b") != std::string::npos || fname_lower.find("500m") != std::string::npos) {
+        meta.size_estimate = "0.5B";
+    } else if (fname_lower.find("1b") != std::string::npos) {
+        meta.size_estimate = "1B";
+    } else if (fname_lower.find("1.1b") != std::string::npos) {
+        meta.size_estimate = "1.1B";
+    } else if (fname_lower.find("1.5b") != std::string::npos) {
+        meta.size_estimate = "1.5B";
+    } else if (fname_lower.find("1.7b") != std::string::npos) {
+        meta.size_estimate = "1.7B";
+    } else if (fname_lower.find("2b") != std::string::npos) {
+        meta.size_estimate = "2B";
+    } else if (fname_lower.find("3b") != std::string::npos || fname_lower.find("3.8b") != std::string::npos) {
+        meta.size_estimate = "3B";
+    } else if (fname_lower.find("7b") != std::string::npos) {
+        meta.size_estimate = "7B";
+    } else {
+        meta.size_estimate = "unknown";
+    }
+
+    return meta;
+}
+
+// Helper: Escape JSON strings
+static std::string json_escape(const std::string& s) {
+    std::string result;
+    for (char c : s) {
+        switch (c) {
+            case '"': result += "\\\""; break;
+            case '\\': result += "\\\\"; break;
+            case '\n': result += "\\n"; break;
+            case '\r': result += "\\r"; break;
+            case '\t': result += "\\t"; break;
+            default: result += c; break;
+        }
+    }
+    return result;
+}
 
 /**
  * Empirical Validation: clear+re-decode Preserves StreamingLLM Pattern
@@ -127,9 +253,9 @@ TEST_CASE("Empirical: clearAndReseed preserves perplexity") {
 
     // === SETUP ===
     auto model_params = llama_model_default_params();
-    model_params.n_gpu_layers = 0;  // CPU for determinism
+    model_params.n_gpu_layers = TestConfig::n_gpu_layers();  // CPU for determinism
 
-    auto model = model_registry::acquire(MODEL_PATH, model_params);
+    auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
     REQUIRE(model != nullptr);
 
     auto ctx_params = llama_context_default_params();
@@ -367,6 +493,47 @@ TEST_CASE("Empirical: clearAndReseed preserves perplexity") {
         INFO("⚠️  WARNING: PPL ratio " << ppl_ratio << " exceeds 1.10 threshold");
         WARN(ppl_ratio < 1.10);  // Soft warning without failing the test
     }
+
+    // === STRUCTURED JSON OUTPUT ===
+    // Extract model metadata
+    auto meta = extract_model_metadata(MODEL_PATH);
+    std::string run_id = generate_uuid();
+    std::string timestamp = get_timestamp();
+
+    // Determine pass/fail based on primary checks
+    bool top1_pass = (top1_after == top1_before);
+    bool top10_pass = (overlap >= 7);
+    bool jsd_pass = (jsd < 1e-2);
+    bool ppl_pass = (ppl_ratio < 1.10);
+    bool overall_pass = top1_pass && top10_pass && jsd_pass;  // PPL is secondary
+
+    // Output JSON (single line for easy parsing/aggregation)
+    std::cout << "\n=== JSON_RESULT ===" << std::endl;
+    std::cout << "{";
+    std::cout << "\"run_id\":\"" << json_escape(run_id) << "\",";
+    std::cout << "\"timestamp\":\"" << json_escape(timestamp) << "\",";
+    std::cout << "\"model\":\"" << json_escape(meta.filename) << "\",";
+    std::cout << "\"model_name\":\"" << json_escape(meta.model_name) << "\",";
+    std::cout << "\"model_size\":\"" << json_escape(meta.size_estimate) << "\",";
+    std::cout << "\"quantization\":\"" << json_escape(meta.quantization) << "\",";
+    std::cout << "\"context_length\":" << ctx_params.n_ctx << ",";
+    std::cout << "\"tokens_before_reseed\":" << tokens_to_generate << ",";
+    std::cout << "\"sink_count\":" << SINK_COUNT << ",";
+    std::cout << "\"tail_count\":" << TAIL_COUNT << ",";
+    std::cout << "\"total_reseeded\":" << (SINK_COUNT + TAIL_COUNT) << ",";
+    std::cout << "\"top1_before\":" << top1_before << ",";
+    std::cout << "\"top1_after\":" << top1_after << ",";
+    std::cout << "\"top1_match\":" << (top1_pass ? "true" : "false") << ",";
+    std::cout << "\"top10_overlap\":" << overlap << ",";
+    std::cout << "\"jsd\":" << std::fixed << std::setprecision(6) << jsd << ",";
+    std::cout << "\"kl_before_after\":" << std::fixed << std::setprecision(6) << kl_ba << ",";
+    std::cout << "\"kl_after_before\":" << std::fixed << std::setprecision(6) << kl_ab << ",";
+    std::cout << "\"ppl_window_before\":" << std::fixed << std::setprecision(4) << mean_ppl_before << ",";
+    std::cout << "\"ppl_window_after\":" << std::fixed << std::setprecision(4) << mean_ppl_after << ",";
+    std::cout << "\"ppl_ratio\":" << std::fixed << std::setprecision(4) << ppl_ratio << ",";
+    std::cout << "\"pass\":" << (overall_pass ? "true" : "false");
+    std::cout << "}" << std::endl;
+    std::cout << "=== END_JSON_RESULT ===" << std::endl;
 
     // === CLEANUP ===
     llama_free(ctx);

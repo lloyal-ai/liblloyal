@@ -28,9 +28,12 @@ add_executable(TestRunner
   model_registry_test.cpp
   kv_test.cpp
   decoder_test.cpp
+  decoder_seq_test.cpp
   tokenizer_test.cpp
   sampler_test.cpp
   chat_template_test.cpp
+  embedding_test.cpp
+  metrics_test.cpp
   stubs/llama_stubs.cpp
 )
 
@@ -50,17 +53,38 @@ target_compile_options(TestRunner PRIVATE -Wall -Wextra)
 # Optional: Enable sanitizers (pass -DLLOYAL_ENABLE_SANITIZERS=ON to cmake)
 option(LLOYAL_ENABLE_SANITIZERS "Enable AddressSanitizer and UBSan" OFF)
 if(LLOYAL_ENABLE_SANITIZERS)
-  message(STATUS "Enabling sanitizers (AddressSanitizer + UBSan)")
-  target_compile_options(TestRunner PRIVATE
-    -fsanitize=address
-    -fsanitize=undefined
-    -fno-omit-frame-pointer
-    -g
-  )
-  target_link_options(TestRunner PRIVATE
-    -fsanitize=address
-    -fsanitize=undefined
-  )
+  # Detect compiler for sanitizer flag compatibility
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(STATUS "Enabling sanitizers (Clang: ASan + UBSan + Integer + Float)")
+    target_compile_options(TestRunner PRIVATE
+      -fsanitize=address
+      -fsanitize=undefined
+      -fsanitize=integer              # Clang-only: catches unsigned overflow & implicit truncation
+      -fsanitize=float-divide-by-zero # Clang-only: catches float division by zero
+      -fno-sanitize=unsigned-shift-base  # Clang-only: allow shifting into sign bit
+      -fno-omit-frame-pointer
+      -g
+    )
+    target_link_options(TestRunner PRIVATE
+      -fsanitize=address
+      -fsanitize=undefined
+      -fsanitize=integer
+      -fsanitize=float-divide-by-zero
+    )
+  else()
+    # GCC: only supports address and undefined sanitizers
+    message(STATUS "Enabling sanitizers (GCC: ASan + UBSan)")
+    target_compile_options(TestRunner PRIVATE
+      -fsanitize=address
+      -fsanitize=undefined
+      -fno-omit-frame-pointer
+      -g
+    )
+    target_link_options(TestRunner PRIVATE
+      -fsanitize=address
+      -fsanitize=undefined
+    )
+  endif()
 endif()
 
 # Optional: Custom target for running tests
@@ -95,9 +119,12 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
     integration/e2e_parameter_flow_test.cpp
     integration/sampler_integration_test.cpp
     integration/clear_and_reseed_test.cpp
+    integration/clear_and_reseed_validation.cpp
     integration/rope_position_invariant_test.cpp
     integration/chat_template_integration_test.cpp
     integration/kv_file_persistence_test.cpp
+    integration/embedding_integration_test.cpp
+    integration/multi_sequence_integration_test.cpp
   )
 
   # Create llama/ subdirectory and symlink headers so #include <llama/llama.h> works

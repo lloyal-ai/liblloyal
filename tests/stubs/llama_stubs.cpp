@@ -99,6 +99,22 @@ void llama_memory_clear(llama_memory_t /*mem*/, bool /*clear_kv*/) {
   // Real behavior validated in integration tests
 }
 
+void llama_memory_seq_cp(llama_memory_t /*mem*/, llama_seq_id src,
+                         llama_seq_id dst, llama_pos p0, llama_pos p1) {
+  auto& cfg = llamaStubConfig();
+  cfg.seq_cp_called = true;
+  cfg.seq_cp_src = src;
+  cfg.seq_cp_dst = dst;
+  cfg.seq_cp_p0 = p0;
+  cfg.seq_cp_p1 = p1;
+}
+
+void llama_memory_seq_keep(llama_memory_t /*mem*/, llama_seq_id seq) {
+  auto& cfg = llamaStubConfig();
+  cfg.seq_keep_called = true;
+  cfg.seq_keep_seq = seq;
+}
+
 // ===== PER-SEQUENCE STATE OPERATIONS =====
 
 size_t llama_state_seq_get_size(llama_context * /*ctx*/, llama_seq_id /*seq*/) {
@@ -214,8 +230,26 @@ void llama_batch_free(llama_batch batch) {
 
 // ===== DECODE OPERATIONS =====
 
-int llama_decode(llama_context * /*ctx*/, llama_batch /*batch*/) {
+int llama_decode(llama_context * /*ctx*/, llama_batch batch) {
   g_stub_config.decode_call_count++;
+
+  // Track seq_id from batch (for multi-sequence tests)
+  if (batch.n_tokens > 0 && batch.seq_id && batch.seq_id[0]) {
+    llama_seq_id seq = batch.seq_id[0][0];  // First token's first seq_id
+    g_stub_config.last_batch_seq_id = seq;
+
+    // Track if all batches use consistent seq_id
+    if (g_stub_config.all_batches_used_seq_id == -1) {
+      // First batch - set the seq_id
+      g_stub_config.all_batches_used_seq_id = seq;
+    } else if (g_stub_config.all_batches_used_seq_id >= 0 &&
+               g_stub_config.all_batches_used_seq_id != seq) {
+      // Different seq_id than previous batches - mark as mixed
+      g_stub_config.all_batches_used_seq_id = -2;
+    }
+    // If already -2 (mixed), leave it as -2
+  }
+
   return g_stub_config.decode_result;
 }
 
@@ -412,6 +446,14 @@ void llama_sampler_chain_add(llama_sampler * /*chain*/,
   // Stub - no-op
 }
 
+int llama_sampler_chain_n(llama_sampler * /*chain*/) {
+  return 2; // Stub - return dummy chain length
+}
+
+llama_sampler *llama_sampler_chain_remove(llama_sampler * /*chain*/, int32_t /*i*/) {
+  return reinterpret_cast<llama_sampler *>(0x5000); // Stub pointer
+}
+
 llama_sampler *llama_sampler_init_greedy() {
   return reinterpret_cast<llama_sampler *>(0x2000); // Stub pointer
 }
@@ -457,6 +499,13 @@ void llama_sampler_free(llama_sampler * /*smpl*/) {
   // Stub - no-op
 }
 
+llama_sampler *llama_sampler_clone(llama_sampler *smpl) {
+  auto& cfg = llamaStubConfig();
+  cfg.sampler_clone_called = true;
+  // Return null if input is null, otherwise return configured result
+  return smpl ? cfg.sampler_clone_result : nullptr;
+}
+
 // ===== GRAMMAR SAMPLER OPERATIONS (For vendored common_sampler) =====
 
 llama_sampler *llama_sampler_init_grammar(const llama_vocab * /*vocab*/,
@@ -482,6 +531,40 @@ void llama_sampler_reset(llama_sampler * /*smpl*/) {
 
 const llama_model *llama_get_model(const llama_context * /*ctx*/) {
   return reinterpret_cast<const llama_model *>(0xB000); // Stub pointer
+}
+
+// ===== EMBEDDING OPERATIONS =====
+
+int32_t llama_model_n_embd(const llama_model * /*model*/) {
+  return g_stub_config.n_embd;
+}
+
+int32_t llama_pooling_type(const llama_context * /*ctx*/) {
+  return g_stub_config.pooling_type;
+}
+
+float *llama_get_embeddings(llama_context * /*ctx*/) {
+  if (!g_stub_config.embeddings_available ||
+      g_stub_config.embeddings.empty()) {
+    return nullptr;
+  }
+  return g_stub_config.embeddings.data();
+}
+
+float *llama_get_embeddings_seq(llama_context * /*ctx*/, llama_seq_id /*seq*/) {
+  if (!g_stub_config.embeddings_available ||
+      g_stub_config.embeddings.empty()) {
+    return nullptr;
+  }
+  return g_stub_config.embeddings.data();
+}
+
+float *llama_get_embeddings_ith(llama_context * /*ctx*/, int32_t /*idx*/) {
+  if (!g_stub_config.embeddings_available ||
+      g_stub_config.embeddings.empty()) {
+    return nullptr;
+  }
+  return g_stub_config.embeddings.data();
 }
 
 } // extern "C"

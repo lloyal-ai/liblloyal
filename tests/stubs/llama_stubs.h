@@ -29,7 +29,8 @@ using llama_token = int32_t;
 struct llama_batch {
     int32_t n_tokens;
     llama_token* token;
-    int32_t* pos;
+    float* embd;
+    llama_pos* pos;
     int32_t* n_seq_id;
     llama_seq_id** seq_id;
     int8_t* logits;
@@ -70,6 +71,12 @@ struct llama_token_data_array {
     bool sorted;       // Whether array is sorted by probability
 };
 
+// Logit bias structure for static token biases
+struct llama_logit_bias {
+    llama_token token;
+    float bias;
+};
+
 // Minimal llama.cpp API functions
 extern "C" {
     // Model loading and cleanup
@@ -91,6 +98,8 @@ extern "C" {
     bool llama_memory_seq_rm(llama_memory_t mem, llama_seq_id seq, llama_pos p0, llama_pos p1);
     llama_pos llama_memory_seq_pos_max(llama_memory_t mem, llama_seq_id seq);
     void llama_memory_clear(llama_memory_t mem, bool clear_kv);  // Phase 3: clear KV cache
+    void llama_memory_seq_cp(llama_memory_t mem, llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1);  // System 2: branch copy
+    void llama_memory_seq_keep(llama_memory_t mem, llama_seq_id seq);  // System 2: prune other sequences
 
     // Per-sequence state operations
     size_t llama_state_seq_get_size(llama_context* ctx, llama_seq_id seq);
@@ -162,6 +171,8 @@ extern "C" {
     llama_sampler_chain_params llama_sampler_chain_default_params();
     llama_sampler* llama_sampler_chain_init(llama_sampler_chain_params params);
     void llama_sampler_chain_add(llama_sampler* chain, llama_sampler* smpl);
+    int llama_sampler_chain_n(llama_sampler* chain);
+    llama_sampler* llama_sampler_chain_remove(llama_sampler* chain, int32_t i);
     llama_sampler* llama_sampler_init_greedy();
     llama_sampler* llama_sampler_init_temp(float temp);
     llama_sampler* llama_sampler_init_dist(uint32_t seed);
@@ -177,6 +188,7 @@ extern "C" {
     );
     llama_token llama_sampler_sample(llama_sampler* smpl, llama_context* ctx, int32_t idx);
     void llama_sampler_free(llama_sampler* smpl);
+    llama_sampler* llama_sampler_clone(llama_sampler* smpl);  // System 2: clone for fork
 
     // Grammar sampler operations (for vendored common_sampler)
     llama_sampler* llama_sampler_init_grammar(const llama_vocab* vocab, const char* grammar_str, const char* grammar_root);
@@ -186,7 +198,20 @@ extern "C" {
 
     // Model introspection (for vendored common_sampler)
     const llama_model* llama_get_model(const llama_context* ctx);
+
+    // Embedding operations
+    int32_t llama_model_n_embd(const llama_model* model);
+    int32_t llama_pooling_type(const llama_context* ctx);
+    float* llama_get_embeddings(llama_context* ctx);
+    float* llama_get_embeddings_seq(llama_context* ctx, llama_seq_id seq);
+    float* llama_get_embeddings_ith(llama_context* ctx, int32_t idx);
 }
+
+// Pooling type constants matching llama.cpp
+#define LLAMA_POOLING_TYPE_NONE 0
+#define LLAMA_POOLING_TYPE_MEAN 1
+#define LLAMA_POOLING_TYPE_CLS 2
+#define LLAMA_POOLING_TYPE_LAST 3
 
 // Test control structure for configuring stub behavior
 struct LlamaStubConfig {
@@ -201,6 +226,17 @@ struct LlamaStubConfig {
     llama_pos pos_max = -1;                    // Max position in KV cache (-1 = empty)
     bool rm_ok = true;                         // Whether llama_memory_seq_rm succeeds
 
+    // Sequence copy tracking (System 2)
+    bool seq_cp_called = false;
+    llama_seq_id seq_cp_src = -1;
+    llama_seq_id seq_cp_dst = -1;
+    llama_pos seq_cp_p0 = -1;
+    llama_pos seq_cp_p1 = -1;
+
+    // Sequence keep tracking (System 2)
+    bool seq_keep_called = false;
+    llama_seq_id seq_keep_seq = -1;
+
     // Per-sequence state operations
     size_t per_seq_size = 0;                   // Per-sequence state size (0 = triggers fallback)
     size_t per_seq_rw = 0;                     // Per-sequence read/write bytes (0 = triggers fallback)
@@ -214,6 +250,10 @@ struct LlamaStubConfig {
     int decode_result = 0;                     // 0=success, <0=failure
     int decode_call_count = 0;                 // Track number of decode calls
     int batch_free_call_count = 0;             // Track RAII cleanup
+
+    // Sequence ID tracking (for multi-sequence tests)
+    llama_seq_id last_batch_seq_id = -1;       // Last seq_id seen in batch (first token)
+    llama_seq_id all_batches_used_seq_id = -1; // -1=unset, -2=mixed, else=consistent seq_id
 
     // Tokenization operations (two-pass simulation)
     std::vector<llama_token> tokenize_result;  // Tokens to return
@@ -233,6 +273,10 @@ struct LlamaStubConfig {
     std::set<llama_token> eog_tokens;          // End-of-generation tokens
     llama_token sample_result = 1;             // Token returned by llama_sampler_sample
 
+    // Sampler clone tracking (System 2)
+    bool sampler_clone_called = false;
+    llama_sampler* sampler_clone_result = nullptr;
+
     // Chat template and special tokens
     std::string chat_template;                 // Model's chat template string
     llama_token bos_token = 1;                 // Beginning-of-sequence token
@@ -244,6 +288,12 @@ struct LlamaStubConfig {
     size_t file_read_bytes = 0;                // Bytes read by state_seq_load_file
     size_t file_token_count = 0;               // Tokens in file
     bool file_operation_succeeds = true;       // Controls if file ops succeed
+
+    // Embedding operations
+    int32_t n_embd = 0;                        // Embedding dimension (0 = no embeddings)
+    int32_t pooling_type = LLAMA_POOLING_TYPE_NONE;  // Pooling type
+    std::vector<float> embeddings;             // Embedding values to return
+    bool embeddings_available = false;         // Controls if llama_get_embeddings returns valid ptr
 };
 
 // Global stub configuration accessor

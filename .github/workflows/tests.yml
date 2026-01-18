@@ -7,19 +7,15 @@ on:
     branches: [ main, develop ]
 
 jobs:
+  # Unit tests - stub-based, platform-independent (run on Linux only for speed)
   unit-tests:
     name: Unit Tests (Stub-based)
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+    runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install dependencies (Ubuntu)
-      if: runner.os == 'Linux'
+    - name: Install dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y cmake build-essential
@@ -36,12 +32,75 @@ jobs:
       working-directory: tests
       run: ./build/TestRunner --success
 
-    - name: Upload test results
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: unit-test-results-${{ matrix.os }}
-        path: tests/build/
+  # Sanitizer tests - Linux only (ASan + UBSan + LeakSan)
+  # macOS ARM has limited sanitizer support, Linux catches same bugs
+  sanitizer-tests:
+    name: Sanitizer Tests (ASan + UBSan + LeakSan)
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake build-essential
+
+    - name: Configure CMake with sanitizers
+      working-directory: tests
+      run: |
+        cmake -S . -B build_san \
+          -DCMAKE_BUILD_TYPE=Debug \
+          -DLLOYAL_ENABLE_SANITIZERS=ON
+
+    - name: Build tests with sanitizers
+      working-directory: tests
+      run: cmake --build build_san --config Debug
+
+    - name: Run tests with ASan + UBSan + LeakSan
+      working-directory: tests
+      env:
+        ASAN_OPTIONS: detect_leaks=1
+      run: |
+        echo "Running with AddressSanitizer, UBSan, Integer, Float, and LeakSanitizer..."
+        ./build_san/TestRunner --success 2>&1 | tee sanitizer_output.txt
+        # Check for any runtime errors (warnings are ok, errors are not)
+        if grep -q "ERROR: " sanitizer_output.txt; then
+          echo "❌ Sanitizer found errors!"
+          exit 1
+        fi
+        echo "✅ No sanitizer errors"
+
+  # ABI safety fallback - ensures LLOYAL_STACK_BATCH=0 path compiles and works
+  abi-safe-path-tests:
+    name: ABI Safe Path (LLOYAL_STACK_BATCH=0)
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake build-essential
+
+    - name: Configure CMake with LLOYAL_STACK_BATCH=0
+      working-directory: tests
+      run: |
+        cmake -S . -B build_abi_safe \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_CXX_FLAGS="-DLLOYAL_STACK_BATCH=0"
+
+    - name: Build tests with safe batch path
+      working-directory: tests
+      run: cmake --build build_abi_safe --config Release
+
+    - name: Run decoder tests (exercises decode_one)
+      working-directory: tests
+      run: |
+        echo "Running with LLOYAL_STACK_BATCH=0 (thread_local batch)..."
+        # Run decoder tests to verify decode_one() works with thread_local batch
+        ./build_abi_safe/TestRunner --success --test-case="*decoder*"
 
   integration-tests-macos:
     name: Integration Tests (macOS)
@@ -51,6 +110,14 @@ jobs:
     - uses: actions/checkout@v4
       with:
         lfs: true  # Pull LFS files (xcframework binaries)
+
+    - name: Cache test models
+      uses: actions/cache@v4
+      with:
+        path: tests/fixtures
+        key: test-models-v1-${{ hashFiles('.github/workflows/tests.yml') }}
+        restore-keys: |
+          test-models-v1-
 
     - name: Download test models
       working-directory: tests
@@ -100,6 +167,27 @@ jobs:
           echo "✓ Using cached tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
         fi
 
+        # Download nomic-embed-text-v1.5 (67MB) for embedding tests
+        if [ ! -f fixtures/nomic-embed-text-v1.5.Q4_K_M.gguf ]; then
+          echo "Downloading nomic-embed-text-v1.5.Q4_K_M.gguf (67MB)..."
+          curl -fsSL --retry 3 --retry-delay 2 \
+            "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q4_K_M.gguf" \
+            -o fixtures/nomic-embed-text-v1.5.Q4_K_M.gguf
+
+          # Verify GGUF magic bytes
+          echo "Verifying nomic-embed-text-v1.5.Q4_K_M.gguf..."
+          if ! head -c 4 fixtures/nomic-embed-text-v1.5.Q4_K_M.gguf | grep -q "GGUF"; then
+            echo "ERROR: Downloaded file is not a valid GGUF file"
+            echo "File header:"
+            head -c 32 fixtures/nomic-embed-text-v1.5.Q4_K_M.gguf | xxd
+            rm -f fixtures/nomic-embed-text-v1.5.Q4_K_M.gguf
+            exit 1
+          fi
+          echo "✓ nomic-embed-text-v1.5.Q4_K_M.gguf verified"
+        else
+          echo "✓ Using cached nomic-embed-text-v1.5.Q4_K_M.gguf"
+        fi
+
         echo "All test models ready"
 
     - name: Configure CMake for integration tests
@@ -138,6 +226,19 @@ jobs:
         ./build_integration/IntegrationRunner --success \
           --test-case="Empirical:*,RoPE Invariant:*"
 
+    - name: Run integration tests (embedding model)
+      working-directory: tests
+      env:
+        LLAMA_TEST_MODEL: ${{ github.workspace }}/tests/fixtures/tiny-random-llama.gguf
+        LLAMA_EMBED_MODEL: ${{ github.workspace }}/tests/fixtures/nomic-embed-text-v1.5.Q4_K_M.gguf
+      run: |
+        echo "Running embedding tests with nomic-embed-text-v1.5..."
+        echo "Embed model path: $LLAMA_EMBED_MODEL"
+        ls -lh "$LLAMA_EMBED_MODEL"
+        # Run embedding-specific tests
+        ./build_integration/IntegrationRunner --success \
+          --test-case="*Embedding*"
+
     - name: Upload test results
       if: always()
       uses: actions/upload-artifact@v4
@@ -170,18 +271,47 @@ jobs:
   summary:
     name: Test Summary
     runs-on: ubuntu-latest
-    needs: [unit-tests, integration-tests-macos]
+    needs: [unit-tests, sanitizer-tests, abi-safe-path-tests, integration-tests-macos, lint]
     if: always()
 
     steps:
     - name: Check test results
       run: |
+        echo "=== Test Results ==="
         echo "Unit Tests: ${{ needs.unit-tests.result }}"
+        echo "Sanitizer Tests: ${{ needs.sanitizer-tests.result }}"
+        echo "ABI Safe Path Tests: ${{ needs.abi-safe-path-tests.result }}"
         echo "Integration Tests (macOS): ${{ needs.integration-tests-macos.result }}"
+        echo "Lint: ${{ needs.lint.result }}"
 
-        if [ "${{ needs.unit-tests.result }}" != "success" ] || \
-           [ "${{ needs.integration-tests-macos.result }}" != "success" ]; then
-          echo "❌ Some tests failed"
+        FAILED=0
+
+        if [ "${{ needs.unit-tests.result }}" != "success" ]; then
+          echo "❌ Unit tests failed"
+          FAILED=1
+        fi
+
+        if [ "${{ needs.sanitizer-tests.result }}" != "success" ]; then
+          echo "❌ Sanitizer tests failed (memory bugs, UB, leaks, or overflow detected)"
+          FAILED=1
+        fi
+
+        if [ "${{ needs.abi-safe-path-tests.result }}" != "success" ]; then
+          echo "❌ ABI safe path tests failed (LLOYAL_STACK_BATCH=0 broken)"
+          FAILED=1
+        fi
+
+        if [ "${{ needs.integration-tests-macos.result }}" != "success" ]; then
+          echo "❌ Integration tests failed"
+          FAILED=1
+        fi
+
+        if [ "${{ needs.lint.result }}" != "success" ]; then
+          echo "❌ Lint failed (code style issues)"
+          FAILED=1
+        fi
+
+        if [ "$FAILED" = "1" ]; then
           exit 1
         else
           echo "✅ All tests passed"
