@@ -7,6 +7,8 @@
 #include <lloyal/tokenizer.hpp>
 #include <lloyal/decoder.hpp>
 #include <lloyal/sampler.hpp>
+#include <lloyal/metrics.hpp>
+#include <lloyal/kv.hpp>
 #include <llama/llama.h>
 #include <cmath>
 #include <vector>
@@ -151,10 +153,10 @@ static std::string json_escape(const std::string& s) {
  * preserve perplexity even with clear+re-decode instead of selective removal.
  *
  * Test Design:
- * 1. Generate 800 tokens with continuous cache (baseline)
- * 2. Clear cache, re-decode sinks (first 4) + tail (last 252)
- * 3. Continue generation for 200 tokens with compressed cache
- * 4. Compare last 200 tokens before vs 200 tokens after
+ * 1. Generate 800 tokens with continuous cache (baseline) in BOTH contexts
+ * 2. Clear cache, re-decode sinks (first 4) + tail (last 252) in reseed context only
+ * 3. Generate 200 target tokens from baseline context
+ * 4. Teacher-force SAME targets through both contexts, compare perplexity
  *
  * Success: PPL ratio < 1.10 (matches StreamingLLM's 3.7% finding)
  *
@@ -180,33 +182,6 @@ struct LlamaBackendGuard {
     LlamaBackendGuard() { llama_backend_init(); }
     ~LlamaBackendGuard() { llama_backend_free(); }
 };
-
-// Helper: Compute log softmax for perplexity calculation
-struct LogSoftmaxResult {
-    double log_softmax;
-    float logit;
-    float prob;
-};
-
-static LogSoftmaxResult compute_log_softmax(int n_vocab, const float* logits, llama_token tok) {
-    // Find max logit for numerical stability
-    float max_logit = logits[0];
-    for (int i = 1; i < n_vocab; ++i) {
-        max_logit = std::max(max_logit, logits[i]);
-    }
-
-    // Compute sum of exp(logit - max_logit)
-    double sum_exp = 0.0;
-    for (int i = 0; i < n_vocab; ++i) {
-        sum_exp += expf(logits[i] - max_logit);
-    }
-
-    // log_softmax(tok) = logit[tok] - max_logit - log(sum_exp)
-    double log_sm = logits[tok] - max_logit - log(sum_exp);
-    float prob = expf(logits[tok] - max_logit) / static_cast<float>(sum_exp);
-
-    return {log_sm, logits[tok], prob};
-}
 
 // Boundary equivalence helpers
 static void softmax_inplace(std::vector<double>& p) {
@@ -259,17 +234,20 @@ TEST_CASE("Empirical: clearAndReseed preserves perplexity") {
     REQUIRE(model != nullptr);
 
     auto ctx_params = llama_context_default_params();
-    ctx_params.n_ctx = 1024;   // Small context to force reseed testing
+    ctx_params.n_ctx = 2048;   // Large enough for 1500+ tokens
     ctx_params.n_batch = 256;
     ctx_params.n_threads = 1;  // Single-thread for determinism
 
-    llama_context* ctx = llama_init_from_model(model.get(), ctx_params);
-    REQUIRE(ctx != nullptr);
+    // Create TWO contexts for teacher-forced comparison
+    llama_context* ctx_baseline = llama_init_from_model(model.get(), ctx_params);
+    llama_context* ctx_reseed = llama_init_from_model(model.get(), ctx_params);
+    REQUIRE(ctx_baseline != nullptr);
+    REQUIRE(ctx_reseed != nullptr);
 
     auto vocab = llama_model_get_vocab(model.get());
     int n_vocab = llama_vocab_n_tokens(vocab);
 
-    // === PHASE 1: Generate tokens and measure baseline perplexity ===
+    // === PHASE 1: Generate baseline sequence (800 tokens) ===
     std::string prompt = "The quick brown fox jumps over the lazy dog.";
     auto prompt_tokens = tokenizer::tokenize(vocab, prompt, false, false);
     REQUIRE_FALSE(prompt_tokens.empty());
@@ -278,46 +256,42 @@ TEST_CASE("Empirical: clearAndReseed preserves perplexity") {
 
     // Track all generated tokens
     std::vector<llama_token> all_tokens = prompt_tokens;
-    std::vector<double> perplexities_before;
 
-    // Decode prompt using our production decoder
-    decoder::decode_tokens(ctx, prompt_tokens, 0, ctx_params.n_batch);
+    // Decode prompt in BOTH contexts
+    decoder::decode_tokens(ctx_baseline, prompt_tokens, 0, ctx_params.n_batch);
+    decoder::decode_tokens(ctx_reseed, prompt_tokens, 0, ctx_params.n_batch);
 
     int n_past = static_cast<int>(prompt_tokens.size());
 
-    // Generate 800 tokens (to approach n_ctx=1024 limit)
-    int tokens_to_generate = 800;
+    // Generate 1500 tokens (more than 1024 needed for tail)
+    int tokens_to_generate = 1500;
     INFO("Generating " << tokens_to_generate << " tokens before reseed...");
 
     for (int i = 0; i < tokens_to_generate; ++i) {
-        // Sample next token using our production sampler (greedy = argmax)
-        llama_token next_token = sampler::greedy(ctx, vocab);
+        // Sample next token using greedy sampling (deterministic)
+        llama_token next_token = sampler::greedy(ctx_baseline, vocab);
         all_tokens.push_back(next_token);
 
-        // Measure perplexity for this token
-        const float* logits = llama_get_logits_ith(ctx, -1);
-        auto result = compute_log_softmax(n_vocab, logits, next_token);
-        double ppl = exp(-result.log_softmax);
-        perplexities_before.push_back(ppl);
-
-        // Decode single token using our production decoder
+        // Decode in BOTH contexts (keep them synchronized)
         std::vector<llama_token> single_token = {next_token};
-        decoder::decode_tokens(ctx, single_token, n_past, ctx_params.n_batch);
+        decoder::decode_tokens(ctx_baseline, single_token, n_past, ctx_params.n_batch);
+        decoder::decode_tokens(ctx_reseed, single_token, n_past, ctx_params.n_batch);
         n_past++;
     }
 
-    auto mem = llama_get_memory(ctx);
-    llama_pos max_pos_before = llama_memory_seq_pos_max(mem, 0);
+    auto mem_baseline = llama_get_memory(ctx_baseline);
+    auto mem_reseed = llama_get_memory(ctx_reseed);
+    llama_pos max_pos_before = llama_memory_seq_pos_max(mem_baseline, 0);
     INFO("Before reseed: KV cache max_pos=" << max_pos_before);
-    CHECK(max_pos_before >= 800);
+    CHECK(max_pos_before >= 1500);
 
-    // === PHASE 2: clearAndReseed ===
-    INFO("Executing clearAndReseed...");
+    // === PHASE 2: clearAndReseed (reseed context only) ===
+    INFO("Executing clearAndReseed on reseed context...");
 
-    // Extract sinks (first 4 tokens) and tail (last 252 tokens)
-    // Total: 4 + 252 = 256 (power-of-2, matches StreamingLLM paper's 4+252 config)
+    // Extract sinks (first 4 tokens) and tail (last 1020 tokens)
+    // Total: 4 + 1020 = 1024 (power-of-2, matches StreamingLLM paper's default config)
     const int SINK_COUNT = 4;
-    const int TAIL_COUNT = 252;
+    const int TAIL_COUNT = 1020;
 
     std::vector<llama_token> sinks(all_tokens.begin(), all_tokens.begin() + SINK_COUNT);
     std::vector<llama_token> tail(all_tokens.end() - TAIL_COUNT, all_tokens.end());
@@ -326,7 +300,7 @@ TEST_CASE("Empirical: clearAndReseed preserves perplexity") {
     INFO("Tail: " << tail.size() << " tokens");
 
     // ----- Boundary capture BEFORE reseed -----
-    const float* logits_before = llama_get_logits_ith(ctx, -1);
+    const float* logits_before = llama_get_logits_ith(ctx_reseed, -1);
     REQUIRE(logits_before != nullptr);
 
     std::vector<double> logp_before(n_vocab);
@@ -338,25 +312,15 @@ TEST_CASE("Empirical: clearAndReseed preserves perplexity") {
 
     INFO("Boundary BEFORE reseed: top-1 token = " << top1_before);
 
-    // Clear entire KV cache using llama_memory_clear (same as HybridCalibrateContext.cpp:202)
-    // This is the SIMPLE approach we're validating (NOT llama_memory_seq_rm which has bugs)
-    llama_memory_clear(mem, true);
+    // Use lloyal::kv::clear_and_reseed() - the validated StreamingLLM API
+    kv::clear_and_reseed(ctx_reseed, sinks, tail, ctx_params.n_batch);
 
-    llama_pos max_pos_after_clear = llama_memory_seq_pos_max(mem, 0);
-    CHECK(max_pos_after_clear == -1);  // Empty
-
-    // Re-decode sinks using our production decoder
-    decoder::decode_tokens(ctx, sinks, 0, ctx_params.n_batch);
-
-    // Re-decode tail using our production decoder
-    decoder::decode_tokens(ctx, tail, SINK_COUNT, ctx_params.n_batch);
-
-    llama_pos max_pos_after_reseed = llama_memory_seq_pos_max(mem, 0);
+    llama_pos max_pos_after_reseed = llama_memory_seq_pos_max(mem_reseed, 0);
     INFO("After reseed: KV cache max_pos=" << max_pos_after_reseed);
     CHECK(max_pos_after_reseed == SINK_COUNT + TAIL_COUNT - 1);
 
     // ----- Boundary capture AFTER reseed -----
-    const float* logits_after = llama_get_logits_ith(ctx, -1);
+    const float* logits_after = llama_get_logits_ith(ctx_reseed, -1);
     REQUIRE(logits_after != nullptr);
 
     std::vector<double> logp_after(n_vocab);
@@ -391,95 +355,95 @@ TEST_CASE("Empirical: clearAndReseed preserves perplexity") {
     INFO("Top-10 overlap: " << overlap << "/10");
     CHECK(overlap >= 7);
 
-    // 3. KL/JSD divergence (distributions should be nearly identical)
+    // 3. Symmetrized KL divergence (Jeffreys divergence)
     double kl_ba = kl_div(logp_before, logp_after);
     double kl_ab = kl_div(logp_after, logp_before);
-    double jsd = 0.5 * (kl_ba + kl_ab);
-    INFO("Jensen-Shannon divergence: " << jsd);
-    CHECK(jsd < 1e-2);  // Very small divergence expected
+    double sym_kl = 0.5 * (kl_ba + kl_ab);
+    INFO("Symmetrized KL divergence (Jeffreys): " << sym_kl);
+    CHECK(sym_kl < 1e-2);  // Very small divergence expected
 
-    if (top1_after == top1_before && overlap >= 8 && jsd < 1e-2) {
+    if (top1_after == top1_before && overlap >= 7 && sym_kl < 1e-2) {
         INFO("✅ BOUNDARY EQUIVALENCE: Clear+re-decode preserves distribution");
     } else {
         INFO("❌ BOUNDARY EQUIVALENCE FAILED: Clear+re-decode changes distribution");
     }
 
-    // === PHASE 3: Continue generation and measure perplexity ===
-    std::vector<double> perplexities_after;
-    int continue_tokens = 200;
-    n_past = SINK_COUNT + TAIL_COUNT;
+    // === PHASE 3: Teacher-Forced Perplexity Comparison ===
+    // Generate 200 target tokens from baseline (greedy)
+    INFO("Generating 200 target tokens from baseline...");
+    std::vector<llama_token> target_tokens;
+    int n_past_baseline = static_cast<int>(all_tokens.size());
 
-    INFO("Continuing generation for " << continue_tokens << " more tokens...");
+    for (int i = 0; i < 200; ++i) {
+        llama_token next_token = sampler::greedy(ctx_baseline, vocab);
+        target_tokens.push_back(next_token);
 
-    for (int i = 0; i < continue_tokens; ++i) {
-        // Sample next token using our production sampler
-        llama_token next_token = sampler::greedy(ctx, vocab);
-
-        // Measure perplexity
-        const float* logits = llama_get_logits_ith(ctx, -1);
-        auto result = compute_log_softmax(n_vocab, logits, next_token);
-        double ppl = exp(-result.log_softmax);
-        perplexities_after.push_back(ppl);
-
-        // Decode single token using our production decoder
         std::vector<llama_token> single_token = {next_token};
-        decoder::decode_tokens(ctx, single_token, n_past, ctx_params.n_batch);
-        n_past++;
+        decoder::decode_tokens(ctx_baseline, single_token, n_past_baseline, ctx_params.n_batch);
+        n_past_baseline++;
     }
 
-    // === PHASE 4: Statistical comparison ===
-    // Compare LAST 200 tokens before reseed vs ALL 200 tokens after reseed
-    // This ensures fair comparison:
-    // - Both windows have 200 tokens
-    // - Both at similar sequence positions (warmed up)
-    // - Before: continuous cache with full history
-    // - After: compressed cache with StreamingLLM pattern
+    INFO("Generated " << target_tokens.size() << " target tokens");
 
-    const int COMPARE_WINDOW = 200;
+    // Now perform teacher-forced evaluation on BOTH contexts
+    // Reset baseline context to boundary position (after 800 tokens)
+    llama_memory_clear(mem_baseline, true);
+    decoder::decode_tokens(ctx_baseline, all_tokens, 0, ctx_params.n_batch);
 
-    // Extract last 200 tokens from before (tokens 601-800)
-    std::vector<double> last_200_before(
-        perplexities_before.end() - COMPARE_WINDOW,
-        perplexities_before.end()
-    );
+    // Reseed context: already at position 256 (after reseed), correct
 
-    // All tokens after are the comparison set (tokens 801-1000)
-    std::vector<double>& first_200_after = perplexities_after;
+    // Evaluate perplexity on SAME target sequence for both contexts
+    INFO("=== TEACHER-FORCED PERPLEXITY COMPARISON ===");
 
-    // Calculate means
-    double sum_before = 0.0;
-    for (double ppl : last_200_before) {
-        sum_before += ppl;
+    // Baseline context (continuous cache, full 800 tokens)
+    auto ppl_baseline = metrics::create_perplexity();
+    n_past_baseline = static_cast<int>(all_tokens.size());
+
+    for (llama_token target : target_tokens) {
+        const float* logits = llama_get_logits_ith(ctx_baseline, -1);
+        float surprisal = metrics::model_surprisal(logits, n_vocab, target, metrics::Base::Nats);
+        metrics::add_surprisal(ppl_baseline, surprisal);
+
+        // Decode target token
+        std::vector<llama_token> single_token = {target};
+        decoder::decode_tokens(ctx_baseline, single_token, n_past_baseline, ctx_params.n_batch);
+        n_past_baseline++;
     }
-    double mean_ppl_before = sum_before / last_200_before.size();
 
-    double sum_after = 0.0;
-    for (double ppl : first_200_after) {
-        sum_after += ppl;
+    float ppl_before_value = metrics::get_ppl(ppl_baseline);
+    int count_baseline = metrics::get_count(ppl_baseline);
+
+    // Reseed context (compressed cache, 256 tokens)
+    auto ppl_reseed = metrics::create_perplexity();
+    int n_past_reseed = SINK_COUNT + TAIL_COUNT;
+
+    for (llama_token target : target_tokens) {
+        const float* logits = llama_get_logits_ith(ctx_reseed, -1);
+        float surprisal = metrics::model_surprisal(logits, n_vocab, target, metrics::Base::Nats);
+        metrics::add_surprisal(ppl_reseed, surprisal);
+
+        // Decode target token
+        std::vector<llama_token> single_token = {target};
+        decoder::decode_tokens(ctx_reseed, single_token, n_past_reseed, ctx_params.n_batch);
+        n_past_reseed++;
     }
-    double mean_ppl_after = sum_after / first_200_after.size();
 
-    double ppl_ratio = mean_ppl_after / mean_ppl_before;
-    double ppl_diff = mean_ppl_after - mean_ppl_before;
+    float ppl_after_value = metrics::get_ppl(ppl_reseed);
+    int count_reseed = metrics::get_count(ppl_reseed);
 
-    INFO("=== PERPLEXITY REGRESSION CHECK (SECONDARY) ===");
-    INFO("Comparing last " << COMPARE_WINDOW << " tokens before vs " << continue_tokens << " tokens after");
-    INFO("Before reseed (tokens 601-800, continuous cache):  PPL = " << mean_ppl_before);
-    INFO("After reseed  (tokens 801-1000, compressed cache): PPL = " << mean_ppl_after);
-    INFO("Ratio (after/before):   " << ppl_ratio);
-    INFO("Difference:             " << ppl_diff);
+    REQUIRE(count_baseline == count_reseed);
+    REQUIRE(count_baseline == static_cast<int>(target_tokens.size()));
 
-    // === SECONDARY VALIDATION ===
-    // Note: This compares perplexity of self-sampled tokens (not true perplexity),
-    // so it's a coarse regression guard. The boundary equivalence check above
-    // is the primary validation.
-    //
-    // StreamingLLM paper showed PPL 5.40 (continuous) vs 5.60 (window+recompute)
-    // That's a ratio of 1.037 (3.7% increase)
-    //
-    // We accept up to 10% increase as "stable perplexity"
-    // (Allows for model variation, quantization effects, etc.)
+    double ppl_ratio = ppl_after_value / ppl_before_value;
 
+    INFO("Target tokens evaluated: " << count_baseline);
+    INFO("Baseline (continuous cache):  PPL = " << ppl_before_value);
+    INFO("Reseed   (compressed cache): PPL = " << ppl_after_value);
+    INFO("Ratio (reseed/baseline):     " << ppl_ratio);
+
+    // === PERPLEXITY VALIDATION ===
+    // StreamingLLM paper showed 3.7% increase
+    // We allow up to 10% to account for quantization and model variation
     if (ppl_ratio < 1.05) {
         INFO("✅ EXCELLENT: PPL increase < 5%");
     } else if (ppl_ratio < 1.10) {
@@ -503,9 +467,9 @@ TEST_CASE("Empirical: clearAndReseed preserves perplexity") {
     // Determine pass/fail based on primary checks
     bool top1_pass = (top1_after == top1_before);
     bool top10_pass = (overlap >= 7);
-    bool jsd_pass = (jsd < 1e-2);
+    bool sym_kl_pass = (sym_kl < 1e-2);
     bool ppl_pass = (ppl_ratio < 1.10);
-    bool overall_pass = top1_pass && top10_pass && jsd_pass;  // PPL is secondary
+    bool overall_pass = top1_pass && top10_pass && sym_kl_pass;  // PPL is secondary
 
     // Output JSON (single line for easy parsing/aggregation)
     std::cout << "\n=== JSON_RESULT ===" << std::endl;
@@ -525,16 +489,19 @@ TEST_CASE("Empirical: clearAndReseed preserves perplexity") {
     std::cout << "\"top1_after\":" << top1_after << ",";
     std::cout << "\"top1_match\":" << (top1_pass ? "true" : "false") << ",";
     std::cout << "\"top10_overlap\":" << overlap << ",";
-    std::cout << "\"jsd\":" << std::fixed << std::setprecision(6) << jsd << ",";
+    std::cout << "\"sym_kl\":" << std::fixed << std::setprecision(6) << sym_kl << ",";
     std::cout << "\"kl_before_after\":" << std::fixed << std::setprecision(6) << kl_ba << ",";
     std::cout << "\"kl_after_before\":" << std::fixed << std::setprecision(6) << kl_ab << ",";
-    std::cout << "\"ppl_window_before\":" << std::fixed << std::setprecision(4) << mean_ppl_before << ",";
-    std::cout << "\"ppl_window_after\":" << std::fixed << std::setprecision(4) << mean_ppl_after << ",";
+    std::cout << "\"ppl_baseline\":" << std::fixed << std::setprecision(4) << ppl_before_value << ",";
+    std::cout << "\"ppl_reseed\":" << std::fixed << std::setprecision(4) << ppl_after_value << ",";
     std::cout << "\"ppl_ratio\":" << std::fixed << std::setprecision(4) << ppl_ratio << ",";
     std::cout << "\"pass\":" << (overall_pass ? "true" : "false");
     std::cout << "}" << std::endl;
     std::cout << "=== END_JSON_RESULT ===" << std::endl;
 
     // === CLEANUP ===
-    llama_free(ctx);
+    metrics::free_perplexity(ppl_baseline);
+    metrics::free_perplexity(ppl_reseed);
+    llama_free(ctx_baseline);
+    llama_free(ctx_reseed);
 }

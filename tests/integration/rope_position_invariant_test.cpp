@@ -1,8 +1,13 @@
 // File: packages/liblloyal/tests/integration/rope_position_invariant_test.cpp
 
+#include <algorithm>
+#include <cmath>
 #include <doctest/doctest.h>
+#include <iomanip>
+#include <iostream>
 #include <llama/llama.h>
 #include <lloyal/decoder.hpp>
+#include <lloyal/kv.hpp>
 #include <lloyal/model_registry.hpp>
 #include <lloyal/sampler.hpp>
 #include <lloyal/tokenizer.hpp>
@@ -40,12 +45,12 @@ using namespace lloyal;
  * If RoPE positions were wrong:
  * - Model would see completely different positional information
  * - Attention patterns would be wildly different
- * - Logit distributions would diverge significantly (JSD >> 0.01)
+ * - Logit distributions would diverge significantly (symmetrized KL >> 0.01)
  * - Top-1 token would almost certainly differ
  *
  * This test validates both:
  * 1. Position contiguity (via llama_memory_seq_pos_max check)
- * 2. RoPE correctness (via boundary equivalence: same top-1, low JSD)
+ * 2. RoPE correctness (via boundary equivalence: same top-1, low symmetrized KL)
  *
  * REQUIRES: Coherent model set via LLAMA_TEST_MODEL env var
  */
@@ -77,7 +82,7 @@ static int argmax(const float *logits, int n) {
   return idx;
 }
 
-// Helper: Compute Jensen-Shannon divergence
+// Helper: Compute symmetrized KL divergence (Jeffreys divergence)
 static void softmax_inplace(std::vector<double> &p) {
   double mx = *std::max_element(p.begin(), p.end());
   double sum = 0.0;
@@ -110,7 +115,7 @@ TEST_CASE("RoPE Invariant: Clear+reseed produces contiguous positions") {
   REQUIRE(model != nullptr);
 
   auto ctx_params = llama_context_default_params();
-  ctx_params.n_ctx = 1024; // Small context to force reseed testing
+  ctx_params.n_ctx = 2048; // Large enough for 1500+ tokens
   ctx_params.n_batch = 256;
   ctx_params.n_threads = 1; // Single-thread for determinism
 
@@ -133,8 +138,8 @@ TEST_CASE("RoPE Invariant: Clear+reseed produces contiguous positions") {
   decoder::decode_tokens(ctx, prompt_tokens, 0, ctx_params.n_batch);
   int n_past = static_cast<int>(prompt_tokens.size());
 
-  // Generate 800 tokens
-  int tokens_to_generate = 800;
+  // Generate 1500 tokens (more than 1024 needed for tail)
+  int tokens_to_generate = 1500;
   INFO("Generating " << tokens_to_generate << " tokens before clear+reseed...");
 
   for (int i = 0; i < tokens_to_generate; ++i) {
@@ -149,7 +154,7 @@ TEST_CASE("RoPE Invariant: Clear+reseed produces contiguous positions") {
   auto mem = llama_get_memory(ctx);
   llama_pos max_pos_before = llama_memory_seq_pos_max(mem, 0);
   INFO("Before clear+reseed: KV cache max_pos=" << max_pos_before);
-  CHECK(max_pos_before >= 800);
+  CHECK(max_pos_before >= 1500);
 
   // === PHASE 2: Capture boundary BEFORE clear+reseed ===
   const float *logits_before = llama_get_logits_ith(ctx, -1);
@@ -166,9 +171,9 @@ TEST_CASE("RoPE Invariant: Clear+reseed produces contiguous positions") {
   // === PHASE 3: Execute clear+reseed with CONTIGUOUS POSITIONS ===
   INFO("Executing clear+reseed...");
 
-  // StreamingLLM config: 4 sinks + 252 tail = 256 total (power-of-2)
+  // StreamingLLM config: 4 sinks + 1020 tail = 1024 total (power-of-2)
   const int SINK_COUNT = 4;
-  const int TAIL_COUNT = 252;
+  const int TAIL_COUNT = 1020;
 
   std::vector<llama_token> sinks(all_tokens.begin(),
                                  all_tokens.begin() + SINK_COUNT);
@@ -178,19 +183,8 @@ TEST_CASE("RoPE Invariant: Clear+reseed produces contiguous positions") {
   INFO("Sinks: " << sinks.size() << " tokens");
   INFO("Tail: " << tail.size() << " tokens");
 
-  // Clear entire KV cache
-  llama_memory_clear(mem, true);
-
-  llama_pos max_pos_after_clear = llama_memory_seq_pos_max(mem, 0);
-  CHECK(max_pos_after_clear == -1); // Empty
-  INFO("After clear: KV cache max_pos=" << max_pos_after_clear << " (empty)");
-
-  // CRITICAL: Re-decode with CONTIGUOUS positions
-  // Sinks at positions 0-3
-  decoder::decode_tokens(ctx, sinks, 0, ctx_params.n_batch);
-
-  // Tail at positions 4-255 (immediately after sinks, NO GAPS)
-  decoder::decode_tokens(ctx, tail, SINK_COUNT, ctx_params.n_batch);
+  // Use lloyal::kv::clear_and_reseed() - the validated StreamingLLM API
+  kv::clear_and_reseed(ctx, sinks, tail, ctx_params.n_batch);
 
   llama_pos max_pos_after_reseed = llama_memory_seq_pos_max(mem, 0);
   INFO("After reseed: KV cache max_pos=" << max_pos_after_reseed);
@@ -234,26 +228,28 @@ TEST_CASE("RoPE Invariant: Clear+reseed produces contiguous positions") {
     INFO("   This indicates RoPE positions are INCORRECT!");
   }
 
-  // 2. Jensen-Shannon divergence (distributions should be nearly identical)
+  // 2. Symmetrized KL divergence (Jeffreys divergence) - distributions should be nearly identical
   double kl_ba = kl_div(logp_before, logp_after);
   double kl_ab = kl_div(logp_after, logp_before);
-  double jsd = 0.5 * (kl_ba + kl_ab);
-  INFO("Jensen-Shannon divergence: " << jsd);
+  double sym_kl = 0.5 * (kl_ba + kl_ab);
+  INFO("Symmetrized KL divergence (Jeffreys): " << sym_kl);
 
-  // Very small divergence expected (< 0.01 = 1% divergence)
-  CHECK(jsd < 1e-2);
+  // Very small divergence expected (< 0.01)
+  CHECK(sym_kl < 1e-2);
 
-  if (jsd < 1e-2) {
-    INFO("✅ JSD < 0.01: Distributions essentially identical");
+  if (sym_kl < 1e-2) {
+    INFO("✅ Symmetrized KL < 0.01: Distributions essentially identical");
     INFO("   This proves RoPE positions are CORRECT!");
   } else {
-    INFO("❌ JSD >= 0.01: Distributions differ significantly");
+    INFO("❌ Symmetrized KL >= 0.01: Distributions differ significantly");
     INFO("   This indicates RoPE positions may be incorrect!");
   }
 
   // === FINAL VERDICT ===
-  if (max_pos_after_reseed == SINK_COUNT + TAIL_COUNT - 1 &&
-      top1_after == top1_before && jsd < 1e-2) {
+  bool pass = (max_pos_after_reseed == SINK_COUNT + TAIL_COUNT - 1 &&
+               top1_after == top1_before && sym_kl < 1e-2);
+
+  if (pass) {
     INFO("");
     INFO("========================================");
     INFO("✅ RoPE INVARIANT VALIDATED");
@@ -272,6 +268,23 @@ TEST_CASE("RoPE Invariant: Clear+reseed produces contiguous positions") {
     INFO("========================================");
     WARN(false); // Soft warning without failing the test
   }
+
+  // === STRUCTURED JSON OUTPUT ===
+  std::cout << "\n=== JSON_RESULT ===" << std::endl;
+  std::cout << "{";
+  std::cout << "\"test\":\"rope_position_invariant\",";
+  std::cout << "\"model\":\"" << MODEL_PATH << "\",";
+  std::cout << "\"max_pos_before\":" << max_pos_before << ",";
+  std::cout << "\"max_pos_after_clear\":" << max_pos_after_clear << ",";
+  std::cout << "\"max_pos_after_reseed\":" << max_pos_after_reseed << ",";
+  std::cout << "\"top1_before\":" << top1_before << ",";
+  std::cout << "\"top1_after\":" << top1_after << ",";
+  std::cout << "\"top1_match\":" << (top1_after == top1_before ? "true" : "false") << ",";
+  std::cout << "\"sym_kl\":" << std::scientific << std::setprecision(6) << sym_kl << ",";
+  std::cout << "\"positions_contiguous\":" << (max_pos_after_reseed == SINK_COUNT + TAIL_COUNT - 1 ? "true" : "false") << ",";
+  std::cout << "\"pass\":" << (pass ? "true" : "false");
+  std::cout << "}" << std::endl;
+  std::cout << "=== END_JSON_RESULT ===" << std::endl;
 
   // === CLEANUP ===
   llama_free(ctx);
