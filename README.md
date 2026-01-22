@@ -122,6 +122,15 @@ auto chain = lloyal::sampler::create_chain(model, grammar);
 
 ## Integration
 
+### Git Submodule
+```bash
+# Pin to stable release (recommended)
+git submodule add -b v0.1.0 https://github.com/lloyal-ai/liblloyal.git
+
+# Or track main for latest (less stable)
+git submodule add https://github.com/lloyal-ai/liblloyal.git
+```
+
 ### CMake
 ```cmake
 add_subdirectory(liblloyal)
