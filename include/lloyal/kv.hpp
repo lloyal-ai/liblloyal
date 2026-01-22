@@ -496,20 +496,6 @@ inline void clear_metadata(llama_context *ctx) {
 // ===== CONTEXT COMPRESSION =====
 
 /**
- * @brief State for managing cache reconstruction
- *
- * Helper struct for tracking tokens across cache reconstruction operations.
- * Pattern requires reusing ORIGINAL anchor tokens from sequence start.
- *
- * @note This is optional; callers can track tokens themselves and pass directly
- *       to clear_and_reseed()
- */
-struct StreamingLlmState {
-  std::vector<llama_token> original_sinks;  ///< First N tokens from sequence start
-  size_t tail_size;                          ///< Number of recent tokens to keep
-};
-
-/**
  * @brief Clear KV cache and reconstruct with anchor + tail tokens
  *
  * Reconstructs KV cache with contiguous positions by:
