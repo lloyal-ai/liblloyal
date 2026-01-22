@@ -1,5 +1,11 @@
 # liblloyal
 
+[![Tests](https://github.com/lloyal-ai/liblloyal/actions/workflows/tests.yml/badge.svg)](https://github.com/lloyal-ai/liblloyal/actions/workflows/tests.yml)
+[![Docs](https://github.com/lloyal-ai/liblloyal/actions/workflows/docs.yml/badge.svg)](https://lloyal-ai.github.io/liblloyal/)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![C++](https://img.shields.io/badge/C++-17-blue.svg)](https://en.cppreference.com/w/cpp/17)
+[![llama.cpp](https://img.shields.io/badge/llama.cpp-b6870-green.svg)](https://github.com/ggml-org/llama.cpp/releases/tag/b6870)
+
 **Composable primitives for llama.cpp inference**
 
 C++ primitives library for llama.cpp with composable building blocks (tokenization, sampling, embeddings, KV cache) and advanced patterns (handle-based APIs, shared model weights, multi-sequence management) enabling applications from simple streaming to complex inference orchestration.
