@@ -2,7 +2,7 @@
 
 **Composable primitives for llama.cpp inference**
 
-Header-only C++ library providing fine-grained control over llama.cpp with clean abstractions for sequence management, metrics, and state operations.
+C++ primitives library for llama.cpp with composable building blocks (tokenization, sampling, embeddings, KV cache) and advanced patterns (handle-based APIs, shared model weights, multi-sequence management) enabling applications from simple streaming to complex inference orchestration.
 
 ## What it provides
 
@@ -14,6 +14,34 @@ Header-only C++ library providing fine-grained control over llama.cpp with clean
 - **Metrics** - Dual-level entropy/surprisal, rolling perplexity, cloneable state
 - **Embeddings** - Pooled extraction, L2 normalization, similarity
 - **Chat Templates** - Jinja2 formatting with fallbacks
+
+### Advanced Patterns
+
+**Handle-Based APIs** - Persistent, reusable objects for efficiency:
+```cpp
+// Create reusable sampler chain
+auto chain = lloyal::sampler::create_chain(model, params);
+lloyal::sampler::apply(chain, ctx, vocab);  // Reuse across tokens
+
+// Grammar handle for structured output
+auto grammar_handle = lloyal::grammar::init_sampler(model, schema);
+```
+
+**Shared Model Weights** - Multiple contexts share same loaded model:
+```cpp
+// ModelRegistry caches by (path, n_gpu_layers, use_mmap)
+auto model1 = lloyal::ModelRegistry::acquire(path, params);
+auto model2 = lloyal::ModelRegistry::acquire(path, params);  // Cache hit
+// model1 and model2 share weights, independent KV caches
+```
+
+**Multi-Sequence Orchestration** - Independent execution paths per context:
+```cpp
+// Parallel hypothesis exploration
+lloyal::kv::seq_cp(ctx, 0, 1);  // Branch to seq 1
+lloyal::kv::seq_cp(ctx, 0, 2);  // Branch to seq 2
+// Each sequence maintains independent recurrent state
+```
 
 ### Sequence-Aware Operations
 Every primitive supports sequence IDs (default seq=0 for single-path):
@@ -78,7 +106,11 @@ auto chain = lloyal::sampler::create_chain(model, grammar);
 ## Architecture
 
 - **Header-only** - All implementations inline in `include/lloyal/*.hpp`
-- **llama.cpp wrapper** - Compile-time dependency, validated by build system
+- **Composable primitives** - Building blocks combine into diverse patterns
+- **Handle-based APIs** - Persistent samplers, grammar chains for efficiency
+- **Shared model weights** - Thread-safe registry enables multi-context with single model load
+- **Multi-sequence support** - All primitives sequence-aware (default seq=0)
+- **llama.cpp binding** - Compile-time dependency, validated by build system
 - **Zero runtime dependencies** - Only requires C++20 standard library
 - **Multi-binding** - C++20 concepts decouple from binding-specific types
 
@@ -97,6 +129,37 @@ s.source_files = "liblloyal/include/**/*.{hpp,h}"
 ```
 
 ## Common Patterns
+
+### From Simple to Complex
+
+**Simple** - Single-sequence streaming:
+```cpp
+lloyal::decoder::decode_tokens(ctx, prompt_tokens, 0);
+while (!done) {
+  auto token = lloyal::sampler::sample_with_params(ctx, vocab, params);
+  lloyal::decoder::decode_one(ctx, token, n_past++);
+}
+```
+
+**Intermediate** - Streaming with cache compression:
+```cpp
+// When approaching context limit
+auto sinks = std::vector<llama_token>(tokens.begin(), tokens.begin() + 4);
+auto tail = std::vector<llama_token>(tokens.end() - 252, tokens.end());
+lloyal::kv::clear_and_reseed(ctx, sinks, tail, n_batch);
+// Continue generation with bounded positions
+```
+
+**Advanced** - Multi-sequence search with shared weights:
+```cpp
+// Fork exploration paths on same model (shared weights)
+lloyal::kv::seq_cp(ctx, 0, 1);
+lloyal::kv::seq_cp(ctx, 0, 2);
+// Decode alternatives in parallel, compare metrics, prune branches
+lloyal::kv::seq_keep(ctx, best_seq);  // Keep winner, discard others
+```
+
+### Pattern Examples
 
 **Speculative decoding:**
 ```cpp
