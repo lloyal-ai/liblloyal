@@ -118,7 +118,7 @@ jobs:
 
     - name: Checkout llama.cpp
       run: |
-        git clone --depth 1 --branch ${{ steps.llama_version.outputs.version }} https://github.com/ggerganov/llama.cpp
+        git clone --depth 1 --branch ${{ steps.llama_version.outputs.version }} https://github.com/ggml-org/llama.cpp
         echo "Checked out llama.cpp at:"
         cd llama.cpp && git log -1 --oneline
 

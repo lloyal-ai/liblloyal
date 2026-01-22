@@ -30,7 +30,7 @@ To update llama.cpp to a newer version:
 
 ```bash
 # Clone llama.cpp
-git clone https://github.com/ggerganov/llama.cpp.git
+git clone https://github.com/ggml-org/llama.cpp.git
 cd llama.cpp
 
 # Checkout desired tag/commit

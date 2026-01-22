@@ -47,7 +47,7 @@ if [ -d "llama.cpp" ]; then
     fi
 else
     echo "Cloning llama.cpp..."
-    git clone --depth 1 --branch $LLAMA_VERSION https://github.com/ggerganov/llama.cpp
+    git clone --depth 1 --branch $LLAMA_VERSION https://github.com/ggml-org/llama.cpp
     cd llama.cpp
 fi
 

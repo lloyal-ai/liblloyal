@@ -117,7 +117,7 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
     set(LLAMA_CPP_BUILD_DIR "${LLAMA_CPP_DIR}/build-linux")
   elseif(EXISTS "${LLAMA_CPP_DIR}/build-windows")
     set(LLAMA_CPP_BUILD_DIR "${LLAMA_CPP_DIR}/build-windows")
-  else
+  else()
     # Default to build/ (CI uses this)
     set(LLAMA_CPP_BUILD_DIR "${LLAMA_CPP_DIR}/build")
   endif()

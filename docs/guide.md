@@ -1342,7 +1342,7 @@ auto emb = lloyal::embedding::get(ctx, lloyal::embedding::Normalize::L2);
 - Unit tests: `tests/` - API contract validation
 
 **External:**
-- llama.cpp: https://github.com/ggerganov/llama.cpp
+- llama.cpp: https://github.com/ggml-org/llama.cpp
 - StreamingLLM paper: Xiao et al. (2023) ["Efficient Streaming Language Models with Attention Sinks"](https://arxiv.org/abs/2309.17453)
 
 ---
