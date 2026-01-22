@@ -6,9 +6,9 @@ PROJECT_NUMBER         = "1.0.0"
 
 OUTPUT_DIRECTORY       = docs/api
 
-INPUT                  = include/lloyal
+INPUT                  = include/lloyal docs/mainpage.dox
 RECURSIVE              = YES
-FILE_PATTERNS          = *.hpp *.h
+FILE_PATTERNS          = *.hpp *.h *.dox
 
 # Exclude third-party libraries
 EXCLUDE                = include/lloyal/nlohmann

@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - 'include/lloyal/**'
+      - 'docs/mainpage.dox'
       - 'Doxyfile'
       - '.github/workflows/docs.yml'
   workflow_dispatch:  # Allow manual trigger

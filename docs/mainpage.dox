@@ -1,0 +1,110 @@
+/**
+ * @mainpage liblloyal - Composable Primitives for llama.cpp Inference
+ *
+ * @section intro_sec Introduction
+ *
+ * liblloyal is a C++20 header-only library providing composable building blocks for llama.cpp inference.
+ * It offers clean abstractions over llama.cpp primitives with support for tokenization, sampling, embeddings,
+ * KV cache management, and advanced patterns like multi-sequence operations and handle-based APIs.
+ *
+ * @section features_sec Core Features
+ *
+ * - **Tokenization** - Two-pass safe buffer sizing, special token handling
+ * - **Decoding** - Batch orchestration, sequence-aware operations
+ * - **KV Cache** - Sequence operations, state snapshots, long-context patterns
+ * - **Sampling** - Grammar-constrained, persistent chains, 52 parameters
+ * - **Metrics** - Dual-level entropy/surprisal, rolling perplexity, cloneable state
+ * - **Embeddings** - Pooled extraction, L2 normalization, similarity
+ * - **Chat Templates** - Jinja2 formatting with fallbacks
+ *
+ * @section patterns_sec Advanced Patterns
+ *
+ * ### Handle-Based APIs
+ * Create reusable sampler chains and grammar handles for efficient token generation:
+ * @code{.cpp}
+ * auto chain = lloyal::sampler::create_chain(model, params);
+ * lloyal::sampler::apply(chain, ctx, vocab);  // Reuse across tokens
+ * @endcode
+ *
+ * ### Shared Model Weights
+ * Multiple contexts can share the same loaded model via ModelRegistry:
+ * @code{.cpp}
+ * auto model1 = lloyal::ModelRegistry::acquire(path, params);  // Loads model
+ * auto model2 = lloyal::ModelRegistry::acquire(path, params);  // Cache hit
+ * // model1 and model2 share weights, independent KV caches
+ * @endcode
+ *
+ * ### Multi-Sequence Operations
+ * All primitives support sequence IDs for parallel execution paths:
+ * @code{.cpp}
+ * lloyal::kv::seq_cp(ctx, 0, 1);  // Branch sequence 0 to sequence 1
+ * lloyal::kv::seq_cp(ctx, 0, 2);  // Branch sequence 0 to sequence 2
+ * // Each sequence maintains independent state
+ * @endcode
+ *
+ * @section quickstart_sec Quick Start
+ *
+ * @code{.cpp}
+ * #include <lloyal/model_registry.hpp>
+ * #include <lloyal/tokenizer.hpp>
+ * #include <lloyal/decoder.hpp>
+ * #include <lloyal/sampler.hpp>
+ *
+ * // Load model (shared weights)
+ * auto model = lloyal::ModelRegistry::acquire("model.gguf", params);
+ * llama_context* ctx = llama_init_from_model(model.get(), ctx_params);
+ *
+ * // Tokenize and decode
+ * auto tokens = lloyal::tokenizer::tokenize(model.get(), "Hello, world!");
+ * lloyal::decoder::decode_tokens(ctx, tokens, 0, n_batch);
+ *
+ * // Sample next token
+ * auto token = lloyal::sampler::sample_with_params(ctx, vocab, params);
+ * @endcode
+ *
+ * @section arch_sec Architecture
+ *
+ * - **Header-only** - All implementations inline in `include/lloyal/*.hpp`
+ * - **Composable primitives** - Building blocks combine into diverse patterns
+ * - **Handle-based APIs** - Persistent samplers, grammar chains for efficiency
+ * - **Shared model weights** - Thread-safe registry enables multi-context with single model load
+ * - **Multi-sequence support** - All primitives sequence-aware (default seq=0)
+ * - **llama.cpp binding** - Compile-time dependency, validated by build system
+ * - **Zero runtime dependencies** - Only requires C++20 standard library
+ *
+ * @section namespaces_sec Key Namespaces
+ *
+ * - @ref lloyal::tokenizer - Tokenization and detokenization
+ * - @ref lloyal::decoder - Batch and single-token decoding
+ * - @ref lloyal::sampler - Token sampling with configurable parameters
+ * - @ref lloyal::kv - KV cache sequence operations
+ * - @ref lloyal::metrics - Entropy, surprisal, and perplexity tracking
+ * - @ref lloyal::embedding - Embedding extraction and similarity
+ * - @ref lloyal::grammar - Grammar-constrained generation
+ * - @ref lloyal::chat_template - Chat formatting with Jinja2 templates
+ * - @ref lloyal::ModelRegistry - Model weight sharing and caching
+ *
+ * @section docs_sec Documentation
+ *
+ * - **Usage Guide:** See `docs/guide.md` for comprehensive patterns, examples, and best practices
+ * - **API Reference:** Navigate using the tabs above (Namespaces, Classes, Files)
+ * - **Examples:** Check the Examples tab for usage patterns
+ * - **Headers:** All APIs are fully documented inline in `include/lloyal/*.hpp`
+ *
+ * @section install_sec Installation
+ *
+ * Add as git submodule:
+ * @code{.bash}
+ * git submodule add -b v0.1.0 https://github.com/lloyal-ai/liblloyal.git
+ * @endcode
+ *
+ * CMake integration:
+ * @code{.cmake}
+ * add_subdirectory(liblloyal)
+ * target_link_libraries(your_target PRIVATE lloyal llama)
+ * @endcode
+ *
+ * @section license_sec License
+ *
+ * Apache 2.0 - See LICENSE file for details
+ */
