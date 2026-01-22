@@ -1,0 +1,69 @@
+# Doxyfile for liblloyal
+
+PROJECT_NAME           = "liblloyal"
+PROJECT_BRIEF          = "Composable primitives for llama.cpp inference"
+PROJECT_NUMBER         = "1.0.0"
+
+OUTPUT_DIRECTORY       = docs/api
+
+INPUT                  = include/lloyal
+RECURSIVE              = YES
+FILE_PATTERNS          = *.hpp *.h
+
+# Exclude third-party libraries
+EXCLUDE                = include/lloyal/nlohmann
+
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = NO
+EXTRACT_STATIC         = YES
+
+JAVADOC_AUTOBRIEF      = YES
+QT_AUTOBRIEF           = YES
+
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+HTML_FILE_EXTENSION    = .html
+
+GENERATE_LATEX         = NO
+
+# Use Doxygen's built-in markdown support
+MARKDOWN_SUPPORT       = YES
+
+# Include source code
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+
+# Generate class diagrams
+HAVE_DOT               = NO
+
+# Better navigation
+GENERATE_TREEVIEW      = YES
+DISABLE_INDEX          = NO
+FULL_SIDEBAR           = YES
+
+# Optimize for C++
+OPTIMIZE_OUTPUT_FOR_C  = NO
+OPTIMIZE_OUTPUT_JAVA   = NO
+
+# Show namespaces
+SHOW_NAMESPACES        = YES
+
+# Better warnings
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = YES
+
+# File patterns
+EXCLUDE_PATTERNS       = */tests/* */build/* */nlohmann/*
+
+# Brief descriptions from first line
+BRIEF_MEMBER_DESC      = YES
+REPEAT_BRIEF           = YES
+
+# Enable preprocessing
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = NO
+SEARCH_INCLUDES        = YES
+INCLUDE_PATH           = include
+PREDEFINED             = LLOYAL_LOG_DEBUG(...)=

@@ -35,3 +35,6 @@ tests/fixtures/*.gguf
 
 # Dependency files
 *.d
+
+# Generated documentation
+docs/api/html/

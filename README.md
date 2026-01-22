@@ -128,6 +128,17 @@ s.header_dir = "lloyal"
 s.source_files = "liblloyal/include/**/*.{hpp,h}"
 ```
 
+## Documentation
+
+**Usage Guide:** [`docs/guide.md`](docs/guide.md) - Comprehensive patterns, examples, and best practices
+
+**API Reference:** Auto-generated from inline header comments
+- **Online:** https://lloyal-ai.github.io/liblloyal/ (auto-published on every commit)
+- **Local:** Generate with `./scripts/generate-docs.sh` and open `docs/api/html/index.html`
+- **Headers:** Browse `include/lloyal/*.hpp` directly - fully documented inline
+
+**Publishing:** See [`docs/PUBLISHING.md`](docs/PUBLISHING.md) for GitHub Pages setup
+
 ## Common Patterns
 
 ### From Simple to Complex
