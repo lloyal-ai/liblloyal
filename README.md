@@ -8,11 +8,12 @@
 
 **Composable primitives for llama.cpp inference**
 
-C++ primitives library for llama.cpp with composable building blocks (tokenization, sampling, embeddings, KV cache) and advanced patterns (handle-based APIs, shared model weights, multi-sequence management) enabling applications from simple streaming to complex inference orchestration.
+Composable C++ primitives library for llama.cpp with advanced patterns (handle-based APIs, shared model weights, multi-sequence management) enabling applications from simple streaming to complex inference orchestration.
 
 ## What it provides
 
 ### Core Primitives
+
 - **Tokenization** - Two-pass safe buffer sizing, special token handling
 - **Decoding** - Batch orchestration, sequence-aware operations
 - **KV Cache** - Sequence operations, state snapshots, long-context patterns
@@ -24,6 +25,7 @@ C++ primitives library for llama.cpp with composable building blocks (tokenizati
 ### Advanced Patterns
 
 **Handle-Based APIs** - Persistent, reusable objects for efficiency:
+
 ```cpp
 // Create reusable sampler chain
 auto chain = lloyal::sampler::create_chain(model, params);
@@ -34,6 +36,7 @@ auto grammar_handle = lloyal::grammar::init_sampler(model, schema);
 ```
 
 **Shared Model Weights** - Multiple contexts share same loaded model:
+
 ```cpp
 // ModelRegistry caches by (path, n_gpu_layers, use_mmap)
 auto model1 = lloyal::ModelRegistry::acquire(path, params);
@@ -42,6 +45,7 @@ auto model2 = lloyal::ModelRegistry::acquire(path, params);  // Cache hit
 ```
 
 **Multi-Sequence Orchestration** - Independent execution paths per context:
+
 ```cpp
 // Parallel hypothesis exploration
 lloyal::kv::seq_cp(ctx, 0, 1);  // Branch to seq 1
@@ -50,7 +54,9 @@ lloyal::kv::seq_cp(ctx, 0, 2);  // Branch to seq 2
 ```
 
 ### Sequence-Aware Operations
+
 Every primitive supports sequence IDs (default seq=0 for single-path):
+
 ```cpp
 // Copy KV state to new sequence
 lloyal::kv::seq_cp(ctx, 0, 1);
@@ -65,7 +71,9 @@ lloyal::kv::remove_range(ctx, seq, p0, p1);
 **Use case:** Speculative decoding - draft with small model on seq=0, verify with large model on seq=1, copy accepted prefix.
 
 ### Cloneable Metrics
+
 Track metrics independently across execution paths:
+
 ```cpp
 // Create baseline tracker
 auto tracker1 = lloyal::metrics::create_perplexity(ctx);
@@ -81,7 +89,9 @@ float ppl2 = lloyal::metrics::get_ppl(ctx, tracker2);
 **Use case:** A/B testing prompt variations - track quality metrics for each variant independently.
 
 ### Dual-Level Uncertainty
+
 Monitor both model and sampling distributions:
+
 ```cpp
 // Model's inherent uncertainty (raw logits)
 float model_entropy = lloyal::metrics::model_entropy(ctx, vocab);
@@ -93,6 +103,7 @@ float sampling_entropy = lloyal::metrics::sampling_entropy(ctx, vocab, params);
 **Use case:** Routing decisions - high model entropy triggers retrieval, collapsed sampling distribution suggests overfitting.
 
 ### Long-Context Patterns
+
 ```cpp
 // Preserve initial tokens + recent window, clear middle
 lloyal::kv::clear_and_reseed(ctx, initial_tokens, recent_tail);
@@ -101,6 +112,7 @@ lloyal::kv::clear_and_reseed(ctx, initial_tokens, recent_tail);
 **Use case:** Chat applications beyond context limit - preserve conversation start + recent exchanges without full reprocessing.
 
 ### Constrained Generation
+
 ```cpp
 // JSON schema → GBNF grammar
 auto grammar = lloyal::grammar::from_json_schema(schema);
@@ -123,6 +135,7 @@ auto chain = lloyal::sampler::create_chain(model, grammar);
 ## Integration
 
 ### Git Submodule
+
 ```bash
 # Pin to stable release (recommended)
 git submodule add -b v0.1.0 https://github.com/lloyal-ai/liblloyal.git
@@ -132,12 +145,14 @@ git submodule add https://github.com/lloyal-ai/liblloyal.git
 ```
 
 ### CMake
+
 ```cmake
 add_subdirectory(liblloyal)
 target_link_libraries(your_target PRIVATE lloyal llama)
 ```
 
 ### CocoaPods (iOS)
+
 ```ruby
 s.header_dir = "lloyal"
 s.source_files = "liblloyal/include/**/*.{hpp,h}"
@@ -148,6 +163,7 @@ s.source_files = "liblloyal/include/**/*.{hpp,h}"
 **Usage Guide:** [`docs/guide.md`](docs/guide.md) - Comprehensive patterns, examples, and best practices
 
 **API Reference:** Auto-generated from inline header comments
+
 - **Online:** https://lloyal-ai.github.io/liblloyal/ (auto-published on every commit)
 - **Local:** Generate with `./scripts/generate-docs.sh` and open `docs/api/html/index.html`
 - **Headers:** Browse `include/lloyal/*.hpp` directly - fully documented inline
@@ -159,6 +175,7 @@ s.source_files = "liblloyal/include/**/*.{hpp,h}"
 ### From Simple to Complex
 
 **Simple** - Single-sequence streaming:
+
 ```cpp
 lloyal::decoder::decode_tokens(ctx, prompt_tokens, 0);
 while (!done) {
@@ -168,6 +185,7 @@ while (!done) {
 ```
 
 **Intermediate** - Streaming with cache compression:
+
 ```cpp
 // When approaching context limit
 auto sinks = std::vector<llama_token>(tokens.begin(), tokens.begin() + 4);
@@ -177,6 +195,7 @@ lloyal::kv::clear_and_reseed(ctx, sinks, tail, n_batch);
 ```
 
 **Advanced** - Multi-sequence search with shared weights:
+
 ```cpp
 // Fork exploration paths on same model (shared weights)
 lloyal::kv::seq_cp(ctx, 0, 1);
@@ -188,6 +207,7 @@ lloyal::kv::seq_keep(ctx, best_seq);  // Keep winner, discard others
 ### Pattern Examples
 
 **Speculative decoding:**
+
 ```cpp
 // Draft on seq=0
 lloyal::decoder::decode_one(draft_ctx, draft_token, pos, 0);
@@ -200,6 +220,7 @@ lloyal::decoder::decode_one(verify_ctx, draft_token, pos, 1);
 ```
 
 **Model comparison:**
+
 ```cpp
 // Load same prompt into multiple contexts
 for (auto& ctx : contexts) {
@@ -210,6 +231,7 @@ for (auto& ctx : contexts) {
 ```
 
 **Prefix caching:**
+
 ```cpp
 // Share common prefix across requests
 lloyal::kv::seq_cp(ctx, 0, request_id);
@@ -219,6 +241,7 @@ lloyal::kv::seq_cp(ctx, 0, request_id);
 ## Testing
 
 Comprehensive test suite with stubs:
+
 - 84+ unit tests covering all primitives
 - Integration tests with real llama.cpp
 - Sanitizer validation (ASan, UBSan, LeakSan)
