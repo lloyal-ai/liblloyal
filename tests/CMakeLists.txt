@@ -103,11 +103,30 @@ option(LLOYAL_BUILD_INTEGRATION_TESTS "Build integration tests with real llama.c
 if(LLOYAL_BUILD_INTEGRATION_TESTS)
   message(STATUS "Building integration tests with real llama.cpp")
 
-  # Use dylib from vendor/llama.cpp/build-apple
-  set(LLAMA_CPP_DYLIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../vendor/llama.cpp/build-apple")
-  set(LLAMA_CPP_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../vendor/llama.cpp/include")
-  set(GGML_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../vendor/llama.cpp/ggml/include")
+  # Configure llama.cpp paths
+  # Can be overridden via -DLLAMA_CPP_DIR=/path/to/llama.cpp
+  if(NOT DEFINED LLAMA_CPP_DIR)
+    # Default: lloyal.node structure (../../vendor/llama.cpp)
+    set(LLAMA_CPP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../vendor/llama.cpp")
+  endif()
 
+  # Determine build directory based on platform (for backwards compat with lloyal.node)
+  if(EXISTS "${LLAMA_CPP_DIR}/build-apple")
+    set(LLAMA_CPP_BUILD_DIR "${LLAMA_CPP_DIR}/build-apple")
+  elseif(EXISTS "${LLAMA_CPP_DIR}/build-linux")
+    set(LLAMA_CPP_BUILD_DIR "${LLAMA_CPP_DIR}/build-linux")
+  elseif(EXISTS "${LLAMA_CPP_DIR}/build-windows")
+    set(LLAMA_CPP_BUILD_DIR "${LLAMA_CPP_DIR}/build-windows")
+  else
+    # Default to build/ (CI uses this)
+    set(LLAMA_CPP_BUILD_DIR "${LLAMA_CPP_DIR}/build")
+  endif()
+
+  set(LLAMA_CPP_DYLIB_DIR "${LLAMA_CPP_BUILD_DIR}")
+  set(LLAMA_CPP_INCLUDE_DIR "${LLAMA_CPP_DIR}/include")
+  set(GGML_INCLUDE_DIR "${LLAMA_CPP_DIR}/ggml/include")
+
+  message(STATUS "Using llama.cpp from: ${LLAMA_CPP_DIR}")
   message(STATUS "Using llama.cpp dylib from: ${LLAMA_CPP_DYLIB_DIR}")
 
   # Integration test executable

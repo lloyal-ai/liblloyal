@@ -108,8 +108,32 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+
+    - name: Read llama.cpp version
+      id: llama_version
+      run: |
+        LLAMA_VERSION=$(grep -v '^#' .llama-cpp-version | head -n1 | tr -d '[:space:]')
+        echo "version=$LLAMA_VERSION" >> $GITHUB_OUTPUT
+        echo "Using llama.cpp version: $LLAMA_VERSION"
+
+    - name: Checkout llama.cpp
+      run: |
+        git clone --depth 1 --branch ${{ steps.llama_version.outputs.version }} https://github.com/ggerganov/llama.cpp
+        echo "Checked out llama.cpp at:"
+        cd llama.cpp && git log -1 --oneline
+
+    - name: Cache llama.cpp build
+      uses: actions/cache@v4
       with:
-        lfs: true  # Pull LFS files (xcframework binaries)
+        path: llama.cpp/build
+        key: llama-macos-${{ runner.arch }}-${{ steps.llama_version.outputs.version }}
+        restore-keys: |
+          llama-macos-${{ runner.arch }}-
+
+    - name: Build llama.cpp
+      run: |
+        chmod +x .github/scripts/build-llama.sh
+        LLAMA_DIR=llama.cpp .github/scripts/build-llama.sh
 
     - name: Cache test models
       uses: actions/cache@v4
@@ -195,6 +219,7 @@ jobs:
       run: |
         cmake -S . -B build_integration \
           -DLLOYAL_BUILD_INTEGRATION_TESTS=ON \
+          -DLLAMA_CPP_DIR=${{ github.workspace }}/llama.cpp \
           -DCMAKE_BUILD_TYPE=Release
 
     - name: Build integration tests
