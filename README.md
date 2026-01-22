@@ -197,11 +197,37 @@ Comprehensive test suite with stubs:
 - Integration tests with real llama.cpp
 - Sanitizer validation (ASan, UBSan, LeakSan)
 
+### Unit Tests (Stub-based)
+
 ```bash
+cd tests
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-ctest --test-dir build
+./build/TestRunner --success
 ```
+
+### Integration Tests (Real llama.cpp)
+
+```bash
+# Setup llama.cpp (reads version from .llama-cpp-version)
+.github/scripts/setup-llama-cpp.sh
+
+# Build llama.cpp
+LLAMA_DIR=llama.cpp .github/scripts/build-llama.sh
+
+# Build and run integration tests
+cd tests
+cmake -B build_integration \
+  -DLLOYAL_BUILD_INTEGRATION_TESTS=ON \
+  -DLLAMA_CPP_DIR=../llama.cpp \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build_integration
+
+# Run with test model
+LLAMA_TEST_MODEL=path/to/model.gguf ./build_integration/IntegrationRunner
+```
+
+**llama.cpp version:** Pinned in `.llama-cpp-version` for reproducible testing
 
 ## Design Principles
 
