@@ -1,5 +1,8 @@
 #pragma once
 
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Lloyal Labs
+
 #include "common.hpp"
 #include <functional>
 #include <llama/llama.h>
@@ -9,14 +12,14 @@
 #include <unordered_map>
 
 /**
- * Model Registry (Header-Only)
+ * @file model_registry.hpp
+ * @brief Thread-Safe Model Cache
  *
- * Purpose: Thread-safe weak-pointer cache to avoid reloading same model
- * multiple times. Uses inline static members (C++17) to enable header-only
- * class with static state.
+ * Provides weak-pointer cache to avoid reloading same model multiple times.
+ * Uses inline static members (C++17) for header-only implementation with static state.
  *
- * Key: (canonPath, n_gpu_layers, use_mmap)
- * Value: weak_ptr to llama_model (auto-cleanup when last context releases)
+ * Cache key: (canonPath, n_gpu_layers, use_mmap)
+ * Cache value: weak_ptr to llama_model (auto-cleanup when last context releases)
  *
  * Thread-safe via std::mutex for all cache operations.
  */
@@ -24,13 +27,15 @@
 namespace lloyal {
 
 /**
- * Model cache key combining file path and GPU configuration
- * SOURCE: ModelRegistry.h:22-32
+ * @brief Model cache key combining file path and GPU configuration
+ *
+ * Used as key in ModelRegistry cache to uniquely identify model instances.
+ * Different GPU configurations of the same model are cached separately.
  */
 struct ModelKey {
-  std::string canonPath; // Normalized file path (file:// prefix removed)
-  int n_gpu_layers;      // Number of layers offloaded to GPU (-1 = all)
-  bool use_mmap;         // Whether to use memory mapping
+  std::string canonPath; ///< Normalized file path (file:// prefix removed)
+  int n_gpu_layers;      ///< Number of layers offloaded to GPU (-1 = all)
+  bool use_mmap;         ///< Whether to use memory mapping
 
   bool operator==(const ModelKey &o) const {
     return n_gpu_layers == o.n_gpu_layers && use_mmap == o.use_mmap &&
@@ -39,10 +44,20 @@ struct ModelKey {
 };
 
 /**
- * Hash function for ModelKey
- * SOURCE: ModelRegistry.h:38-46
+ * @brief Hash functor for ModelKey
+ *
+ * Computes combined hash of path, GPU layers, and mmap flag for use in
+ * std::unordered_map. Uses XOR with golden ratio constant for good distribution.
  */
 struct ModelKeyHash {
+  /**
+   * @brief Compute hash for ModelKey
+   *
+   * Combines path hash with GPU/mmap configuration using XOR and golden ratio.
+   *
+   * @param k Key to hash
+   * @return Combined hash value
+   */
   size_t operator()(const ModelKey &k) const {
     std::hash<std::string> Hs;
     std::hash<int> Hi;
@@ -54,7 +69,6 @@ struct ModelKeyHash {
 
 /**
  * Thread-safe registry for sharing llama_model instances
- * SOURCE: ModelRegistry.h:72-120
  *
  * IMPORTANT: This is a CLASS with static members, not a namespace.
  * Converting to header-only requires inline static members (C++17).
@@ -63,7 +77,6 @@ class ModelRegistry {
 public:
   /**
    * Acquire a model from cache or load if not present
-   * SOURCE: ModelRegistry.h:93-96
    *
    * @param fsPath Filesystem path to model file (file:// prefix normalized)
    * @param params Model load parameters (GPU layers, mmap, etc.)
@@ -75,21 +88,25 @@ public:
 private:
   /**
    * Global cache mutex - inline static for header-only
-   * SOURCE: ModelRegistry.h:103
    */
   inline static std::mutex mu_;
 
   /**
    * Model cache - inline static for header-only
-   * SOURCE: ModelRegistry.h:113
    */
   inline static std::unordered_map<ModelKey, std::weak_ptr<llama_model>,
                                    ModelKeyHash>
       cache_;
 
   /**
-   * Create cache key from path and parameters (private helper)
-   * SOURCE: ModelRegistry.h:119
+   * @brief Create normalized cache key from path and parameters
+   *
+   * Normalizes filesystem path by removing file:// prefix to ensure
+   * "file:///path" and "/path" map to the same cache entry.
+   *
+   * @param fsPath Filesystem path (may include file:// prefix)
+   * @param params Model parameters for GPU/mmap configuration
+   * @return Normalized ModelKey
    */
   static ModelKey makeKey(const std::string &fsPath,
                           const llama_model_params &params);

@@ -1,96 +1,165 @@
 # liblloyal
 
-**Header-only llama.cpp-bound core library**
+**Composable primitives for llama.cpp inference**
 
-## Overview
+Header-only C++ library providing fine-grained control over llama.cpp with clean abstractions for sequence management, metrics, and state operations.
 
-`liblloyal` is a header-only C++ library that provides high-level abstractions over llama.cpp for local LLM inference. It implements anti-corruption layers for tokenization, sampling, KV cache management, chat templates, and grammar-constrained generation.
+## What it provides
+
+### Core Primitives
+- **Tokenization** - Two-pass safe buffer sizing, special token handling
+- **Decoding** - Batch orchestration, sequence-aware operations
+- **KV Cache** - Sequence operations, state snapshots, long-context patterns
+- **Sampling** - Grammar-constrained, persistent chains, 52 parameters
+- **Metrics** - Dual-level entropy/surprisal, rolling perplexity, cloneable state
+- **Embeddings** - Pooled extraction, L2 normalization, similarity
+- **Chat Templates** - Jinja2 formatting with fallbacks
+
+### Sequence-Aware Operations
+Every primitive supports sequence IDs (default seq=0 for single-path):
+```cpp
+// Copy KV state to new sequence
+lloyal::kv::seq_cp(ctx, 0, 1);
+
+// Sample from different sequences
+lloyal::sampler::sample_with_params(ctx, vocab, params, /*seq=*/1);
+
+// Remove tokens from specific sequence
+lloyal::kv::remove_range(ctx, seq, p0, p1);
+```
+
+**Use case:** Speculative decoding - draft with small model on seq=0, verify with large model on seq=1, copy accepted prefix.
+
+### Cloneable Metrics
+Track metrics independently across execution paths:
+```cpp
+// Create baseline tracker
+auto tracker1 = lloyal::metrics::create_perplexity(ctx);
+
+// Clone for alternative
+auto tracker2 = lloyal::metrics::clone_perplexity(ctx, tracker1);
+
+// Compare results
+float ppl1 = lloyal::metrics::get_ppl(ctx, tracker1);
+float ppl2 = lloyal::metrics::get_ppl(ctx, tracker2);
+```
+
+**Use case:** A/B testing prompt variations - track quality metrics for each variant independently.
+
+### Dual-Level Uncertainty
+Monitor both model and sampling distributions:
+```cpp
+// Model's inherent uncertainty (raw logits)
+float model_entropy = lloyal::metrics::model_entropy(ctx, vocab);
+
+// Actual sampling distribution (post-filter)
+float sampling_entropy = lloyal::metrics::sampling_entropy(ctx, vocab, params);
+```
+
+**Use case:** Routing decisions - high model entropy triggers retrieval, collapsed sampling distribution suggests overfitting.
+
+### Long-Context Patterns
+```cpp
+// Preserve initial tokens + recent window, clear middle
+lloyal::kv::clear_and_reseed(ctx, initial_tokens, recent_tail);
+```
+
+**Use case:** Chat applications beyond context limit - preserve conversation start + recent exchanges without full reprocessing.
+
+### Constrained Generation
+```cpp
+// JSON schema → GBNF grammar
+auto grammar = lloyal::grammar::from_json_schema(schema);
+auto chain = lloyal::sampler::create_chain(model, grammar);
+```
+
+**Use case:** Structured API responses, data extraction, format enforcement.
 
 ## Architecture
 
-- **Header-only**: All implementations are inline in headers under `include/lloyal/`
-- **llama.cpp-bound**: Designed to work with llama.cpp b6870 (pinned version)
-- **Namespace**: `lloyal::` (portable, neutral naming)
-- **Zero dependencies**: Only requires llama.cpp and standard library
-
-## Components
-
-### Core Abstractions
-
-- **`tokenizer.hpp`**: Tokenization/detokenization with special token handling
-- **`decoder.hpp`**: Token-to-text streaming decoding
-- **`sampler.hpp`**: Advanced sampling with 52 tunable parameters
-- **`kv.hpp`**: KV cache management (operations, defragmentation, compression)
-- **`chat_template.hpp`**: Jinja2-based chat template formatting
-- **`grammar.hpp`**: Grammar-constrained generation with JSON schema support
-- **`model_registry.hpp`**: Model metadata and feature detection
-- **`helpers.hpp`**: Batch utilities, string operations, parameter conversions
-
-### Vendored Dependencies
-
-- **`minja/`**: Jinja2 template engine (from llama.cpp)
-- **`nlohmann/json.hpp`**: JSON library (ordered_json for schema)
-
-## Usage
-
-```cpp
-#include <lloyal/tokenizer.hpp>
-#include <lloyal/sampler.hpp>
-#include <lloyal/kv.hpp>
-
-// Tokenize text
-auto tokens = lloyal::tokenizer::tokenize(vocab, "Hello world", true, false);
-
-// Sample next token
-int token_id = lloyal::sampler::sample(ctx, vocab, params);
-
-// Manage KV cache
-lloyal::kv::clear_range(ctx, 0, 100, 512, 1024);
-```
+- **Header-only** - All implementations inline in `include/lloyal/*.hpp`
+- **llama.cpp wrapper** - Compile-time dependency, validated by build system
+- **Zero runtime dependencies** - Only requires C++20 standard library
+- **Multi-binding** - C++20 concepts decouple from binding-specific types
 
 ## Integration
 
-### CMake (Android, Linux, etc.)
-
+### CMake
 ```cmake
 add_subdirectory(liblloyal)
 target_link_libraries(your_target PRIVATE lloyal llama)
 ```
 
 ### CocoaPods (iOS)
-
 ```ruby
 s.header_dir = "lloyal"
 s.source_files = "liblloyal/include/**/*.{hpp,h}"
-s.vendored_frameworks = "llama.cpp/build-apple/llama.xcframework"
 ```
 
-## Version Pinning
+## Common Patterns
 
-This library is built against **llama.cpp b6870**. The CMakeLists.txt includes build-time validation to ensure version compatibility.
+**Speculative decoding:**
+```cpp
+// Draft on seq=0
+lloyal::decoder::decode_one(draft_ctx, draft_token, pos, 0);
+
+// Verify on seq=1 (copied from seq=0)
+lloyal::kv::seq_cp(verify_ctx, 0, 1);
+lloyal::decoder::decode_one(verify_ctx, draft_token, pos, 1);
+
+// Accept or reject based on logits comparison
+```
+
+**Model comparison:**
+```cpp
+// Load same prompt into multiple contexts
+for (auto& ctx : contexts) {
+  lloyal::decoder::decode_tokens(ctx, prompt_tokens, 0);
+  auto tracker = lloyal::metrics::create_perplexity(ctx);
+  // Compare perplexities across checkpoints
+}
+```
+
+**Prefix caching:**
+```cpp
+// Share common prefix across requests
+lloyal::kv::seq_cp(ctx, 0, request_id);
+// Continue from shared prefix without re-decode
+```
 
 ## Testing
 
-Smoke tests verify core functionality:
-- `tests/test_logits_mask.cpp` - Validates logits biasing operations
-- `tests/test_kv_range.cpp` - Validates KV cache range operations
+Comprehensive test suite with stubs:
+- 84+ unit tests covering all primitives
+- Integration tests with real llama.cpp
+- Sanitizer validation (ASan, UBSan, LeakSan)
 
-Run tests: `ctest` (from build directory)
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+ctest --test-dir build
+```
 
 ## Design Principles
 
-1. **Anti-Corruption Layer**: Isolates shells from llama.cpp API churn
-2. **Header-Only**: Simplifies linking, enables aggressive inlining
-3. **Explicit Over Implicit**: Clear parameters, no hidden state
-4. **Fail-Safe**: Validates inputs, returns empty/false on errors
-5. **Two-Pass Algorithms**: Safe buffer sizing for tokenization/detokenization
+1. **Primitives, not opinions** - Build your patterns, we provide the tools
+2. **Explicit over implicit** - No hidden state, clear contracts
+3. **Sequence-aware** - All operations support independent execution paths
+4. **Testable** - No framework coupling, works standalone
+5. **Version-isolated** - Absorbs llama.cpp API changes
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development guidelines.
+
+## Security
+
+For security issues, see [SECURITY.md](SECURITY.md) for our disclosure policy.
 
 ## License
 
-MIT (matches llama.cpp licensing)
+Apache 2.0 - See LICENSE file for details
 
-## Shells
+## Integrations
 
-This library is used by:
-- **calibrate-ndk**: Commercial React Native module (with TokenLedger)
-- **nitro-llama**: Open-source React Native module
+This library is used by multiple inference bindings including React Native modules, Node.js addons, and CLI applications.

@@ -1,6 +1,11 @@
 #pragma once
 
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Lloyal Labs
+
 #include "common.hpp"
+#include "helpers.hpp"
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <llama/llama.h>
@@ -8,17 +13,18 @@
 #include <vector>
 
 /**
- * Embeddings Anti-Corruption Layer (Header-Only)
+ * @file embedding.hpp
+ * @brief Embedding Extraction and Normalization
  *
- * Purpose: Single point of contact with llama.cpp embedding APIs to isolate
- * version churn, pooling modes, and normalization complexity.
+ * Wraps llama.cpp embedding APIs with pooling mode management and L2 normalization.
+ * Provides both context-bound extraction and model capability checks.
  *
- * ARCHITECTURE:
- * - Primitives accept context directly (embeddings are context-bound)
- * - Model-accepting overloads provided for capability checks
- * - L2 normalization built-in (required for cosine similarity)
+ * Architecture:
+ * - Context-bound primitives for embedding extraction
+ * - Model-accepting overloads for capability checks
+ * - Built-in L2 normalization for cosine similarity
  *
- * USAGE:
+ * @example
  *   // Check model supports embeddings
  *   if (embedding::has_embeddings(model)) {
  *     int32_t dim = embedding::dimension(model);
@@ -151,6 +157,99 @@ inline void apply_l2_normalize(std::vector<float> &vec) {
 }
 
 } // namespace detail
+
+// ===== RAII GUARD FOR BATCH CLEANUP =====
+
+namespace detail {
+/**
+ * RAII guard for automatic batch cleanup
+ * Ensures llama_batch_free is called even if exceptions occur
+ */
+struct BatchGuard {
+  llama_batch &batch;
+  explicit BatchGuard(llama_batch &b) : batch(b) {}
+  ~BatchGuard() { llama_batch_free(batch); }
+};
+} // namespace detail
+
+// ===== ENCODING (FORWARD PASS FOR EMBEDDINGS) =====
+
+/**
+ * Encode tokens for embedding extraction
+ *
+ * Unlike decoder::decode_tokens(), this marks ALL tokens with logits=true which is
+ * required for embedding extraction.
+ *
+ * NOTE: Use this with a dedicated embedding context (embeddings=true, pooling
+ * enabled). Clear KV between texts with kv::clear_all():
+ *
+ *   // Create dedicated embedding context
+ *   ctx_params.embeddings = true;
+ *   ctx_params.pooling_type = LLAMA_POOLING_TYPE_MEAN;
+ *   auto embed_ctx = llama_init_from_model(model, ctx_params);
+ *
+ *   // Embed each text
+ *   kv::clear_all(embed_ctx);
+ *   embedding::encode(embed_ctx, tokens, 512);
+ *   auto emb = embedding::get(embed_ctx);
+ *
+ * @param ctx Llama context (must have embeddings=true and pooling enabled)
+ * @param tokens Token array to encode
+ * @param n_tokens Number of tokens in array
+ * @param n_batch Batch size
+ * @throws std::runtime_error if encode fails
+ */
+inline void encode(llama_context *ctx, const llama_token *tokens,
+                   int32_t n_tokens, int32_t n_batch) {
+  LLOYAL_LOG_DEBUG("[embedding::encode] Encoding %d tokens for embeddings",
+                   n_tokens);
+
+  if (!ctx) {
+    LLOYAL_LOG_DEBUG("[embedding::encode] ERROR: NULL context");
+    throw std::runtime_error("embedding::encode - NULL context");
+  }
+
+  if (!tokens || n_tokens <= 0) {
+    LLOYAL_LOG_DEBUG("[embedding::encode] ERROR: Invalid token array");
+    throw std::runtime_error("embedding::encode - Invalid token array");
+  }
+
+  if (n_tokens > n_batch) {
+    LLOYAL_LOG_DEBUG("[embedding::encode] ERROR: n_tokens (%d) > n_batch (%d)",
+                     n_tokens, n_batch);
+    throw std::runtime_error(
+        "embedding::encode - token count exceeds batch size (truncation not "
+        "supported, increase n_batch or reduce input length)");
+  }
+
+  // Initialize batch - single sequence
+  llama_batch batch = llama_batch_init(n_batch, 0, 1);
+  detail::BatchGuard batch_guard(batch);
+
+  // Clear batch
+  lloyal::batch_clear(batch);
+
+  // Add ALL tokens with logits=true (required for embedding extraction)
+  for (int32_t i = 0; i < n_tokens; ++i) {
+    lloyal::batch_add(batch, tokens[i], i, {0}, true, n_batch);
+  }
+
+  // Decode/encode the batch (llama.cpp handles encoder vs decoder internally)
+  if (llama_decode(ctx, batch) != 0) {
+    LLOYAL_LOG_DEBUG("[embedding::encode] ERROR: llama_decode failed");
+    throw std::runtime_error("embedding::encode - llama_decode failed");
+  }
+
+  LLOYAL_LOG_DEBUG("[embedding::encode] Encode complete");
+}
+
+/**
+ * Convenience overload for std::vector<llama_token>
+ */
+inline void encode(llama_context *ctx, const std::vector<llama_token> &tokens,
+                   int32_t n_batch) {
+  encode(ctx, tokens.data(), static_cast<int32_t>(tokens.size()), n_batch);
+}
 
 // ===== EMBEDDING EXTRACTION =====
 

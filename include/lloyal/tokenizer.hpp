@@ -1,5 +1,8 @@
 #pragma once
 
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Lloyal Labs
+
 #include "common.hpp"
 #include <cstdint>
 #include <llama/llama.h>
@@ -7,13 +10,16 @@
 #include <vector>
 
 /**
- * Tokenizer Anti-Corruption Layer (Header-Only)
+ * @file tokenizer.hpp
+ * @brief Text Tokenization Operations
  *
- * Purpose: Single point of contact with llama.cpp tokenization APIs to isolate
- * version churn, special token handling complexity, and buffer sizing edge
- * cases.
+ * Wraps llama.cpp tokenization APIs with safe buffer management and special token handling.
+ * Uses two-pass algorithms for reliable buffer sizing.
  *
- * Uses two-pass algorithms for safe buffer sizing.
+ * Architecture:
+ * - Two-pass tokenization: measure size, then allocate and populate
+ * - Special token handling: BOS/EOS/parsing configuration
+ * - Model-accepting overloads for convenience
  */
 
 namespace lloyal::tokenizer {

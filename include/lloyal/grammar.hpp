@@ -1,5 +1,8 @@
 #pragma once
 
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Lloyal Labs
+
 #include "common.hpp"
 #include "json-schema-to-grammar.hpp"
 #include "tokenizer.hpp"
@@ -9,17 +12,18 @@
 #include <string>
 
 /**
- * Grammar Anti-Corruption Layer (Header-Only)
+ * @file grammar.hpp
+ * @brief Grammar-Constrained Sampling
  *
- * PURPOSE: Provides JSON schema to GBNF grammar conversion for structured
- * output
+ * Provides JSON schema to GBNF grammar conversion for structured output generation.
+ * Wraps json-schema-to-grammar.hpp conversion logic with error handling and logging.
  *
- * ARCHITECTURE:
- * - This layer CALLS json_schema_to_grammar from json-schema-to-grammar.hpp
- * - Does NOT reimplement conversion logic
- * - Provides error handling, logging, and consistent API
+ * Architecture:
+ * - Calls json_schema_to_grammar() from json-schema-to-grammar.hpp
+ * - Adds error handling, logging, and consistent API
+ * - Manages grammar sampler lifecycle
  *
- * USAGE:
+ * @example
  *   std::string gbnf = lloyal::grammar::from_json_schema(schemaJsonString);
  *   // Pass to sampler::sample_with_params() via grammarSampler parameter
  */

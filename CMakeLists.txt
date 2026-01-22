@@ -6,8 +6,8 @@ project(liblloyal VERSION 0.1.0 LANGUAGES CXX)
 # =============================================================================
 #
 # This library provides type-safe, ergonomic wrappers around llama.cpp for
-# React Native shells (calibrate-ndk, nitro-llama). All implementations are
-# header-only with inline specifiers.
+# multiple language bindings. All implementations are header-only with inline
+# specifiers.
 #
 # Dependencies:
 #   - llama.cpp (b6870 or compatible)

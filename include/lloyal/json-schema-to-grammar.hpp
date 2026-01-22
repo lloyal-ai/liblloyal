@@ -1,5 +1,8 @@
 #pragma once
 
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Lloyal Labs
+
 #include "common.hpp"
 #include "helpers.hpp" // For string_repeat, string_join, string_split
 #include <lloyal/nlohmann/json.hpp>
@@ -78,7 +81,13 @@ struct BuiltinRule {
   std::vector<std::string> deps;
 };
 
-// Primitive grammar rules
+/**
+ * @var PRIMITIVE_RULES
+ * @brief Built-in grammar rules for JSON primitives
+ *
+ * Defines GBNF rules for basic JSON types: boolean, number, integer, string, array,
+ * object, null, uuid, and character escaping. Used as building blocks for schema conversion.
+ */
 inline const std::unordered_map<std::string, BuiltinRule> PRIMITIVE_RULES = {
     {"boolean", {"(\"true\" | \"false\") space", {}}},
     {"decimal-part", {"[0-9]{1,16}", {}}},
@@ -109,7 +118,13 @@ inline const std::unordered_map<std::string, BuiltinRule> PRIMITIVE_RULES = {
     {"null", {"\"null\" space", {}}},
 };
 
-// String format rules (date, time, etc.)
+/**
+ * @var STRING_FORMAT_RULES
+ * @brief Grammar rules for string format validation
+ *
+ * Defines GBNF rules for JSON Schema string formats: date, time, date-time, uri, email, uuid.
+ * Used when schema specifies "format" field for string validation.
+ */
 inline const std::unordered_map<std::string, BuiltinRule> STRING_FORMAT_RULES =
     {{"date",
       {"[0-9]{4} \"-\" ( \"0\" [1-9] | \"1\" [0-2] ) \"-\" ( \"0\" [1-9] | "
@@ -126,7 +141,18 @@ inline const std::unordered_map<std::string, BuiltinRule> STRING_FORMAT_RULES =
      {"date-time-string",
       {"\"\\\"\" date-time \"\\\"\" space", {"date-time"}}}};
 
-// Reserved rule names
+/**
+ * @brief Check if name conflicts with GBNF reserved keywords
+ *
+ * Tests whether a rule name would collide with built-in primitives ("root", "boolean",
+ * "number", "string", etc.) or format rules ("date", "time", "uuid", etc.). Used during
+ * schema conversion to append "-" suffix to conflicting names.
+ *
+ * @param name Rule name to check
+ * @return True if name is reserved, false otherwise
+ *
+ * @note Uses lazy-initialized static set for O(1) lookup after first call
+ */
 inline bool is_reserved_name(const std::string &name) {
   static std::unordered_set<std::string> RESERVED_NAMES;
   if (RESERVED_NAMES.empty()) {
@@ -461,8 +487,38 @@ public:
     _rules["space"] = SPACE_RULE;
   }
 
+  /**
+   * @brief Resolve $ref pointers in JSON schema
+   *
+   * Recursively resolves all $ref fields in schema, fetching remote schemas as needed.
+   * Replaces relative refs (#/definitions/...) with absolute URLs and populates internal
+   * _refs map with resolved schema objects.
+   *
+   * @param schema Schema object to resolve (modified in place)
+   * @param url Base URL for resolving relative references
+   *
+   * @note Handles both absolute (https://...) and relative (#/definitions/...) refs
+   * @note Errors accumulated in _errors vector for batch reporting
+   */
   void resolve_refs(json &schema, const std::string &url);
   std::string _generate_constant_rule(const json &value);
+
+  /**
+   * @brief Convert schema node to GBNF rule
+   *
+   * Main entry point for schema-to-grammar conversion. Dispatches to appropriate handler
+   * based on schema type (object, array, string, number, enum, etc.). Recursively processes
+   * nested schemas and generates corresponding GBNF rules.
+   *
+   * @param schema Schema node to convert (JSON object, may contain type, properties, items, etc.)
+   * @param name Rule name to generate (used as identifier in output grammar)
+   * @return Generated GBNF rule definition
+   *
+   * @note Accumulates errors in _errors vector - call check_errors() after conversion
+   * @note May throw std::runtime_error on unrecognized schema constructs
+   *
+   * @warning Complex method (~200+ lines) - handles all JSON Schema type keywords
+   */
   std::string visit(const json &schema, const std::string &name);
   void check_errors();
   std::string format_grammar();

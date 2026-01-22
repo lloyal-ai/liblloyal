@@ -232,7 +232,7 @@ TEST_CASE("Embedding Integration: context creation with runtime pooling type") {
   REQUIRE_FALSE(tokens.empty());
 
   kv::clear_all(ctx);
-  decoder::encode(ctx, tokens, 512);
+  embedding::encode(ctx, tokens, 512);
 
   auto emb = embedding::get(ctx, embedding::Normalize::L2);
   CHECK(emb.size() == static_cast<size_t>(embedding::dimension(model.get())));
@@ -272,7 +272,7 @@ TEST_CASE("Embedding Integration: extract embeddings from embedding model") {
 
   // Clear KV and encode (marks all tokens with logits=true)
   kv::clear_all(ctx);
-  decoder::encode(ctx, tokens, 512);
+  embedding::encode(ctx, tokens, 512);
 
   // Extract embeddings
   auto emb = embedding::get(ctx, embedding::Normalize::L2);
@@ -315,19 +315,19 @@ TEST_CASE(
   // Embed first sentence
   auto tokens1 = tokenizer::tokenize(vocab, "The cat sat on the mat", true, true);
   kv::clear_all(ctx);
-  decoder::encode(ctx, tokens1, 512);
+  embedding::encode(ctx, tokens1, 512);
   auto emb1 = embedding::get(ctx, embedding::Normalize::L2);
 
   // Embed second (similar) sentence
   auto tokens2 = tokenizer::tokenize(vocab, "A cat rested on the rug", true, true);
   kv::clear_all(ctx);
-  decoder::encode(ctx, tokens2, 512);
+  embedding::encode(ctx, tokens2, 512);
   auto emb2 = embedding::get(ctx, embedding::Normalize::L2);
 
   // Embed third (different) sentence
   auto tokens3 = tokenizer::tokenize(vocab, "Stock prices rose sharply", true, true);
   kv::clear_all(ctx);
-  decoder::encode(ctx, tokens3, 512);
+  embedding::encode(ctx, tokens3, 512);
   auto emb3 = embedding::get(ctx, embedding::Normalize::L2);
 
   // Similar sentences should have higher similarity than different ones

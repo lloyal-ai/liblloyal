@@ -1,32 +1,55 @@
 #pragma once
 
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Lloyal Labs
+
+/**
+ * @file kv.hpp
+ * @brief KV Cache Management
+ *
+ * Core primitives for KV cache operations in LLM applications:
+ * - Multi-sequence management: independent recurrent states per seq_id
+ * - Cache lifecycle: clear, remove, copy, keep operations
+ * - State persistence: save/load with fragmentation fallback
+ * - Cache reconstruction: clear_and_reseed for context compression strategies
+ * - File I/O: session save/resume for app lifecycle management
+ *
+ * These primitives compose into diverse inference patterns including:
+ * - Context window management (streaming, compression, eviction)
+ * - Session persistence (save/resume across app restarts)
+ * - Multi-sequence orchestration (parallel logical states)
+ * - Specialized search and sampling strategies
+ *
+ * Memory management for llama.cpp primitives:
+ * - llama_memory_* for cache lifecycle and multi-sequence ops
+ * - llama_state_* for serialization with fragmentation fallback
+ * - Adds null-safety, error handling, and defensive programming
+ */
+
 #include "common.hpp"
 #include "decoder.hpp"
 #include <cstdint>
 #include <llama/llama.h>
 #include <vector>
 
-/**
- * KV Cache Anti-Corruption Layer (Header-Only)
- *
- * Purpose: Handles API name churn across llama.cpp versions.
- * Pinned version: commit b6870 (llama_memory_seq_* API naming)
- */
-
 namespace lloyal::kv {
 
 // ===== KV SEQUENCE OPERATIONS =====
 
 /**
- * Remove token range from KV cache sequence.
+ * @brief Remove token range from KV cache sequence
  *
- * @param ctx llama context
- * @param seq sequence ID (use 0 for single-sequence mode)
- * @param p0 start position (inclusive)
- * @param p1 end position (exclusive), use -1 for "to end"
- * @return true if successful, false otherwise
+ * Removes tokens in the range [p0, p1) from the specified sequence's KV cache.
+ * Used for selective eviction in context window management.
  *
- * CRITICAL: Call this BEFORE next llama_decode(), not after.
+ * @param ctx Llama context (must not be null)
+ * @param seq Sequence ID (use 0 for single-sequence mode)
+ * @param p0 Start position (inclusive)
+ * @param p1 End position (exclusive), use -1 for "to end"
+ * @return true if successful, false if context is null or operation failed
+ *
+ * @warning CRITICAL: Call this BEFORE next llama_decode(), not after.
+ *          Calling after decode may cause undefined behavior.
  */
 inline bool remove_range(llama_context *ctx, llama_seq_id seq, llama_pos p0,
                          llama_pos p1) {
@@ -52,11 +75,14 @@ inline bool remove_range(llama_context *ctx, llama_seq_id seq, llama_pos p0,
 }
 
 /**
- * Get maximum position in KV cache sequence.
+ * @brief Get maximum position in KV cache sequence
  *
- * @param ctx llama context
- * @param seq sequence ID
- * @return maximum position (number of tokens - 1), or -1 if empty
+ * Returns the highest token position in the specified sequence's KV cache.
+ * For a sequence with N tokens, this returns N-1 (zero-indexed).
+ *
+ * @param ctx Llama context (must not be null)
+ * @param seq Sequence ID
+ * @return Maximum position (number of tokens - 1), or -1 if empty or context is null
  */
 inline llama_pos pos_max(llama_context *ctx, llama_seq_id seq) {
   if (!ctx) {
@@ -72,15 +98,18 @@ inline llama_pos pos_max(llama_context *ctx, llama_seq_id seq) {
 }
 
 /**
- * Copy KV cache from one sequence to another (for branching/fork).
+ * @brief Copy KV cache from one sequence to another
  *
- * @param ctx llama context
- * @param src source sequence ID
- * @param dst destination sequence ID
- * @param p0 start position (inclusive), default 0
- * @param p1 end position (exclusive), default -1 (to end)
+ * Copies KV cache state from source to destination sequence, enabling
+ * efficient branching without duplicating model weights.
  *
- * Use case: System 2 tree search - fork from trunk without copying model weights
+ * @param ctx Llama context (must not be null)
+ * @param src Source sequence ID
+ * @param dst Destination sequence ID
+ * @param p0 Start position (inclusive), default 0
+ * @param p1 End position (exclusive), default -1 for "to end"
+ *
+ * @note Use case: Multi-sequence search (fork from trunk without copying model weights)
  */
 inline void seq_cp(llama_context *ctx, llama_seq_id src, llama_seq_id dst,
                    llama_pos p0 = 0, llama_pos p1 = -1) {
@@ -96,12 +125,15 @@ inline void seq_cp(llama_context *ctx, llama_seq_id src, llama_seq_id dst,
 }
 
 /**
- * Keep only one sequence, removing all others.
+ * @brief Keep only one sequence, removing all others
  *
- * @param ctx llama context
- * @param seq sequence ID to keep
+ * Removes all sequences except the specified one from the KV cache.
+ * Efficient way to prune unused branches.
  *
- * Use case: After tree search, prune all branches except winner
+ * @param ctx Llama context (must not be null)
+ * @param seq Sequence ID to keep
+ *
+ * @note Use case: After selection, prune all alternatives except chosen path
  */
 inline void seq_keep(llama_context *ctx, llama_seq_id seq) {
   if (!ctx) {
@@ -115,11 +147,20 @@ inline void seq_keep(llama_context *ctx, llama_seq_id seq) {
   LLOYAL_LOG_DEBUG("[kv::seq_keep] Kept only seq %d", seq);
 }
 
-// ===== STATE SNAPSHOT OPERATIONS (with fragmentation fallback) =====
+// ===== STATE SNAPSHOT OPERATIONS =====
 
 /**
- * Get size needed to serialize sequence state.
- * Automatically falls back to global state size if per-sequence fails.
+ * @brief Get size needed to serialize sequence state
+ *
+ * Returns buffer size required to save the sequence's KV cache state.
+ * Automatically falls back to global state size if per-sequence query fails
+ * (may occur with fragmented caches).
+ *
+ * @param ctx Llama context (must not be null)
+ * @param seq Sequence ID
+ * @return Required buffer size in bytes, or 0 if empty/failed
+ *
+ * @note Fallback strategy: per-sequence → global state (handles fragmentation)
  */
 inline size_t state_size(llama_context *ctx, llama_seq_id seq) {
   if (!ctx) {
@@ -162,8 +203,19 @@ inline size_t state_size(llama_context *ctx, llama_seq_id seq) {
 }
 
 /**
- * Save sequence state to buffer.
- * Automatically falls back to global state save if per-sequence fails.
+ * @brief Save sequence state to buffer
+ *
+ * Serializes the sequence's KV cache state into the provided buffer.
+ * Automatically falls back to global state save if per-sequence save fails
+ * (may occur with fragmented caches).
+ *
+ * @param ctx Llama context (must not be null)
+ * @param seq Sequence ID
+ * @param dst Destination buffer (must not be null)
+ * @param size Buffer size in bytes
+ * @return Bytes written, or 0 on failure
+ *
+ * @note Fallback strategy: per-sequence → global state (handles fragmentation)
  */
 inline size_t state_save(llama_context *ctx, llama_seq_id seq, uint8_t *dst,
                          size_t size) {
@@ -211,8 +263,20 @@ inline size_t state_save(llama_context *ctx, llama_seq_id seq, uint8_t *dst,
 }
 
 /**
- * Restore sequence state from buffer.
- * Automatically falls back to global state restore if per-sequence fails.
+ * @brief Restore sequence state from buffer
+ *
+ * Deserializes KV cache state from buffer and restores it to the sequence.
+ * Automatically falls back to global state restore if per-sequence restore fails
+ * (may occur with fragmented caches).
+ *
+ * @param ctx Llama context (must not be null)
+ * @param seq Sequence ID
+ * @param src Source buffer (must not be null)
+ * @param size Buffer size in bytes
+ * @return Bytes read, or 0 on failure
+ *
+ * @warning May crash on recurrent models if KV cache is empty during load
+ * @note Fallback strategy: per-sequence → global state (handles fragmentation)
  */
 inline size_t state_load(llama_context *ctx, llama_seq_id seq,
                          const uint8_t *src, size_t size) {
@@ -258,8 +322,17 @@ inline size_t state_load(llama_context *ctx, llama_seq_id seq,
   return read;
 }
 
-// ===== GLOBAL STATE FALLBACKS (explicit) =====
+// ===== GLOBAL STATE OPERATIONS =====
 
+/**
+ * @brief Get size needed to serialize global state
+ *
+ * Returns buffer size required to save the entire context's state.
+ * Use when per-sequence serialization is not needed.
+ *
+ * @param ctx Llama context (must not be null)
+ * @return Required buffer size in bytes, or 0 if context is null
+ */
 inline size_t global_state_size(llama_context *ctx) {
   if (!ctx) {
     LLOYAL_LOG_DEBUG("[kv::global_state_size] ERROR: null context");
@@ -272,6 +345,16 @@ inline size_t global_state_size(llama_context *ctx) {
   return size;
 }
 
+/**
+ * @brief Save global state to buffer
+ *
+ * Serializes the entire context's state into the provided buffer.
+ *
+ * @param ctx Llama context (must not be null)
+ * @param dst Destination buffer (must not be null)
+ * @param size Buffer size in bytes
+ * @return Bytes written, or 0 on failure
+ */
 inline size_t global_state_save(llama_context *ctx, uint8_t *dst, size_t size) {
   if (!ctx || !dst || size == 0) {
     LLOYAL_LOG_DEBUG("[kv::global_state_save] ERROR: invalid parameters");
@@ -284,6 +367,16 @@ inline size_t global_state_save(llama_context *ctx, uint8_t *dst, size_t size) {
   return written;
 }
 
+/**
+ * @brief Restore global state from buffer
+ *
+ * Deserializes and restores the entire context's state from buffer.
+ *
+ * @param ctx Llama context (must not be null)
+ * @param src Source buffer (must not be null)
+ * @param size Buffer size in bytes
+ * @return Bytes read, or 0 on failure
+ */
 inline size_t global_state_load(llama_context *ctx, const uint8_t *src,
                                 size_t size) {
   if (!ctx || !src || size == 0) {
@@ -299,6 +392,16 @@ inline size_t global_state_load(llama_context *ctx, const uint8_t *src,
 
 // ===== DIAGNOSTICS =====
 
+/**
+ * @brief Log KV cache build info and current state
+ *
+ * Outputs debug information about the KV cache configuration and current state.
+ * Useful for debugging and understanding cache behavior.
+ *
+ * @param ctx Llama context (can be null; limits output if null)
+ *
+ * @note Only produces output when DEBUG logging is enabled
+ */
 inline void log_build_info(llama_context *ctx) {
   LLOYAL_LOG_DEBUG(
       "[kv::build_info] ============================================");
@@ -336,31 +439,23 @@ inline void log_build_info(llama_context *ctx) {
       "[kv::build_info] ============================================");
 }
 
-// ===== CACHE CLEARING (PHASE 3) =====
+// ===== CACHE CLEARING =====
 
 /**
- * Clear all KV cache (complete reset)
+ * @brief Clear all KV cache (complete reset)
  *
- * Wrapper around llama_memory_clear() with:
- * - Null checking
- * - Error logging
- * - Clears both metadata and data buffers
+ * Clears both metadata and data buffers for a complete cache reset.
+ * Use when starting a new conversation or session.
  *
- * @param ctx Llama context (must be initialized)
- * @throws std::runtime_error if ctx is NULL
+ * @param ctx Llama context (must not be null)
+ * @throws std::runtime_error if ctx is null
  *
- * USAGE:
- *   lloyal::kv::clear_all(ctx);  // Fresh start for new conversation
+ * @note Uses llama_memory_clear(mem, true) which:
+ *       - Clears metadata (cell positions, sequence heads)
+ *       - Zeroes K/V tensor data buffers
+ *       - Complete reset (slower than clear_metadata())
  *
- * IMPLEMENTATION NOTE:
- * Uses llama_memory_clear(mem, true) which:
- * - Clears metadata (cell positions, sequence heads)
- * - Zeroes K/V tensor data buffers
- * - Full reset for new conversation
- *
- * Compare with clear_metadata():
- * - clear_metadata() clears only metadata (keeps allocations, faster)
- * - clear_all() clears both metadata and data (complete reset)
+ * @see clear_metadata() for faster metadata-only clearing
  */
 inline void clear_all(llama_context *ctx) {
   if (!ctx) {
@@ -374,21 +469,18 @@ inline void clear_all(llama_context *ctx) {
 }
 
 /**
- * Clear KV cache metadata only (fast reset)
+ * @brief Clear KV cache metadata only (fast reset)
  *
  * Clears logical structure but keeps buffer allocations.
- * Faster than clear_all() for StreamingLLM pattern.
+ * Faster than clear_all() for compression patterns.
  *
- * @param ctx Llama context (must be initialized)
- * @throws std::runtime_error if ctx is NULL
+ * @param ctx Llama context (must not be null)
+ * @throws std::runtime_error if ctx is null
  *
- * USAGE:
- *   lloyal::kv::clear_metadata(ctx);  // Fast reset for reseed
+ * @note Performance: Faster than clear_all() (no buffer zeroing)
+ *       Use when immediately re-decoding; buffer reuse reduces overhead
  *
- * PERFORMANCE:
- * - Faster than clear_all() (no buffer zeroing)
- * - Use for StreamingLLM when immediately re-decoding
- * - Buffer reuse reduces allocation overhead
+ * @see clear_all() for complete reset including data buffers
  */
 inline void clear_metadata(llama_context *ctx) {
   if (!ctx) {
@@ -401,64 +493,53 @@ inline void clear_metadata(llama_context *ctx) {
   LLOYAL_LOG_DEBUG("[kv::clear_metadata] KV cache metadata cleared");
 }
 
-// ===== STREAMINGLLM SUPPORT (PHASE 3) =====
+// ===== CONTEXT COMPRESSION =====
 
 /**
- * StreamingLLM state for managing original sinks across reseeds
+ * @brief State for managing cache reconstruction
  *
- * StreamingLLM pattern requires ALWAYS reusing the ORIGINAL first 4 tokens
- * from conversation start as "attention sinks". This struct helps track them.
+ * Helper struct for tracking tokens across cache reconstruction operations.
+ * Pattern requires reusing ORIGINAL anchor tokens from sequence start.
  *
- * NOTE: This is provided for convenience. Callers can also track original
- * sinks themselves and pass directly to clear_and_reseed().
+ * @note This is optional; callers can track tokens themselves and pass directly
+ *       to clear_and_reseed()
  */
 struct StreamingLlmState {
-  std::vector<llama_token> original_sinks;  // First N tokens from conversation start
-  size_t tail_size;                          // Number of recent tokens to keep (usually 252)
+  std::vector<llama_token> original_sinks;  ///< First N tokens from sequence start
+  size_t tail_size;                          ///< Number of recent tokens to keep
 };
 
 /**
- * Clear KV cache and re-decode sinks + tail (StreamingLLM pattern)
+ * @brief Clear KV cache and reconstruct with anchor + tail tokens
  *
- * Implements the "CLEAR" strategy validated in integration tests:
- * 1. Clear entire KV cache using llama_memory_clear()
- * 2. Re-decode original_sinks (first N tokens) at position 0
- * 3. Re-decode tail (last M tokens) at position sinks.size()
+ * Reconstructs KV cache with contiguous positions by:
+ * 1. Clearing entire KV cache
+ * 2. Re-decoding original_sinks (anchor tokens) at position 0
+ * 3. Re-decoding tail (recent tokens) at position sinks.size()
  *
- * This is SIMPLER and MORE RELIABLE than selective removal (llama_memory_seq_rm)
- * which has known bugs with position handling in some llama.cpp versions.
+ * This maintains contiguous positions [0,1,2,...] which is simpler and more
+ * reliable than selective removal with position gaps.
  *
- * ⚠️  CRITICAL: original_sinks MUST be the FIRST tokens from conversation start!
- *
- * StreamingLLM relies on attention sinks at fixed positions. Using different
- * "first 4" tokens after each reseed will violate the learned positional bias
- * and destroy perplexity preservation.
- *
- * CORRECT usage:
- *   // First time: Capture original sinks
- *   std::vector<llama_token> ORIGINAL_SINKS(conversation.begin(), conversation.begin() + 4);
- *   // Store ORIGINAL_SINKS for entire session
- *
- *   // Each reseed: Reuse SAME original sinks
- *   auto tail = std::vector<llama_token>(conversation.end() - 252, conversation.end());
- *   kv::clear_and_reseed(ctx, ORIGINAL_SINKS, tail, n_batch);
- *
- * WRONG usage:
- *   auto current_window = get_current_tokens();
- *   auto sinks = std::vector<llama_token>(current_window.begin(), current_window.begin() + 4);
- *   kv::clear_and_reseed(ctx, sinks, tail, n_batch);  // ❌ NOT original! Will degrade!
- *
- * @param ctx Llama context (must be initialized)
- * @param original_sinks MUST be first N tokens from conversation start (typically 4)
- * @param tail Recent M tokens to preserve (typically 252, total 256 with sinks)
+ * @param ctx Llama context (must not be null)
+ * @param original_sinks Anchor tokens from sequence start (typically 4)
+ * @param tail Recent tokens to preserve (typically 252, total 256 with sinks)
  * @param n_batch Batch size for re-decoding chunks
  * @throws std::runtime_error if parameters are invalid or re-decode fails
  *
- * Empirical validation: Preserves perplexity within 10% (StreamingLLM paper: 3.7%)
- * See tests/integration/clear_and_reseed_validation.cpp for full validation.
+ * @warning CRITICAL: original_sinks MUST be the ORIGINAL first N tokens from
+ *          sequence start. Reusing different "first N" tokens on each reseed
+ *          will degrade quality for attention-sink patterns.
  *
- * IMPORTANT: After calling, KV cache position = sinks.size() + tail.size()
- * Continue generation with n_past = static_cast<int32_t>(sinks.size() + tail.size())
+ * @note After calling, KV cache position = sinks.size() + tail.size()
+ *       Continue generation with n_past = static_cast<int32_t>(sinks.size() + tail.size())
+ *
+ * @example
+ *   // Capture original anchor tokens once
+ *   std::vector<llama_token> SINKS(tokens.begin(), tokens.begin() + 4);
+ *
+ *   // Each compression: reuse SAME anchors with current tail
+ *   auto tail = std::vector<llama_token>(tokens.end() - 252, tokens.end());
+ *   kv::clear_and_reseed(ctx, SINKS, tail, n_batch);
  */
 inline void clear_and_reseed(llama_context *ctx,
                              const std::vector<llama_token> &original_sinks,
@@ -522,35 +603,38 @@ inline void clear_and_reseed(llama_context *ctx,
   LLOYAL_LOG_DEBUG("[kv::clear_and_reseed] Reseed complete");
 }
 
-// ===== FILE PERSISTENCE OPERATIONS =====
+// ===== FILE PERSISTENCE =====
 
 /**
- * FileData structure returned by read_file
- * Contains tokens and metadata from file
+ * @brief Data structure returned by read_file
+ *
+ * Contains tokens and metadata restored from KV cache file.
  */
 struct FileData {
-  std::vector<llama_token> tokens; // Tokens restored from file
-  size_t bytes_read;               // Total bytes read from file
+  std::vector<llama_token> tokens; ///< Tokens restored from file
+  size_t bytes_read;               ///< Total bytes read from file
 };
 
 /**
- * Write KV state to file with self-describing format
+ * @brief Write KV state to file with self-describing format
  *
- * File format (llama.cpp standard):
+ * Serializes KV cache state to file using llama.cpp's standard format:
  * - Magic + Version (validation)
  * - Token count + Token array
  * - KV state data (cache + logits + embeddings)
  *
- * @param ctx llama context
- * @param seq sequence ID (use 0 for single-sequence mode)
- * @param filepath Destination file path
+ * @param ctx Llama context (must not be null)
+ * @param seq Sequence ID (use 0 for single-sequence mode)
+ * @param filepath Destination file path (must not be empty)
  * @param tokens Token IDs to include in file
- * @return bytes written, or 0 on failure
+ * @return Bytes written, or 0 on failure
  *
- * Use cases:
- * - Exit/resume app: kv::write_file(ctx, 0, "app_state.llama", tokens)
- * - Persistent pages: kv::write_file(ctx, 0, "fork_42.llama", fork_tokens)
- * - Context sharing: Write → upload to S3 → share signed URL
+ * @note Use cases:
+ *       - Exit/resume: Save app state across restarts
+ *       - Persistent sessions: Multiple save points per conversation
+ *       - Context sharing: Serialize → upload → share
+ *
+ * @warning Skips write if KV cache is empty (returns 0)
  */
 inline size_t write_file(llama_context *ctx, llama_seq_id seq,
                          const std::string &filepath,
@@ -592,23 +676,24 @@ inline size_t write_file(llama_context *ctx, llama_seq_id seq,
 }
 
 /**
- * Read KV state from file
+ * @brief Read KV state from file
  *
- * Validates magic + version automatically.
- * Returns structured data (no output parameters).
+ * Deserializes KV cache state from file and restores it to the sequence.
+ * Validates magic + version automatically. Returns structured data with
+ * restored tokens and metadata.
  *
- * @param ctx llama context
- * @param seq sequence ID (use 0 for single-sequence mode)
- * @param filepath Source file path
+ * @param ctx Llama context (must not be null)
+ * @param seq Sequence ID (use 0 for single-sequence mode)
+ * @param filepath Source file path (must not be empty)
  * @return FileData with tokens and bytes_read
  * @throws std::runtime_error if validation fails or file doesn't exist
  *
- * Example usage:
- * ```cpp
- * auto data = lloyal::kv::read_file(ctx, 0, "app_state.llama");
- * // Use data.tokens for reconstruction/validation
- * // KV cache is automatically restored
- * ```
+ * @note KV cache is automatically restored during load
+ *       Use data.tokens for reconstruction/validation
+ *
+ * @example
+ *   auto data = lloyal::kv::read_file(ctx, 0, "app_state.llama");
+ *   // KV cache restored, tokens available in data.tokens
  */
 inline FileData read_file(llama_context *ctx, llama_seq_id seq,
                           const std::string &filepath) {

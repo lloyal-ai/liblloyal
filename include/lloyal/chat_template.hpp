@@ -1,5 +1,8 @@
 #pragma once
 
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Lloyal Labs
+
 #include "common.hpp"
 #include "helpers.hpp"
 #include <llama/llama.h>
@@ -8,24 +11,23 @@
 #include <vector>
 
 /**
- * Chat Template Orchestration Layer (Header-Only)
+ * @file chat_template.hpp
+ * @brief Chat Template Formatting
  *
- * Purpose: Wraps helpers.hpp chat template functions with fallback error
- * handling. NOT just re-exports - adds orchestration and fallback logic.
+ * Orchestrates chat template processing with fallback error handling.
+ * Wraps helpers.hpp functions and adds graceful degradation when template
+ * processing fails.
  *
  * Architecture:
- * - Uses public functions from helpers.hpp (format_chat_template_complete,
- * validate_chat_template_helper)
- * - Adds fallback to simple "role: content" format when template processing
- * fails
- * - Provides clean API for chat template formatting
+ * - Uses format_chat_template_complete() and validate_chat_template_helper() from helpers.hpp
+ * - Adds fallback to simple "role: content" format on errors
+ * - Provides clean FormatResult API for template formatting + stop token extraction
  */
 
 namespace lloyal::chat_template {
 
 /**
  * Result from chat template formatting
- * SOURCE: ChatTemplate.h:24-28
  * NOTE: Named FormatResult, NOT ChatTemplateResult
  */
 struct FormatResult {
@@ -35,7 +37,6 @@ struct FormatResult {
 
 /**
  * Format chat messages using model's chat template with fallback
- * SOURCE: ChatTemplate.h:51-55
  *
  * Orchestration logic:
  * 1. Calls format_chat_template_complete() from helpers.hpp
@@ -119,7 +120,6 @@ inline FormatResult format(const llama_model *model,
 
 /**
  * Validate chat template syntax
- * SOURCE: ChatTemplate.h:68
  *
  * Calls validate_chat_template_helper() from helpers.hpp.
  * Does NOT require a model (syntax-only validation).

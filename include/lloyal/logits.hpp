@@ -1,4 +1,8 @@
 #pragma once
+
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Lloyal Labs
+
 /**
  * @file logits.hpp
  * @brief Zero-copy logits access with clear lifetime semantics

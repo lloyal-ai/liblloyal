@@ -1,11 +1,14 @@
 #pragma once
 
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Lloyal Labs
+
 /**
  * liblloyal - Common definitions and logging
  *
  * Header-only library for llama.cpp-bound LLM operations
  * Version: 1.0.0 (bound to llama.cpp b6870)
- * License: MIT
+ * License: Apache-2.0
  */
 
 // ===== PLATFORM-NATIVE LOGGING =====

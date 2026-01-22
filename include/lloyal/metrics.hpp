@@ -1,5 +1,8 @@
 #pragma once
 
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Lloyal Labs
+
 /**
  * @file metrics.hpp
  * @brief Distribution Metrics for Test-Time Alignment

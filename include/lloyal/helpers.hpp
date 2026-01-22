@@ -1,5 +1,8 @@
 #pragma once
 
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Lloyal Labs
+
 #include "common.hpp"
 #include "minja/chat-template.hpp"
 #include "minja/minja.hpp"
@@ -14,8 +17,17 @@
 #include <vector>
 
 /**
- * Helper utilities vendored from llama.cpp/common/
- * MIT License - Copyright (c) 2023-2024 The ggml.ai team
+ * @file helpers.hpp
+ * @brief Helper Utilities
+ *
+ * Collection of utility functions for common llama.cpp operations:
+ * - Batch operations: Build and manage token batches for decoding
+ * - Chat template processing: Format messages, extract stop tokens, validate templates
+ * - Parameter conversion: KV cache type mapping, string validation helpers
+ * - String utilities: Repeat, join, split operations
+ *
+ * Source: Vendored from llama.cpp/common/
+ * License: MIT License - Copyright (c) 2023-2024 The ggml.ai team
  */
 
 // Forward declarations for detail namespace (defined at end of file)
@@ -39,10 +51,36 @@ using json = nlohmann::ordered_json;
 
 // ===== BATCH UTILITIES =====
 
-// Clear batch to empty state (reset n_tokens)
+/**
+ * @brief Clear batch to empty state
+ *
+ * Resets the batch token counter to prepare for new tokens.
+ * Does not deallocate buffer memory.
+ *
+ * @param batch Batch to clear (modified in place)
+ *
+ * @note Only resets n_tokens counter, buffer capacity remains unchanged
+ */
 inline void batch_clear(llama_batch &batch) { batch.n_tokens = 0; }
 
-// Add single token to batch with position and sequence info
+/**
+ * @brief Add single token to batch with position and sequence info
+ *
+ * Appends a token to the batch at the current n_tokens position, then increments
+ * the counter. Assigns position embedding, sequence IDs, and logits flag.
+ *
+ * @param batch Batch to modify (appends token at batch.n_tokens)
+ * @param id Token ID to add
+ * @param pos Position embedding for this token (e.g., 0, 1, 2...)
+ * @param seq_ids Sequence IDs this token belongs to (usually single-element vector {0})
+ * @param logits Whether to compute logits for this token
+ * @param capacity Optional capacity check for DEBUG builds (default: -1 disables check)
+ *
+ * @warning Caller must ensure batch has sufficient capacity (n_tokens < n_max)
+ *          to avoid buffer overflow. No runtime bounds checking in release builds.
+ *
+ * @note DEBUG builds enable capacity assertion if capacity > 0
+ */
 inline void batch_add(llama_batch &batch, llama_token id, int32_t pos,
                       const std::vector<llama_seq_id> &seq_ids, bool logits,
                       int32_t capacity = -1) {
@@ -66,12 +104,38 @@ inline void batch_add(llama_batch &batch, llama_token id, int32_t pos,
 
 // ===== CHAT TEMPLATE TYPES (PUBLIC API) =====
 
+/**
+ * @brief Result from complete chat template processing
+ *
+ * Contains formatted prompt and dynamically detected stop tokens specific
+ * to the model's chat template (ChatML, Llama-3, etc.).
+ */
 struct ChatTemplateResult {
-  std::string prompt;
-  std::vector<std::string> additional_stops;
+  std::string prompt;                      ///< Formatted chat prompt ready for tokenization
+  std::vector<std::string> additional_stops; ///< Template-specific stop tokens (e.g., "<|im_end|>", "<|eot_id|>")
 };
 
-// Format chat messages using model's built-in template
+/**
+ * @brief Format chat messages using model's built-in template
+ *
+ * Applies chat template (Jinja2) to format message array into a single prompt string.
+ * Automatically queries model metadata for BOS/EOS tokens and add_bos/add_eos flags.
+ *
+ * Template selection hierarchy:
+ * 1. template_override (if provided)
+ * 2. model's embedded template (from GGUF metadata)
+ * 3. ChatML fallback (default)
+ *
+ * @param model Llama model (can be null, will use ChatML fallback)
+ * @param messages_json JSON array of messages: [{"role":"user","content":"..."},...]
+ * @param template_override Optional Jinja2 template string (default: empty, uses model template)
+ * @return Formatted prompt string ready for tokenization
+ *
+ * @throws std::exception if JSON parsing fails (caught internally, returns empty string)
+ *
+ * @note Strips BOS/EOS wrapper tokens if model metadata indicates they're added during tokenization
+ *       to prevent double-token issues
+ */
 inline std::string
 format_chat_template_from_model(const llama_model *model,
                                 const std::string &messages_json,
@@ -117,7 +181,25 @@ format_chat_template_from_model(const llama_model *model,
   }
 }
 
-// Dynamic stop token detection
+/**
+ * @brief Dynamically detect stop tokens from chat template
+ *
+ * Analyzes template string to identify template-specific stop tokens and verifies
+ * they exist in the model's vocabulary. Prevents generating invalid tokens that
+ * would cause tokenization failures.
+ *
+ * Supported patterns:
+ * - ChatML: <|im_end|>, <|endoftext|> (when template contains "im_start")
+ * - Llama-3: <|eom_id|>, <|eot_id|> (when template contains "eom_id" or "eot_id")
+ * - Fallback: Model's EOT token from vocabulary
+ *
+ * @param model Llama model (can be null, returns empty vector)
+ * @param template_str Jinja2 template string to analyze
+ * @return Vector of stop token strings that exist in model vocabulary
+ *
+ * @note Only returns tokens that successfully tokenize to single token IDs.
+ *       Prevents returning strings that would split into multiple tokens.
+ */
 inline std::vector<std::string>
 extract_template_stop_tokens(const llama_model *model,
                              const std::string &template_str) {
@@ -180,7 +262,22 @@ extract_template_stop_tokens(const llama_model *model,
   return stops;
 }
 
-// Complete chat template processing
+/**
+ * @brief Complete chat template processing with stop token detection
+ *
+ * Combines format_chat_template_from_model() and extract_template_stop_tokens()
+ * into a single call for convenience. Returns both formatted prompt and detected
+ * stop tokens.
+ *
+ * @param model Llama model (can be null, will use ChatML fallback)
+ * @param messages_json JSON array of messages: [{"role":"user","content":"..."},...]
+ * @param template_override Optional Jinja2 template string (default: empty, uses model template)
+ * @return ChatTemplateResult with formatted prompt and additional_stops vector
+ *
+ * @note Equivalent to calling format_chat_template_from_model() followed by
+ *       extract_template_stop_tokens(), but more efficient as it only queries
+ *       model metadata once.
+ */
 inline ChatTemplateResult
 format_chat_template_complete(const llama_model *model,
                               const std::string &messages_json,
@@ -230,7 +327,17 @@ format_chat_template_complete(const llama_model *model,
   return result;
 }
 
-// Validate chat template syntax
+/**
+ * @brief Validate chat template syntax
+ *
+ * Attempts to parse Jinja2 template string using minja engine to check for
+ * syntax errors before usage.
+ *
+ * @param template_str Jinja2 template string to validate
+ * @return True if template syntax is valid, false if parsing failed
+ *
+ * @note Uses empty BOS/EOS tokens for validation - only checks syntax, not semantics
+ */
 inline bool validate_chat_template_helper(const std::string &template_str) {
   try {
     minja::chat_template tmpl(template_str, "", "");
@@ -242,7 +349,17 @@ inline bool validate_chat_template_helper(const std::string &template_str) {
 
 // ===== PARAMETER CONVERSION HELPERS =====
 
-// Get supported KV cache types
+/**
+ * @brief Get list of supported KV cache types
+ *
+ * Returns static vector of ggml_type enums representing supported quantization
+ * formats for KV cache. Includes full-precision (F32, F16, BF16) and quantized
+ * formats (Q8_0, Q4_0, Q4_1, IQ4_NL, Q5_0, Q5_1).
+ *
+ * @return Reference to static vector of supported cache types
+ *
+ * @note Returns const reference to avoid allocation on each call
+ */
 inline const std::vector<ggml_type> &get_kv_cache_types() {
   static const std::vector<ggml_type> types = {
       GGML_TYPE_F32,    GGML_TYPE_F16,  GGML_TYPE_BF16,
@@ -252,7 +369,16 @@ inline const std::vector<ggml_type> &get_kv_cache_types() {
   return types;
 }
 
-// Convert cache type string to ggml_type enum
+/**
+ * @brief Convert cache type string to ggml_type enum
+ *
+ * Maps type name string (e.g., "f16", "q4_0") to corresponding ggml_type enum.
+ * Used for parsing user-provided cache type configuration.
+ *
+ * @param s Type name string (e.g., "f16", "q4_0", "q8_0")
+ * @return Matching ggml_type enum value
+ * @throws std::runtime_error if type name is not in supported types list
+ */
 inline ggml_type kv_cache_type_from_str(const std::string &s) {
   const auto &kv_cache_types = get_kv_cache_types();
   for (const auto &type : kv_cache_types) {
@@ -263,16 +389,33 @@ inline ggml_type kv_cache_type_from_str(const std::string &s) {
   throw std::runtime_error("Unsupported cache type: " + s);
 }
 
-// String validation helpers
+/**
+ * @brief Check if string represents a truthy value
+ *
+ * @param value String to check
+ * @return True if value is "on", "enabled", "1", or "true"
+ */
 inline bool is_truthy(const std::string &value) {
   return value == "on" || value == "enabled" || value == "1" || value == "true";
 }
 
+/**
+ * @brief Check if string represents a falsey value
+ *
+ * @param value String to check
+ * @return True if value is "off", "disabled", "0", or "false"
+ */
 inline bool is_falsey(const std::string &value) {
   return value == "off" || value == "disabled" || value == "0" ||
          value == "false";
 }
 
+/**
+ * @brief Check if string represents an auto value
+ *
+ * @param value String to check
+ * @return True if value is "auto" or "-1"
+ */
 inline bool is_autoy(const std::string &value) {
   return value == "auto" || value == "-1";
 }

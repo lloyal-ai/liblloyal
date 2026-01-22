@@ -1,5 +1,8 @@
 #pragma once
 
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Lloyal Labs
+
 #include "common.hpp"
 #include "logits.hpp"
 #include "tokenizer.hpp"
@@ -12,14 +15,16 @@
 #include <vector>
 
 /**
- * Sampler Anti-Corruption Layer (Header-Only)
+ * @file sampler.hpp
+ * @brief Token Sampling Operations
  *
- * Purpose: Single point of contact with llama.cpp sampling APIs to isolate
- * sampling strategy complexity and enable future extensions.
+ * Wraps llama.cpp sampling APIs with configurable sampling strategies.
+ * Uses C++20 concepts for generic parameter handling.
  *
- * Uses C++20 concept-constrained templates to accept any shell's
- * Nitrogen-generated SamplingParams type without requiring struct duplication
- * or adapters.
+ * Architecture:
+ * - Concept-constrained templates accept any Nitrogen-generated SamplingParams type
+ * - No struct duplication or adapters required
+ * - Supports greedy, temperature, top-k, top-p, min-p, grammar-constrained sampling
  */
 
 namespace lloyal::detail {
@@ -59,10 +64,8 @@ namespace lloyal {
 /**
  * C++20 concept: Any type with sampling parameter fields
  *
- * Allows template to accept any shell's Nitrogen-generated SamplingParams:
- * - margelo::nitro::calibratendk::SamplingParams
- * - margelo::nitro::nitrollama::SamplingParams
- * - Or any other conforming type
+ * Allows template to accept any binding's generated SamplingParams type
+ * without coupling to specific implementations.
  *
  * Fields can be either T or std::optional<T>
  */
@@ -169,10 +172,8 @@ inline llama_token greedy(llama_context *ctx, const llama_vocab *vocab) {
  * @throws std::runtime_error if sampling fails
  *
  * TEMPLATE INSTANTIATION:
- * - calibrate-ndk: instantiates for
- * margelo::nitro::calibratendk::SamplingParams
- * - nitro-llama: instantiates for margelo::nitro::nitrollama::SamplingParams
- * - No adapters needed, works via duck typing + concept constraint
+ * Works with any SamplingParams type matching the concept constraint.
+ * No adapters needed - uses duck typing + C++20 concepts.
  */
 template <SamplingParamsLike P>
 inline llama_token sample_with_params(llama_context *ctx,
