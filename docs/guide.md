@@ -46,49 +46,65 @@ git submodule update --init --recursive
 
 ### CMake Integration
 
-**Method 1: Override llama.cpp path (recommended for CI/standalone)**
+#### Recommended: Using `add_subdirectory()` (v1.0.1+)
+
+When you include llama.cpp and liblloyal via `add_subdirectory()`, liblloyal automatically sets up the required include paths. No manual configuration needed.
 
 ```cmake
-# In your CMakeLists.txt
-add_subdirectory(liblloyal/tests)
+cmake_minimum_required(VERSION 3.18)
+project(my_app)
 
-# When configuring (override default path):
+set(CMAKE_CXX_STANDARD 20)
+
+# 1. Add llama.cpp first (creates llama, ggml targets)
+add_subdirectory(vendor/llama.cpp)
+
+# 2. Add liblloyal (auto-configures include paths for llama/llama.h)
+add_subdirectory(vendor/liblloyal)
+
+# 3. Create your target and link
+add_executable(my_app main.cpp)
+target_link_libraries(my_app PRIVATE liblloyal::liblloyal)
+```
+
+**What happens automatically:**
+- liblloyal detects the `llama` target and links to it
+- Creates `llama/llama.h` and `llama/ggml.h` symlinks in the build directory
+- Exports include paths via `liblloyal::liblloyal` target
+
+**Your code can use:**
+```cpp
+#include <lloyal/tokenizer.hpp>   // liblloyal headers
+#include <llama/llama.h>          // llama.cpp headers (auto-resolved)
+```
+
+#### For Tests: Override llama.cpp Path
+
+When running liblloyal tests with a custom llama.cpp location:
+
+```bash
 cmake -B build \
   -DLLOYAL_BUILD_INTEGRATION_TESTS=ON \
   -DLLAMA_CPP_DIR=/path/to/your/llama.cpp
 ```
 
-**Method 2: Use default path structure**
+#### Legacy: Manual Include Path Setup
 
-If your project follows this structure:
-```
-your-project/
-├── liblloyal/           # This library
-└── vendor/llama.cpp/    # Your llama.cpp checkout
-```
-
-Then CMake will automatically find llama.cpp:
-```cmake
-# CMake finds vendor/llama.cpp automatically
-add_subdirectory(liblloyal/tests)
-```
-
-**How it works:**
-- **Default**: CMake looks for `../../vendor/llama.cpp` (relative to liblloyal)
-- **Override**: Use `-DLLAMA_CPP_DIR=<path>` to specify custom location
-- **Build detection**: Automatically checks for `build-apple/`, `build-linux/`, `build-windows/`, or `build/`
-
-See `/Users/zuhairnaqvi/dev/apps/nitro-llama/packages/liblloyal-node/liblloyal/tests/CMakeLists.txt` lines 106-130 for full implementation.
-
-### Link Against liblloyal
+For consumers **not** using `add_subdirectory()` (e.g., pre-built llama.cpp), you'll need to set up include paths manually:
 
 ```cmake
 # Include headers
-target_include_directories(your_target PRIVATE liblloyal/include)
+target_include_directories(your_target PRIVATE 
+    liblloyal/include
+    llama.cpp/include       # For llama.h
+    llama.cpp/ggml/include  # For ggml.h
+)
 
 # Link llama.cpp
 target_link_libraries(your_target PRIVATE llama)
 ```
+
+**Note:** liblloyal headers use `#include <llama/llama.h>` (with `llama/` prefix). If your llama.cpp has flat includes, you may need to create a wrapper directory structure.
 
 ### CocoaPods (iOS)
 
