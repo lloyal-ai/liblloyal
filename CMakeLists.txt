@@ -57,6 +57,89 @@ else()
 endif()
 
 # =============================================================================
+# Include Path Setup for Consumers
+# =============================================================================
+# liblloyal headers use #include <llama/llama.h> but llama.cpp provides
+# include/llama.h (flat structure). Create symlinks at configure time so
+# consumers see the expected structure without manual setup.
+#
+# This runs once during CMake configure and creates build-time symlinks.
+# Consumers get ${CMAKE_CURRENT_BINARY_DIR}/include in their include path,
+# which contains llama/llama.h and llama/ggml.h pointing to actual headers.
+
+if(TARGET llama)
+    # Get llama.cpp include directory from llama target
+    get_target_property(LLAMA_INCLUDE_DIRS llama INTERFACE_INCLUDE_DIRECTORIES)
+
+    foreach(dir ${LLAMA_INCLUDE_DIRS})
+        if(EXISTS "${dir}/llama.h")
+            set(LLAMA_CPP_INCLUDE_DIR "${dir}")
+            break()
+        endif()
+    endforeach()
+
+    # Get ggml include directory from ggml or ggml-base target (if exists)
+    # Also check relative to llama.cpp source dir as fallback
+    if(TARGET ggml)
+        get_target_property(GGML_INCLUDE_DIRS ggml INTERFACE_INCLUDE_DIRECTORIES)
+        foreach(dir ${GGML_INCLUDE_DIRS})
+            if(EXISTS "${dir}/ggml.h")
+                set(GGML_INCLUDE_DIR "${dir}")
+                break()
+            endif()
+        endforeach()
+    endif()
+    
+    if(NOT GGML_INCLUDE_DIR AND TARGET ggml-base)
+        get_target_property(GGML_INCLUDE_DIRS ggml-base INTERFACE_INCLUDE_DIRECTORIES)
+        foreach(dir ${GGML_INCLUDE_DIRS})
+            if(EXISTS "${dir}/ggml.h")
+                set(GGML_INCLUDE_DIR "${dir}")
+                break()
+            endif()
+        endforeach()
+    endif()
+    
+    # Fallback: look relative to llama.cpp include dir (ggml is sibling)
+    if(NOT GGML_INCLUDE_DIR AND LLAMA_CPP_INCLUDE_DIR)
+        # llama.h is in llama.cpp/include, ggml.h is in llama.cpp/ggml/include
+        get_filename_component(LLAMA_CPP_ROOT "${LLAMA_CPP_INCLUDE_DIR}" DIRECTORY)
+        set(GGML_FALLBACK_DIR "${LLAMA_CPP_ROOT}/ggml/include")
+        if(EXISTS "${GGML_FALLBACK_DIR}/ggml.h")
+            set(GGML_INCLUDE_DIR "${GGML_FALLBACK_DIR}")
+        endif()
+    endif()
+
+    # Create llama/ subdirectory with symlinks at configure time
+    if(LLAMA_CPP_INCLUDE_DIR)
+        file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/include/llama)
+
+        execute_process(
+            COMMAND ${CMAKE_COMMAND} -E create_symlink
+                ${LLAMA_CPP_INCLUDE_DIR}/llama.h
+                ${CMAKE_CURRENT_BINARY_DIR}/include/llama/llama.h
+        )
+
+        if(GGML_INCLUDE_DIR)
+            execute_process(
+                COMMAND ${CMAKE_COMMAND} -E create_symlink
+                    ${GGML_INCLUDE_DIR}/ggml.h
+                    ${CMAKE_CURRENT_BINARY_DIR}/include/llama/ggml.h
+            )
+        endif()
+
+        # Export this directory to consumers
+        target_include_directories(liblloyal INTERFACE
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
+        )
+
+        message(STATUS "liblloyal: Created llama/ include structure at ${CMAKE_CURRENT_BINARY_DIR}/include/llama")
+    else()
+        message(WARNING "liblloyal: Could not find llama.cpp include directory. Consumers may need manual include path setup.")
+    endif()
+endif()
+
+# =============================================================================
 # Version Check for llama.cpp
 # =============================================================================
 
@@ -85,45 +168,49 @@ target_compile_features(liblloyal INTERFACE cxx_std_20)
 # =============================================================================
 # Installation (Optional - for package managers)
 # =============================================================================
+# Only configure install rules when liblloyal is the top-level project.
+# When used via add_subdirectory(), the parent project handles installation.
 
-include(GNUInstallDirs)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    include(GNUInstallDirs)
 
-install(TARGETS liblloyal
-    EXPORT liblloyal-targets
-    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-)
+    install(TARGETS liblloyal
+        EXPORT liblloyal-targets
+        INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    )
 
-install(DIRECTORY include/lloyal
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-    FILES_MATCHING PATTERN "*.hpp"
-)
+    install(DIRECTORY include/lloyal
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+        FILES_MATCHING PATTERN "*.hpp"
+    )
 
-install(EXPORT liblloyal-targets
-    FILE liblloyal-targets.cmake
-    NAMESPACE liblloyal::
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/liblloyal
-)
+    install(EXPORT liblloyal-targets
+        FILE liblloyal-targets.cmake
+        NAMESPACE liblloyal::
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/liblloyal
+    )
 
-# Generate and install package config files
-include(CMakePackageConfigHelpers)
+    # Generate and install package config files
+    include(CMakePackageConfigHelpers)
 
-configure_package_config_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/liblloyal-config.cmake.in
-    ${CMAKE_CURRENT_BINARY_DIR}/liblloyal-config.cmake
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/liblloyal
-)
+    configure_package_config_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/liblloyal-config.cmake.in
+        ${CMAKE_CURRENT_BINARY_DIR}/liblloyal-config.cmake
+        INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/liblloyal
+    )
 
-write_basic_package_version_file(
-    ${CMAKE_CURRENT_BINARY_DIR}/liblloyal-config-version.cmake
-    VERSION ${PROJECT_VERSION}
-    COMPATIBILITY SameMajorVersion
-)
+    write_basic_package_version_file(
+        ${CMAKE_CURRENT_BINARY_DIR}/liblloyal-config-version.cmake
+        VERSION ${PROJECT_VERSION}
+        COMPATIBILITY SameMajorVersion
+    )
 
-install(FILES
-    ${CMAKE_CURRENT_BINARY_DIR}/liblloyal-config.cmake
-    ${CMAKE_CURRENT_BINARY_DIR}/liblloyal-config-version.cmake
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/liblloyal
-)
+    install(FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/liblloyal-config.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/liblloyal-config-version.cmake
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/liblloyal
+    )
+endif()
 
 # =============================================================================
 # Testing (Enable with -DLIBLLOYAL_BUILD_TESTS=ON)

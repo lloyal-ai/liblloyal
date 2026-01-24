@@ -7,8 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1-alpha] - 2025-01-25
+
 ### Added
-- Initial public release
+- **Automatic include path setup**: When using `add_subdirectory(liblloyal)` after `add_subdirectory(llama.cpp)`, liblloyal now automatically creates the `llama/llama.h` and `llama/ggml.h` include structure. Consumers no longer need manual include path workarounds.
+
+### Changed
+- **Conditional install rules**: CMake install/export rules now only run when liblloyal is the top-level project. When used via `add_subdirectory()`, install rules are skipped to avoid conflicts with parent project builds.
+
+### Migration Notes
+- **No breaking changes**. Existing consumers using manual include path setup will continue to work.
+- Consumers using `add_subdirectory()` now get automatic include path setup — no code changes required.
+
+## [1.0.0-alpha] - Initial Release
+
+### Added
 - Header-only C++ library for llama.cpp primitives
 - Core modules:
   - `tokenizer.hpp` - Tokenization/detokenization with special token handling
