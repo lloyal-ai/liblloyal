@@ -61,14 +61,15 @@ endif()
 # =============================================================================
 # liblloyal headers use #include <llama/llama.h> but llama.cpp provides
 # include/llama.h (flat structure). We create the expected namespace structure
-# in the build directory at configure time.
+# in the build directory at configure time using wrapper headers.
 #
-# Why copy instead of symlink? Cross-platform compatibility. Windows symlinks
-# require admin privileges or Developer Mode. Copying is universal and works
-# everywhere, with minimal overhead (headers are small, ~200KB total).
+# Why wrapper headers? Cross-platform compatibility without symbol conflicts.
+# - Symlinks fail on Windows (require admin/Developer Mode)
+# - Copying creates duplicate definitions when llama target exports its paths
+# - Wrapper headers forward-include, creating the namespace without duplication
 #
-# configure_file() only copies if source timestamp changed (efficient for
-# incremental builds). This runs at configure time, not on every build.
+# Template files: cmake/templates/{llama,ggml}.h.in
+# Generated at configure time via configure_file() with @ONLY
 
 if(TARGET llama)
     # Get llama.cpp include directory from llama target
@@ -113,28 +114,30 @@ if(TARGET llama)
         endif()
     endif()
 
-    # Create llama/ subdirectory and copy headers at configure time
+    # Create llama/ namespace with wrapper headers at configure time
     if(LLAMA_CPP_INCLUDE_DIR)
         set(PUBLIC_INCLUDE_DIR ${CMAKE_CURRENT_BINARY_DIR}/include/llama)
         file(MAKE_DIRECTORY ${PUBLIC_INCLUDE_DIR})
 
-        # configure_file only copies if source changed (timestamp check)
+        # Generate wrapper headers from templates
+        # These forward-include the actual headers, creating the llama/ namespace
+        # without duplicating definitions
         configure_file(
-            ${LLAMA_CPP_INCLUDE_DIR}/llama.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/cmake/templates/llama.h.in
             ${PUBLIC_INCLUDE_DIR}/llama.h
-            COPYONLY
+            @ONLY
         )
 
         if(GGML_INCLUDE_DIR)
             configure_file(
-                ${GGML_INCLUDE_DIR}/ggml.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/cmake/templates/ggml.h.in
                 ${PUBLIC_INCLUDE_DIR}/ggml.h
-                COPYONLY
+                @ONLY
             )
         endif()
 
-        # Export this directory to consumers
-        target_include_directories(liblloyal INTERFACE
+        # Export build/include BEFORE llama.cpp's paths so our wrappers are found first
+        target_include_directories(liblloyal BEFORE INTERFACE
             $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
         )
 
