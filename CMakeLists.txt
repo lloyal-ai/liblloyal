@@ -60,12 +60,15 @@ endif()
 # Include Path Setup for Consumers
 # =============================================================================
 # liblloyal headers use #include <llama/llama.h> but llama.cpp provides
-# include/llama.h (flat structure). Create symlinks at configure time so
-# consumers see the expected structure without manual setup.
+# include/llama.h (flat structure). We create the expected namespace structure
+# in the build directory at configure time.
 #
-# This runs once during CMake configure and creates build-time symlinks.
-# Consumers get ${CMAKE_CURRENT_BINARY_DIR}/include in their include path,
-# which contains llama/llama.h and llama/ggml.h pointing to actual headers.
+# Why copy instead of symlink? Cross-platform compatibility. Windows symlinks
+# require admin privileges or Developer Mode. Copying is universal and works
+# everywhere, with minimal overhead (headers are small, ~200KB total).
+#
+# configure_file() only copies if source timestamp changed (efficient for
+# incremental builds). This runs at configure time, not on every build.
 
 if(TARGET llama)
     # Get llama.cpp include directory from llama target
@@ -110,21 +113,23 @@ if(TARGET llama)
         endif()
     endif()
 
-    # Create llama/ subdirectory with symlinks at configure time
+    # Create llama/ subdirectory and copy headers at configure time
     if(LLAMA_CPP_INCLUDE_DIR)
-        file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/include/llama)
+        set(PUBLIC_INCLUDE_DIR ${CMAKE_CURRENT_BINARY_DIR}/include/llama)
+        file(MAKE_DIRECTORY ${PUBLIC_INCLUDE_DIR})
 
-        execute_process(
-            COMMAND ${CMAKE_COMMAND} -E create_symlink
-                ${LLAMA_CPP_INCLUDE_DIR}/llama.h
-                ${CMAKE_CURRENT_BINARY_DIR}/include/llama/llama.h
+        # configure_file only copies if source changed (timestamp check)
+        configure_file(
+            ${LLAMA_CPP_INCLUDE_DIR}/llama.h
+            ${PUBLIC_INCLUDE_DIR}/llama.h
+            COPYONLY
         )
 
         if(GGML_INCLUDE_DIR)
-            execute_process(
-                COMMAND ${CMAKE_COMMAND} -E create_symlink
-                    ${GGML_INCLUDE_DIR}/ggml.h
-                    ${CMAKE_CURRENT_BINARY_DIR}/include/llama/ggml.h
+            configure_file(
+                ${GGML_INCLUDE_DIR}/ggml.h
+                ${PUBLIC_INCLUDE_DIR}/ggml.h
+                COPYONLY
             )
         endif()
 
@@ -133,7 +138,7 @@ if(TARGET llama)
             $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
         )
 
-        message(STATUS "liblloyal: Created llama/ include structure at ${CMAKE_CURRENT_BINARY_DIR}/include/llama")
+        message(STATUS "liblloyal: Created llama/ include namespace at ${PUBLIC_INCLUDE_DIR}")
     else()
         message(WARNING "liblloyal: Could not find llama.cpp include directory. Consumers may need manual include path setup.")
     endif()
