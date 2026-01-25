@@ -69,7 +69,7 @@ target_link_libraries(my_app PRIVATE liblloyal::liblloyal)
 
 **What happens automatically:**
 - liblloyal detects the `llama` target and links to it
-- Copies `llama/llama.h` and `llama/ggml.h` to the build directory (cross-platform compatible)
+- Generates wrapper headers `llama/llama.h` and `llama/ggml.h` in the build directory (cross-platform compatible)
 - Exports include paths via `liblloyal::liblloyal` target
 
 **Your code can use:**
