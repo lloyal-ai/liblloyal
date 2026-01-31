@@ -6,11 +6,56 @@
 [![C++](https://img.shields.io/badge/C++-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
 [![llama.cpp](https://img.shields.io/badge/llama.cpp-b6870-green.svg)](https://github.com/ggml-org/llama.cpp/releases/tag/b6870)
 
-**Composable primitives for llama.cpp inference**
+**Branched Inference for llama.cpp**
 
 Composable C++ primitives library for llama.cpp with advanced patterns (handle-based APIs, shared model weights, multi-sequence management) enabling applications from simple streaming to complex inference orchestration.
 
-## What it provides
+## The Branch API
+
+Branch is the high-level API that composes all of liblloyal's primitives into a single forkable handle. Each branch owns a KV cache sequence, sampler chain, grammar, metrics tracker, and logits snapshot — everything needed for independent generation. Fork a branch to explore alternatives, compare by perplexity, prune losers.
+
+```cpp
+using namespace lloyal::branch;
+
+// Prefill prompt on seq 0
+lloyal::decoder::decode_tokens(ctx, prompt, prompt_len, 0);
+
+// Create root branch, capture logits from prefill
+auto root = Branch::create(ctx, model, /*seq=*/0, prompt_len, params);
+root.capture_logits();
+
+// Fork N candidates, each on its own KV sequence
+std::vector<Branch> candidates;
+for (int i = 0; i < n; i++) {
+    candidates.push_back(root.fork(/*seq=*/i + 1));
+}
+
+// Generate one token per candidate
+for (auto& c : candidates) {
+    auto tok = c.sample();
+    c.accept(tok);
+    c.decode_and_capture_one(tok);
+}
+
+// Select winner by perplexity
+auto& winner = *std::min_element(candidates.begin(), candidates.end(),
+    [](auto& a, auto& b) { return a.perplexity() < b.perplexity(); });
+
+// Commit winner's KV cache, prune losers automatically (RAII)
+auto released = winner.release_kv();
+// released.seq_id and released.position ready for continued generation
+```
+
+**What `fork()` clones:**
+- KV cache sequence (via `llama_memory_seq_cp`)
+- Sampler chain (penalties, PRNG, top-k/p filters)
+- Grammar constraints (GBNF parser state)
+- Metrics (model + sampling perplexity trackers)
+- Logits snapshot and logit bias
+
+**Use cases:** Best-of-N sampling, speculative decoding (draft/verify), MCTS/LATS tree search, beam search, grammar-constrained exploration.
+
+## Building Blocks
 
 ### Core Primitives
 
@@ -24,33 +69,28 @@ Composable C++ primitives library for llama.cpp with advanced patterns (handle-b
 
 ### Advanced Patterns
 
-**Handle-Based APIs** - Persistent, reusable objects for efficiency:
+**Branch API** - The primary handle-based API (see above). Composes all primitives into forkable sessions with RAII cleanup.
+
+**Lower-Level Handles** - Reusable sampler chains and grammar handles for fine-grained control:
 
 ```cpp
-// Create reusable sampler chain
-auto chain = lloyal::sampler::create_chain(model, params);
-lloyal::sampler::apply(chain, ctx, vocab);  // Reuse across tokens
-
-// Grammar handle for structured output
-auto grammar_handle = lloyal::grammar::init_sampler(model, schema);
+auto chain = lloyal::sampler::create_chain(params);          // Reusable sampler
+auto grammar_handle = lloyal::grammar::init_sampler(model, schema);  // Grammar state
 ```
 
 **Shared Model Weights** - Multiple contexts share same loaded model:
 
 ```cpp
-// ModelRegistry caches by (path, n_gpu_layers, use_mmap)
 auto model1 = lloyal::ModelRegistry::acquire(path, params);
 auto model2 = lloyal::ModelRegistry::acquire(path, params);  // Cache hit
 // model1 and model2 share weights, independent KV caches
 ```
 
-**Multi-Sequence Orchestration** - Independent execution paths per context:
+**Multi-Sequence Orchestration** - Branch handles this automatically via `fork()`. For fine-grained control, raw KV operations are available:
 
 ```cpp
-// Parallel hypothesis exploration
-lloyal::kv::seq_cp(ctx, 0, 1);  // Branch to seq 1
-lloyal::kv::seq_cp(ctx, 0, 2);  // Branch to seq 2
-// Each sequence maintains independent recurrent state
+lloyal::kv::seq_cp(ctx, 0, 1);      // Copy KV state to new sequence
+lloyal::kv::seq_keep(ctx, best_seq); // Keep winner, discard others
 ```
 
 ### Sequence-Aware Operations
@@ -68,7 +108,7 @@ lloyal::sampler::sample_with_params(ctx, vocab, params, /*seq=*/1);
 lloyal::kv::remove_range(ctx, seq, p0, p1);
 ```
 
-**Use case:** Speculative decoding - draft with small model on seq=0, verify with large model on seq=1, copy accepted prefix.
+**Use case:** The Branch API manages sequences automatically. These low-level operations are available for custom patterns like speculative decoding or prefix caching.
 
 ### Cloneable Metrics
 
@@ -194,14 +234,18 @@ lloyal::kv::clear_and_reseed(ctx, sinks, tail, n_batch);
 // Continue generation with bounded positions
 ```
 
-**Advanced** - Multi-sequence search with shared weights:
+**Advanced** - Multi-sequence search with Branch API:
 
 ```cpp
-// Fork exploration paths on same model (shared weights)
-lloyal::kv::seq_cp(ctx, 0, 1);
-lloyal::kv::seq_cp(ctx, 0, 2);
-// Decode alternatives in parallel, compare metrics, prune branches
-lloyal::kv::seq_keep(ctx, best_seq);  // Keep winner, discard others
+using namespace lloyal::branch;
+
+auto root = Branch::create(ctx, model, 0, prompt_len, params);
+root.capture_logits();
+
+auto child1 = root.fork(1);
+auto child2 = root.fork(2);
+// Each child has independent KV, sampler, grammar, metrics
+// Generate, compare perplexities, prune losers (automatic on scope exit)
 ```
 
 ### Pattern Examples
@@ -209,14 +253,19 @@ lloyal::kv::seq_keep(ctx, best_seq);  // Keep winner, discard others
 **Speculative decoding:**
 
 ```cpp
-// Draft on seq=0
-lloyal::decoder::decode_one(draft_ctx, draft_token, pos, 0);
+using namespace lloyal::branch;
 
-// Verify on seq=1 (copied from seq=0)
-lloyal::kv::seq_cp(verify_ctx, 0, 1);
-lloyal::decoder::decode_one(verify_ctx, draft_token, pos, 1);
+// Draft branch generates candidate tokens
+auto draft = Branch::create(draft_ctx, draft_model, 0, pos, draft_params);
+draft.decode_and_capture_one(token);
+auto draft_token = draft.sample();
+
+// Verify branch forks from shared prefix
+auto verify = Branch::create(verify_ctx, verify_model, 0, pos, verify_params);
+verify.decode_and_capture_one(draft_token);
 
 // Accept or reject based on logits comparison
+// Prune rejected branches automatically (RAII)
 ```
 
 **Model comparison:**

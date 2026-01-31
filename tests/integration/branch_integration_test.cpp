@@ -1401,7 +1401,7 @@ TEST_CASE("branch integration: slot reuse does not leak logit_bias") {
   CHECK(a_token != greedy_token);
 
   // Destroy A — slot 1 returns to freelist
-  // BUG: release() does not clear logit_bias
+  // Regression check: release() must clear logit_bias; this would fail if bias leaked
   destroy(a, &store);
 
   // --- Branch B: must NOT inherit A's logit_bias ---
@@ -1474,7 +1474,7 @@ TEST_CASE("branch integration: slot reuse does not leak steer_fn") {
   CHECK(a_token != greedy_token);
 
   // Destroy A — slot 1 returns to freelist
-  // BUG: release() does not clear steer_fn
+  // Would fail if release() did not clear steer_fn (regression guard against steer_fn leakage)
   destroy(a, &store);
 
   // --- Branch B: must NOT inherit A's steer_fn ---

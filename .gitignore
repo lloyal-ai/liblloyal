@@ -38,3 +38,4 @@ tests/fixtures/*.gguf
 
 # Generated documentation
 docs/api/html/
+docs/build/

@@ -82,6 +82,7 @@ namespace lloyal::branch {
 using BranchHandle = uint32_t;
 
 constexpr BranchHandle INVALID_HANDLE = 0;  ///< Null handle sentinel
+constexpr int DEFAULT_N_BATCH = 512;        ///< Default batch size for decode operations
 constexpr uint32_t GEN_SHIFT = 16;          ///< Bit shift for generation field
 constexpr uint32_t INDEX_MASK = 0xFFFF;     ///< Mask for slot index field
 
@@ -170,7 +171,7 @@ struct BranchState {
   /// @todo Move to per-thread or SessionContext scratch arena for deep MCTS trees.
   std::vector<llama_token_data> candidates_buffer;
 
-  int n_batch = 512;  ///< Batch size for decode operations
+  int n_batch = DEFAULT_N_BATCH;  ///< Batch size for decode operations
   int n_vocab = 0;    ///< Vocabulary size (cached for buffer pre-allocation)
 
   uint16_t generation = 0;  ///< Slot generation counter (for ABA prevention)
@@ -301,7 +302,7 @@ public:
     slot.logit_bias.clear();
     slot.steer_fn = nullptr;
     slot.candidates_buffer.clear();  // Clear contents, capacity preserved for reuse
-    slot.n_batch = 512;
+    slot.n_batch = DEFAULT_N_BATCH;
     slot.n_vocab = 0;
 
     freelist_.push_back(index);
@@ -438,7 +439,7 @@ inline BranchHandle create(
     llama_seq_id seq_id,
     llama_pos start_pos,
     const P& params,
-    int n_batch = 512,
+    int n_batch = DEFAULT_N_BATCH,
     const char* grammar_str = nullptr,
     boundaries::BoundaryTracker* boundary_tracker = nullptr,
     BranchStore* store = nullptr) {
@@ -1662,7 +1663,7 @@ public:
       llama_seq_id seq_id,
       llama_pos start_pos,
       const P& params,
-      int n_batch = 512,
+      int n_batch = DEFAULT_N_BATCH,
       const char* grammar_str = nullptr,
       boundaries::BoundaryTracker* boundary_tracker = nullptr,
       BranchStore* store = nullptr) {

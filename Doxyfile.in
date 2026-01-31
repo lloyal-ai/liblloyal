@@ -1,14 +1,15 @@
 # Doxyfile for liblloyal
 
 PROJECT_NAME           = "liblloyal"
-PROJECT_BRIEF          = "Composable primitives for llama.cpp inference"
+PROJECT_BRIEF          = "Branched Inference for llama.cpp"
 PROJECT_NUMBER         = "1.0.0"
 
 OUTPUT_DIRECTORY       = docs/api
 
-INPUT                  = include/lloyal docs/mainpage.dox
+INPUT                  = include/lloyal README.md
 RECURSIVE              = YES
-FILE_PATTERNS          = *.hpp *.h *.dox
+FILE_PATTERNS          = *.hpp *.h *.dox *.md
+USE_MDFILE_AS_MAINPAGE = README.md
 
 # Exclude third-party libraries
 EXCLUDE                = include/lloyal/nlohmann
@@ -36,10 +37,19 @@ INLINE_SOURCES         = NO
 # Generate class diagrams
 HAVE_DOT               = NO
 
-# Better navigation
+# Sidebar-only layout (doxygen-awesome-css)
 GENERATE_TREEVIEW      = YES
 DISABLE_INDEX          = NO
-FULL_SIDEBAR           = YES
+FULL_SIDEBAR           = NO
+HTML_COLORSTYLE        = LIGHT
+
+# Theme: doxygen-awesome-css (sidebar-only) + dark mode toggle + brand overrides
+HTML_HEADER            = docs/api/header.html
+HTML_EXTRA_STYLESHEET  = @AWESOME_CSS_DIR@/doxygen-awesome.css \
+                         @AWESOME_CSS_DIR@/doxygen-awesome-sidebar-only.css \
+                         @AWESOME_CSS_DIR@/doxygen-awesome-sidebar-only-darkmode-toggle.css \
+                         docs/custom-theme.css
+HTML_EXTRA_FILES       = @AWESOME_CSS_DIR@/doxygen-awesome-darkmode-toggle.js
 
 # Optimize for C++
 OPTIMIZE_OUTPUT_FOR_C  = NO
