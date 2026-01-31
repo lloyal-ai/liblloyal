@@ -1349,3 +1349,149 @@ TEST_CASE("branch integration: successive steer calls replace") {
   destroy(h, &store);
   llama_free(ctx);
 }
+
+// ============================================================================
+// Slot Reuse Safety (TDD: these tests expose release() not clearing
+// logit_bias and steer_fn, causing stale state to leak into new branches)
+// ============================================================================
+
+TEST_CASE("branch integration: slot reuse does not leak logit_bias") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  llama_model_params mparams = llama_model_default_params();
+  mparams.n_gpu_layers = TestConfig::n_gpu_layers();
+  std::shared_ptr<llama_model> model(
+      llama_model_load_from_file(MODEL_PATH, mparams),
+      llama_model_free);
+  REQUIRE(model);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 512;
+  cparams.n_batch = 64;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+
+  // Store with capacity 2: slot 0 reserved, slot 1 is the ONLY usable slot.
+  // This guarantees Branch B reuses the exact slot that Branch A occupied.
+  BranchStore store(2);
+  TestParams params;
+  params.temperature = 0.0f;  // Greedy — deterministic argmax
+
+  const llama_vocab* vocab = llama_model_get_vocab(model.get());
+  auto tokens = tokenizer::tokenize(vocab, "The capital of France is", true, false);
+  REQUIRE(!tokens.empty());
+
+  // --- Branch A: find greedy token, then ban it ---
+
+  BranchHandle a = create(ctx, model.get(), 0, 0, params, 64, nullptr, nullptr, &store);
+  REQUIRE(a != INVALID_HANDLE);
+  CHECK_NOTHROW(decode_and_capture_batch(a, tokens.data(), tokens.size(), &store));
+
+  // Sample with greedy to discover the natural argmax
+  llama_token greedy_token = sample(a, &store);
+  REQUIRE(greedy_token != -1);
+
+  // Ban the greedy token
+  llama_logit_bias bias = {greedy_token, -std::numeric_limits<float>::infinity()};
+  set_logit_bias(a, &bias, 1, &store);
+
+  // Verify ban works on A
+  llama_token a_token = sample(a, &store);
+  CHECK(a_token != greedy_token);
+
+  // Destroy A — slot 1 returns to freelist
+  // BUG: release() does not clear logit_bias
+  destroy(a, &store);
+
+  // --- Branch B: must NOT inherit A's logit_bias ---
+
+  // Clear KV cache so B starts fresh (A's seq_id=0 entries still in cache)
+  kv::clear_all(ctx);
+
+  BranchHandle b = create(ctx, model.get(), 0, 0, params, 64, nullptr, nullptr, &store);
+  REQUIRE(b != INVALID_HANDLE);
+  CHECK_NOTHROW(decode_and_capture_batch(b, tokens.data(), tokens.size(), &store));
+
+  // With greedy and NO bias, B should produce the same argmax as A originally did
+  llama_token b_token = sample(b, &store);
+  REQUIRE(b_token != -1);
+  CHECK(b_token == greedy_token);  // FAILS if logit_bias leaked from A
+
+  MESSAGE("greedy=" << greedy_token << ", A(banned)=" << a_token << ", B=" << b_token);
+
+  destroy(b, &store);
+  llama_free(ctx);
+}
+
+TEST_CASE("branch integration: slot reuse does not leak steer_fn") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  llama_model_params mparams = llama_model_default_params();
+  mparams.n_gpu_layers = TestConfig::n_gpu_layers();
+  std::shared_ptr<llama_model> model(
+      llama_model_load_from_file(MODEL_PATH, mparams),
+      llama_model_free);
+  REQUIRE(model);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 512;
+  cparams.n_batch = 64;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+
+  // Store with capacity 2: forces slot reuse
+  BranchStore store(2);
+  TestParams params;
+  params.temperature = 0.0f;  // Greedy — deterministic argmax
+
+  const llama_vocab* vocab = llama_model_get_vocab(model.get());
+  auto tokens = tokenizer::tokenize(vocab, "The capital of France is", true, false);
+  REQUIRE(!tokens.empty());
+
+  // --- Branch A: find greedy token, then mask it via steer ---
+
+  BranchHandle a = create(ctx, model.get(), 0, 0, params, 64, nullptr, nullptr, &store);
+  REQUIRE(a != INVALID_HANDLE);
+  CHECK_NOTHROW(decode_and_capture_batch(a, tokens.data(), tokens.size(), &store));
+
+  // Sample with greedy to discover the natural argmax
+  llama_token greedy_token = sample(a, &store);
+  REQUIRE(greedy_token != -1);
+
+  // Set steer to mask the greedy token
+  set_steer(a, [greedy_token](llama_token_data_array& cur_p) {
+    for (size_t i = 0; i < cur_p.size; ++i) {
+      if (cur_p.data[i].id == greedy_token) {
+        cur_p.data[i].logit = -std::numeric_limits<float>::infinity();
+      }
+    }
+  }, &store);
+
+  // Verify steer works on A
+  llama_token a_token = sample(a, &store);
+  CHECK(a_token != greedy_token);
+
+  // Destroy A — slot 1 returns to freelist
+  // BUG: release() does not clear steer_fn
+  destroy(a, &store);
+
+  // --- Branch B: must NOT inherit A's steer_fn ---
+
+  kv::clear_all(ctx);
+
+  BranchHandle b = create(ctx, model.get(), 0, 0, params, 64, nullptr, nullptr, &store);
+  REQUIRE(b != INVALID_HANDLE);
+  CHECK_NOTHROW(decode_and_capture_batch(b, tokens.data(), tokens.size(), &store));
+
+  // With greedy and NO steer, B should produce the same argmax as A originally did
+  llama_token b_token = sample(b, &store);
+  REQUIRE(b_token != -1);
+  CHECK(b_token == greedy_token);  // FAILS if steer_fn leaked from A
+
+  MESSAGE("greedy=" << greedy_token << ", A(steered)=" << a_token << ", B=" << b_token);
+
+  destroy(b, &store);
+  llama_free(ctx);
+}

@@ -293,11 +293,15 @@ public:
     slot.sampler_chain = nullptr;
     slot.grammar = nullptr;
     slot.metrics = 0;
+    slot.has_dist_sampler = false;
     slot.last_token = -1;
     slot.last_candidates.clear();
     slot.logits_snapshot.clear();
     slot.has_logits = false;
+    slot.logit_bias.clear();
+    slot.steer_fn = nullptr;
     slot.candidates_buffer.clear();  // Clear contents, capacity preserved for reuse
+    slot.n_batch = 512;
     slot.n_vocab = 0;
 
     freelist_.push_back(index);
