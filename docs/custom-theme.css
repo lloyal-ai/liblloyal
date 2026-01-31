@@ -1,0 +1,47 @@
+/* liblloyal brand theme — overrides doxygen-awesome-css defaults */
+/* Brand palette sourced from examples/server (emerald + dark stone) */
+
+/* Light mode */
+html {
+  --primary-color: #059669;         /* emerald-600 */
+  --primary-dark-color: #047857;    /* emerald-700 */
+  --primary-light-color: #10b981;   /* emerald-500 */
+}
+
+/* Dark mode (system preference — no toggle extension) */
+@media (prefers-color-scheme: dark) {
+  html:not(.light-mode) {
+    --primary-color: #10b981;         /* emerald-500 */
+    --primary-dark-color: #34d399;    /* emerald-400 */
+    --primary-light-color: #059669;   /* emerald-600 */
+
+    --page-background-color: #111111;           /* chat-bg */
+    --page-foreground-color: #e7e5e4;           /* stone-200 */
+    --page-secondary-foreground-color: #a8a29e; /* stone-400 */
+
+    --code-background: rgba(255, 255, 255, 0.08); /* inline code bg — matches server theme */
+    --fragment-background: #0a0a0a;              /* code block bg — chat-surface */
+    --fragment-foreground: #e7e5e4;              /* stone-200 */
+  }
+}
+
+/* Inline code spans — Doxygen renders backtick text as span.tt
+   with a hardcoded #FBFCFD background that doxygen-awesome doesn't override */
+span.tt {
+  background-color: var(--code-background);
+}
+
+/* Dark mode (toggle extension, if added later) */
+html.dark-mode {
+  --primary-color: #10b981;
+  --primary-dark-color: #34d399;
+  --primary-light-color: #059669;
+
+  --page-background-color: #111111;
+  --page-foreground-color: #e7e5e4;
+  --page-secondary-foreground-color: #a8a29e;
+
+  --code-background: rgba(255, 255, 255, 0.08);
+  --fragment-background: #0a0a0a;
+  --fragment-foreground: #e7e5e4;
+}

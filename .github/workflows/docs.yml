@@ -6,8 +6,11 @@ on:
       - main
     paths:
       - 'include/lloyal/**'
-      - 'docs/mainpage.dox'
-      - 'Doxyfile'
+      - 'README.md'
+      - 'Doxyfile.in'
+      - 'docs/CMakeLists.txt'
+      - 'docs/custom-theme.css'
+      - 'docs/api/header.html'
       - '.github/workflows/docs.yml'
   workflow_dispatch:  # Allow manual trigger
 
@@ -32,11 +35,12 @@ jobs:
       - name: Install Doxygen
         run: |
           sudo apt-get update
-          sudo apt-get install -y doxygen graphviz
+          sudo apt-get install -y doxygen graphviz cmake
 
       - name: Generate Documentation
         run: |
-          doxygen Doxyfile
+          cmake -S docs -B docs/build
+          cmake --build docs/build --target docs
 
       - name: Setup Pages
         uses: actions/configure-pages@v4
