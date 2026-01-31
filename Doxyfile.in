@@ -8,6 +8,11 @@ OUTPUT_DIRECTORY       = docs/api
 
 INPUT                  = include/lloyal README.md
 RECURSIVE              = YES
+
+# Strip absolute paths from output (prevents leaking local machine paths)
+FULL_PATH_NAMES        = YES
+STRIP_FROM_PATH        = @CMAKE_CURRENT_SOURCE_DIR@/..
+STRIP_FROM_INC_PATH    = @CMAKE_CURRENT_SOURCE_DIR@/../include
 FILE_PATTERNS          = *.hpp *.h *.dox *.md
 USE_MDFILE_AS_MAINPAGE = README.md
 

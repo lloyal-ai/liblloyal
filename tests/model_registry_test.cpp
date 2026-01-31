@@ -55,8 +55,8 @@ TEST_CASE("ModelRegistry: path normalization") {
   auto params = llama_model_params{.n_gpu_layers = 32, .use_mmap = true};
 
   // file:// URI and filesystem path should normalize to same key
-  std::string path1 = "file:///Users/test/model.gguf";
-  std::string path2 = "/Users/test/model.gguf";
+  std::string path1 = "file:///tmp/test/model.gguf";
+  std::string path2 = "/tmp/test/model.gguf";
 
   auto model1 = ModelRegistry::acquire(path1, params);
   auto model2 = ModelRegistry::acquire(path2, params);

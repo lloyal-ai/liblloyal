@@ -3,7 +3,7 @@
 ## Primary Authors
 
 **Lloyal Labs**
-- Zuhair Naqvi
+- Lloyal Engineering
 
 ## Acknowledgments
 
