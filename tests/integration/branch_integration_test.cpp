@@ -130,9 +130,7 @@ TEST_CASE("branch integration: create and destroy") {
   // Load model
   llama_model_params mparams = llama_model_default_params();
   mparams.n_gpu_layers = TestConfig::n_gpu_layers();
-  std::shared_ptr<llama_model> model(
-      llama_model_load_from_file(MODEL_PATH, mparams),
-      llama_model_free);
+  auto model = ModelRegistry::acquire(MODEL_PATH, mparams);
   REQUIRE(model);
 
   // Create context
@@ -174,9 +172,7 @@ TEST_CASE("branch integration: decode updates position") {
 
   llama_model_params mparams = llama_model_default_params();
   mparams.n_gpu_layers = TestConfig::n_gpu_layers();
-  std::shared_ptr<llama_model> model(
-      llama_model_load_from_file(MODEL_PATH, mparams),
-      llama_model_free);
+  auto model = ModelRegistry::acquire(MODEL_PATH, mparams);
   REQUIRE(model);
 
   llama_context_params cparams = llama_context_default_params();
@@ -219,9 +215,7 @@ TEST_CASE("branch integration: decode_and_capture captures logits") {
 
   llama_model_params mparams = llama_model_default_params();
   mparams.n_gpu_layers = TestConfig::n_gpu_layers();
-  std::shared_ptr<llama_model> model(
-      llama_model_load_from_file(MODEL_PATH, mparams),
-      llama_model_free);
+  auto model = ModelRegistry::acquire(MODEL_PATH, mparams);
   REQUIRE(model);
 
   llama_context_params cparams = llama_context_default_params();
@@ -275,9 +269,7 @@ TEST_CASE("branch integration: fork creates independent branch") {
 
   llama_model_params mparams = llama_model_default_params();
   mparams.n_gpu_layers = TestConfig::n_gpu_layers();
-  std::shared_ptr<llama_model> model(
-      llama_model_load_from_file(MODEL_PATH, mparams),
-      llama_model_free);
+  auto model = ModelRegistry::acquire(MODEL_PATH, mparams);
   REQUIRE(model);
 
   llama_context_params cparams = llama_context_default_params();
@@ -390,9 +382,7 @@ TEST_CASE("branch integration: prune removes KV entries") {
 
   llama_model_params mparams = llama_model_default_params();
   mparams.n_gpu_layers = TestConfig::n_gpu_layers();
-  std::shared_ptr<llama_model> model(
-      llama_model_load_from_file(MODEL_PATH, mparams),
-      llama_model_free);
+  auto model = ModelRegistry::acquire(MODEL_PATH, mparams);
   REQUIRE(model);
 
   llama_context_params cparams = llama_context_default_params();
@@ -441,9 +431,7 @@ TEST_CASE("branch integration: RAII Branch wrapper") {
 
   llama_model_params mparams = llama_model_default_params();
   mparams.n_gpu_layers = TestConfig::n_gpu_layers();
-  std::shared_ptr<llama_model> model(
-      llama_model_load_from_file(MODEL_PATH, mparams),
-      llama_model_free);
+  auto model = ModelRegistry::acquire(MODEL_PATH, mparams);
   REQUIRE(model);
 
   llama_context_params cparams = llama_context_default_params();
@@ -494,9 +482,7 @@ TEST_CASE("branch integration: sample and accept token") {
 
   llama_model_params mparams = llama_model_default_params();
   mparams.n_gpu_layers = TestConfig::n_gpu_layers();
-  std::shared_ptr<llama_model> model(
-      llama_model_load_from_file(MODEL_PATH, mparams),
-      llama_model_free);
+  auto model = ModelRegistry::acquire(MODEL_PATH, mparams);
   REQUIRE(model);
 
   llama_context_params cparams = llama_context_default_params();
@@ -542,9 +528,7 @@ TEST_CASE("branch integration: perplexity tracking across fork") {
 
   llama_model_params mparams = llama_model_default_params();
   mparams.n_gpu_layers = TestConfig::n_gpu_layers();
-  std::shared_ptr<llama_model> model(
-      llama_model_load_from_file(MODEL_PATH, mparams),
-      llama_model_free);
+  auto model = ModelRegistry::acquire(MODEL_PATH, mparams);
   REQUIRE(model);
 
   llama_context_params cparams = llama_context_default_params();
@@ -615,9 +599,7 @@ TEST_CASE("branch scoping: logits snapshots are independent memory") {
 
   llama_model_params mparams = llama_model_default_params();
   mparams.n_gpu_layers = TestConfig::n_gpu_layers();
-  std::shared_ptr<llama_model> model(
-      llama_model_load_from_file(MODEL_PATH, mparams),
-      llama_model_free);
+  auto model = ModelRegistry::acquire(MODEL_PATH, mparams);
   REQUIRE(model);
 
   llama_context_params cparams = llama_context_default_params();
@@ -678,9 +660,7 @@ TEST_CASE("branch scoping: decode updates only target branch logits") {
 
   llama_model_params mparams = llama_model_default_params();
   mparams.n_gpu_layers = TestConfig::n_gpu_layers();
-  std::shared_ptr<llama_model> model(
-      llama_model_load_from_file(MODEL_PATH, mparams),
-      llama_model_free);
+  auto model = ModelRegistry::acquire(MODEL_PATH, mparams);
   REQUIRE(model);
 
   llama_context_params cparams = llama_context_default_params();
@@ -758,9 +738,7 @@ TEST_CASE("branch scoping: concurrent captures preserve isolation") {
 
   llama_model_params mparams = llama_model_default_params();
   mparams.n_gpu_layers = TestConfig::n_gpu_layers();
-  std::shared_ptr<llama_model> model(
-      llama_model_load_from_file(MODEL_PATH, mparams),
-      llama_model_free);
+  auto model = ModelRegistry::acquire(MODEL_PATH, mparams);
   REQUIRE(model);
 
   llama_context_params cparams = llama_context_default_params();
@@ -858,9 +836,7 @@ TEST_CASE("branch integration: basic logit_bias bans tokens") {
 
   llama_model_params mparams = llama_model_default_params();
   mparams.n_gpu_layers = TestConfig::n_gpu_layers();
-  std::shared_ptr<llama_model> model(
-      llama_model_load_from_file(MODEL_PATH, mparams),
-      llama_model_free);
+  auto model = ModelRegistry::acquire(MODEL_PATH, mparams);
   REQUIRE(model);
 
   llama_context_params cparams = llama_context_default_params();
@@ -906,9 +882,7 @@ TEST_CASE("branch integration: logit_bias cloned on fork") {
 
   llama_model_params mparams = llama_model_default_params();
   mparams.n_gpu_layers = TestConfig::n_gpu_layers();
-  std::shared_ptr<llama_model> model(
-      llama_model_load_from_file(MODEL_PATH, mparams),
-      llama_model_free);
+  auto model = ModelRegistry::acquire(MODEL_PATH, mparams);
   REQUIRE(model);
 
   llama_context_params cparams = llama_context_default_params();
@@ -956,9 +930,7 @@ TEST_CASE("branch integration: basic steer masks tokens") {
 
   llama_model_params mparams = llama_model_default_params();
   mparams.n_gpu_layers = TestConfig::n_gpu_layers();
-  std::shared_ptr<llama_model> model(
-      llama_model_load_from_file(MODEL_PATH, mparams),
-      llama_model_free);
+  auto model = ModelRegistry::acquire(MODEL_PATH, mparams);
   REQUIRE(model);
 
   llama_context_params cparams = llama_context_default_params();
@@ -1015,9 +987,7 @@ TEST_CASE("branch integration: steer NOT cloned on fork") {
 
   llama_model_params mparams = llama_model_default_params();
   mparams.n_gpu_layers = TestConfig::n_gpu_layers();
-  std::shared_ptr<llama_model> model(
-      llama_model_load_from_file(MODEL_PATH, mparams),
-      llama_model_free);
+  auto model = ModelRegistry::acquire(MODEL_PATH, mparams);
   REQUIRE(model);
 
   llama_context_params cparams = llama_context_default_params();
@@ -1086,9 +1056,7 @@ TEST_CASE("branch integration: grammar + bias + steer composition") {
 
   llama_model_params mparams = llama_model_default_params();
   mparams.n_gpu_layers = TestConfig::n_gpu_layers();
-  std::shared_ptr<llama_model> model(
-      llama_model_load_from_file(MODEL_PATH, mparams),
-      llama_model_free);
+  auto model = ModelRegistry::acquire(MODEL_PATH, mparams);
   REQUIRE(model);
 
   llama_context_params cparams = llama_context_default_params();
@@ -1142,9 +1110,7 @@ TEST_CASE("branch integration: clear functions work") {
 
   llama_model_params mparams = llama_model_default_params();
   mparams.n_gpu_layers = TestConfig::n_gpu_layers();
-  std::shared_ptr<llama_model> model(
-      llama_model_load_from_file(MODEL_PATH, mparams),
-      llama_model_free);
+  auto model = ModelRegistry::acquire(MODEL_PATH, mparams);
   REQUIRE(model);
 
   llama_context_params cparams = llama_context_default_params();
@@ -1209,9 +1175,7 @@ TEST_CASE("branch integration: MCTS deduplication use case") {
 
   llama_model_params mparams = llama_model_default_params();
   mparams.n_gpu_layers = TestConfig::n_gpu_layers();
-  std::shared_ptr<llama_model> model(
-      llama_model_load_from_file(MODEL_PATH, mparams),
-      llama_model_free);
+  auto model = ModelRegistry::acquire(MODEL_PATH, mparams);
   REQUIRE(model);
 
   llama_context_params cparams = llama_context_default_params();
@@ -1292,9 +1256,7 @@ TEST_CASE("branch integration: successive steer calls replace") {
 
   llama_model_params mparams = llama_model_default_params();
   mparams.n_gpu_layers = TestConfig::n_gpu_layers();
-  std::shared_ptr<llama_model> model(
-      llama_model_load_from_file(MODEL_PATH, mparams),
-      llama_model_free);
+  auto model = ModelRegistry::acquire(MODEL_PATH, mparams);
   REQUIRE(model);
 
   llama_context_params cparams = llama_context_default_params();
@@ -1361,9 +1323,7 @@ TEST_CASE("branch integration: slot reuse does not leak logit_bias") {
 
   llama_model_params mparams = llama_model_default_params();
   mparams.n_gpu_layers = TestConfig::n_gpu_layers();
-  std::shared_ptr<llama_model> model(
-      llama_model_load_from_file(MODEL_PATH, mparams),
-      llama_model_free);
+  auto model = ModelRegistry::acquire(MODEL_PATH, mparams);
   REQUIRE(model);
 
   llama_context_params cparams = llama_context_default_params();
@@ -1430,9 +1390,7 @@ TEST_CASE("branch integration: slot reuse does not leak steer_fn") {
 
   llama_model_params mparams = llama_model_default_params();
   mparams.n_gpu_layers = TestConfig::n_gpu_layers();
-  std::shared_ptr<llama_model> model(
-      llama_model_load_from_file(MODEL_PATH, mparams),
-      llama_model_free);
+  auto model = ModelRegistry::acquire(MODEL_PATH, mparams);
   REQUIRE(model);
 
   llama_context_params cparams = llama_context_default_params();
