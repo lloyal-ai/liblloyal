@@ -1,4 +1,5 @@
 #include <doctest/doctest.h>
+#include "test_config.hpp"
 #include <lloyal/decoder.hpp>
 #include <lloyal/kv.hpp>
 #include <lloyal/model_registry.hpp>
@@ -37,10 +38,7 @@ TEST_CASE("Integration: write_file/read_file round-trip") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
-
-  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   auto ctx_params = llama_context_default_params();
@@ -95,10 +93,7 @@ TEST_CASE("Integration: write_file creates valid session format") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
-
-  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   auto ctx_params = llama_context_default_params();
@@ -142,10 +137,7 @@ TEST_CASE("Integration: read_file rejects invalid files") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
-
-  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   auto ctx_params = llama_context_default_params();
@@ -179,10 +171,7 @@ TEST_CASE("Integration: write_file/read_file preserves generation capability") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
-
-  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   auto ctx_params = llama_context_default_params();
@@ -224,10 +213,7 @@ TEST_CASE("Integration: write_file/read_file with larger context") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
-
-  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   auto ctx_params = llama_context_default_params();

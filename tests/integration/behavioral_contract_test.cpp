@@ -1,5 +1,6 @@
 #include <cstdlib>
 #include <doctest/doctest.h>
+#include "test_config.hpp"
 #include <llama/llama.h>
 #include <lloyal/decoder.hpp>
 #include <lloyal/kv.hpp>
@@ -48,10 +49,7 @@ TEST_CASE("Behavioral: Tokenization produces consistent token IDs") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0; // CPU only for determinism
-
-  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   auto vocab = llama_model_get_vocab(model.get());
@@ -88,10 +86,7 @@ TEST_CASE("Behavioral: KV cache state size is stable") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
-
-  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   auto ctx_params = llama_context_default_params();
@@ -169,10 +164,7 @@ TEST_CASE("Behavioral: KV cache serialization round-trip preserves state") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
-
-  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   auto ctx_params = llama_context_default_params();
@@ -226,10 +218,7 @@ TEST_CASE("Behavioral: Greedy sampling is deterministic") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
-
-  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   auto ctx_params = llama_context_default_params();
@@ -272,10 +261,7 @@ TEST_CASE("Behavioral: Detokenization produces consistent text") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
-
-  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   auto vocab = llama_model_get_vocab(model.get());
@@ -300,10 +286,7 @@ TEST_CASE("Behavioral: Batch decode processing is consistent") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
-
-  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   auto ctx_params = llama_context_default_params();
@@ -329,10 +312,7 @@ TEST_CASE("Behavioral: Error conditions produce expected behavior") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
-
-  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   auto ctx_params = llama_context_default_params();

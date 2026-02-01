@@ -11,6 +11,7 @@
  */
 
 #include <doctest/doctest.h>
+#include "test_config.hpp"
 #include <lloyal/helpers.hpp>
 #include <lloyal/model_registry.hpp>
 #include <lloyal/tokenizer.hpp>
@@ -45,10 +46,7 @@ TEST_CASE("ChatTemplate Integration: verify model metadata flags") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto params = llama_model_default_params();
-  params.n_gpu_layers = 0;
-
-  auto model = lloyal::ModelRegistry::acquire(MODEL_PATH, params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   const llama_vocab* vocab = llama_model_get_vocab(model.get());
@@ -70,10 +68,7 @@ TEST_CASE("ChatTemplate Integration: extract chat template") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto params = llama_model_default_params();
-  params.n_gpu_layers = 0;
-
-  auto model = lloyal::ModelRegistry::acquire(MODEL_PATH, params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   const char* template_str = llama_model_chat_template(model.get(), nullptr);
@@ -92,10 +87,7 @@ TEST_CASE("ChatTemplate Integration: format with model template") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto params = llama_model_default_params();
-  params.n_gpu_layers = 0;
-
-  auto model = lloyal::ModelRegistry::acquire(MODEL_PATH, params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   json messages = json::array({
@@ -116,10 +108,7 @@ TEST_CASE("ChatTemplate Integration: multi-turn conversation") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto params = llama_model_default_params();
-  params.n_gpu_layers = 0;
-
-  auto model = lloyal::ModelRegistry::acquire(MODEL_PATH, params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   json messages = json::array({
@@ -141,10 +130,7 @@ TEST_CASE("ChatTemplate Integration: tokenization round-trip with metadata") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto params = llama_model_default_params();
-  params.n_gpu_layers = 0;
-
-  auto model = lloyal::ModelRegistry::acquire(MODEL_PATH, params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   const llama_vocab* vocab = llama_model_get_vocab(model.get());
@@ -180,10 +166,7 @@ TEST_CASE("ChatTemplate Integration: stop tokens extraction") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto params = llama_model_default_params();
-  params.n_gpu_layers = 0;
-
-  auto model = lloyal::ModelRegistry::acquire(MODEL_PATH, params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   const char* template_str = llama_model_chat_template(model.get(), nullptr);
@@ -201,10 +184,7 @@ TEST_CASE("ChatTemplate Integration: custom template override") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto params = llama_model_default_params();
-  params.n_gpu_layers = 0;
-
-  auto model = lloyal::ModelRegistry::acquire(MODEL_PATH, params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   // Use ChatML as override
@@ -232,10 +212,7 @@ TEST_CASE("ChatTemplate Integration: long conversation (50 turns)") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto params = llama_model_default_params();
-  params.n_gpu_layers = 0;
-
-  auto model = lloyal::ModelRegistry::acquire(MODEL_PATH, params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   json messages = json::array();
@@ -264,10 +241,7 @@ TEST_CASE("ChatTemplate Integration: very long message content") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto params = llama_model_default_params();
-  params.n_gpu_layers = 0;
-
-  auto model = lloyal::ModelRegistry::acquire(MODEL_PATH, params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   // 10KB message
@@ -287,10 +261,7 @@ TEST_CASE("ChatTemplate Integration: special characters in content") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto params = llama_model_default_params();
-  params.n_gpu_layers = 0;
-
-  auto model = lloyal::ModelRegistry::acquire(MODEL_PATH, params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   json messages = json::array({
@@ -306,10 +277,7 @@ TEST_CASE("ChatTemplate Integration: unicode and emoji content") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto params = llama_model_default_params();
-  params.n_gpu_layers = 0;
-
-  auto model = lloyal::ModelRegistry::acquire(MODEL_PATH, params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   json messages = json::array({

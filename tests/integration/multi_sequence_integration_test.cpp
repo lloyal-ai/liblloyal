@@ -48,9 +48,7 @@ TEST_CASE("Integration: multi-sequence decode populates different KV regions") {
   LlamaBackendGuard backend;
 
   // Load model
-  auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
-  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   // Create context with n_seq_max = 4 (support 4 parallel sequences)
@@ -97,9 +95,7 @@ TEST_CASE("Integration: clearing one sequence doesn't affect others") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
-  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   auto ctx_params = llama_context_default_params();
@@ -140,9 +136,7 @@ TEST_CASE("Integration: backward compatibility - default seq_id=0") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
-  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   // Standard single-sequence context (n_seq_max defaults to 1)
@@ -171,9 +165,7 @@ TEST_CASE("Integration: decode with explicit seq_id=0 matches default") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
-  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   auto ctx_params = llama_context_default_params();
@@ -204,9 +196,7 @@ TEST_CASE("Integration: seq_cp copies KV cache to new sequence") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
-  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   auto ctx_params = llama_context_default_params();
@@ -271,9 +261,7 @@ TEST_CASE("Integration: clone_sampler creates independent grammar state") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
-  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   // Import grammar namespace
@@ -322,9 +310,7 @@ TEST_CASE("Integration: clone_sampler preserves advanced grammar state") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
-  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   using namespace lloyal;
@@ -369,9 +355,7 @@ TEST_CASE("Integration: branches can decode different tokens independently") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
-  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   auto ctx_params = llama_context_default_params();
@@ -434,9 +418,7 @@ TEST_CASE("Integration: complete System 2 branching workflow") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
-  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   auto ctx_params = llama_context_default_params();
