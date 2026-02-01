@@ -1,0 +1,158 @@
+name: Sync llama.cpp
+
+on:
+  schedule:
+    # Daily at 17:00 AEDT (06:00 UTC)
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      target_tag:
+        description: 'Specific llama.cpp tag to sync to (e.g., b6871). Leave empty for latest.'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check-and-sync:
+    name: Check for new llama.cpp release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout liblloyal
+        uses: actions/checkout@v4
+
+      - name: Read current version
+        id: current
+        run: |
+          CURRENT=$(grep -v '^#' .llama-cpp-version | head -n1 | tr -d '[:space:]')
+          echo "version=$CURRENT" >> $GITHUB_OUTPUT
+          echo "Current llama.cpp version: $CURRENT"
+
+          # Extract numeric part for comparison (b6870 -> 6870)
+          CURRENT_NUM=$(echo "$CURRENT" | sed 's/^b//')
+          echo "num=$CURRENT_NUM" >> $GITHUB_OUTPUT
+
+      - name: Determine target tag
+        id: target
+        run: |
+          if [ -n "${{ inputs.target_tag }}" ]; then
+            echo "tag=${{ inputs.target_tag }}" >> $GITHUB_OUTPUT
+            TARGET_NUM=$(echo "${{ inputs.target_tag }}" | sed 's/^b//')
+            echo "num=$TARGET_NUM" >> $GITHUB_OUTPUT
+            echo "Using manually specified tag: ${{ inputs.target_tag }}"
+          else
+            # Fetch latest b{number} tag without cloning the 2GB+ repo
+            LATEST_TAG=$(git ls-remote --tags --sort=-v:refname \
+              https://github.com/ggml-org/llama.cpp.git 'refs/tags/b[0-9]*' \
+              | head -n1 | sed 's|.*refs/tags/||')
+
+            if [ -z "$LATEST_TAG" ]; then
+              echo "::error::Could not fetch tags from ggml-org/llama.cpp"
+              exit 1
+            fi
+
+            echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+            LATEST_NUM=$(echo "$LATEST_TAG" | sed 's/^b//')
+            echo "num=$LATEST_NUM" >> $GITHUB_OUTPUT
+            echo "Latest upstream tag: $LATEST_TAG"
+          fi
+
+      - name: Check if update needed
+        id: check
+        run: |
+          CURRENT="${{ steps.current.outputs.version }}"
+          TARGET="${{ steps.target.outputs.tag }}"
+          CURRENT_NUM="${{ steps.current.outputs.num }}"
+          TARGET_NUM="${{ steps.target.outputs.num }}"
+
+          if [ "$CURRENT" = "$TARGET" ]; then
+            echo "needed=false" >> $GITHUB_OUTPUT
+            echo "Already at $CURRENT, no update needed."
+            exit 0
+          fi
+
+          if [ "$TARGET_NUM" -le "$CURRENT_NUM" ] 2>/dev/null; then
+            echo "needed=false" >> $GITHUB_OUTPUT
+            echo "Target $TARGET is not newer than current $CURRENT, skipping."
+            exit 0
+          fi
+
+          echo "needed=true" >> $GITHUB_OUTPUT
+          echo "Update available: $CURRENT -> $TARGET"
+
+      - name: Check for existing PR
+        if: steps.check.outputs.needed == 'true'
+        id: existing_pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BRANCH="sync/llama-cpp-${{ steps.target.outputs.tag }}"
+          EXISTING=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "PR #$EXISTING already exists for $BRANCH, skipping."
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create sync branch and PR
+        if: steps.check.outputs.needed == 'true' && steps.existing_pr.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT: ${{ steps.current.outputs.version }}
+          TARGET: ${{ steps.target.outputs.tag }}
+        run: |
+          BRANCH="sync/llama-cpp-${TARGET}"
+          DATE=$(date -u +%Y-%m-%d)
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git checkout -b "$BRANCH"
+
+          # Update .llama-cpp-version (no leading whitespace)
+          printf '# llama.cpp version for integration tests\n# Last updated: %s\n# Format: git commit hash or tag\n%s\n' \
+            "$DATE" "$TARGET" > .llama-cpp-version
+
+          # Update CMakeLists.txt hardcoded version strings
+          sed -i "s/llama.cpp (${CURRENT} or compatible)/llama.cpp (${TARGET} or compatible)/" CMakeLists.txt
+          sed -i "s/against llama.cpp ${CURRENT}/against llama.cpp ${TARGET}/" CMakeLists.txt
+          sed -i "s/STREQUAL \"${CURRENT}\"/STREQUAL \"${TARGET}\"/" CMakeLists.txt
+          sed -i "s/llama.cpp ${CURRENT}, found/llama.cpp ${TARGET}, found/" CMakeLists.txt
+          sed -i "s/llama.cpp version ${CURRENT}/llama.cpp version ${TARGET}/" CMakeLists.txt
+          sed -i "s/Recommended: ${CURRENT}/Recommended: ${TARGET}/" CMakeLists.txt
+
+          git add .llama-cpp-version CMakeLists.txt
+          git commit -m "chore(deps): bump llama.cpp ${CURRENT} -> ${TARGET}"
+          git push origin "$BRANCH"
+
+          # Write PR body to file to avoid YAML indentation issues
+          cat > /tmp/pr-body.md << PREOF
+          ## Automated llama.cpp sync
+
+          Updates llama.cpp version pin from \`${CURRENT}\` to \`${TARGET}\`.
+
+          **Changes:**
+          - \`.llama-cpp-version\`: ${CURRENT} -> ${TARGET}
+          - \`CMakeLists.txt\`: version check strings updated
+
+          **Review checklist:**
+          - [ ] Integration tests pass (CI runs automatically)
+          - [ ] Review [llama.cpp changelog](https://github.com/ggml-org/llama.cpp/compare/${CURRENT}...${TARGET}) for breaking changes
+          - [ ] If breaking: update liblloyal wrappers before merging
+
+          **After merging:**
+          Tag a new liblloyal release when ready. lloyal-node consumers pick up the new version via submodule update + \`npm run sync:llama-cpp\`.
+
+          ---
+          *Automated by sync-llama-cpp workflow*
+          PREOF
+
+          gh pr create \
+            --title "chore(deps): bump llama.cpp ${CURRENT} -> ${TARGET}" \
+            --body-file /tmp/pr-body.md \
+            --base main \
+            --head "$BRANCH"
