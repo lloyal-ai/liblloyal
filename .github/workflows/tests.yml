@@ -139,49 +139,25 @@ jobs:
       uses: actions/cache@v4
       with:
         path: tests/fixtures
-        key: test-models-v1-${{ hashFiles('.github/workflows/tests.yml') }}
+        key: test-models-v2-${{ hashFiles('.github/workflows/tests.yml') }}
         restore-keys: |
-          test-models-v1-
+          test-models-v2-
 
     - name: Download test models
       working-directory: tests
       run: |
         mkdir -p fixtures
 
-        # Download tiny-random-llama (12MB) for basic integration tests
-        # Using the exact URL from setup_test_model.sh
-        if [ ! -f fixtures/tiny-random-llama.gguf ]; then
-          echo "Downloading tiny-random-llama.gguf (12MB)..."
-          curl -fsSL --retry 3 --retry-delay 2 \
-            "https://huggingface.co/tensorblock/tiny-random-LlamaForCausalLM-ONNX-GGUF/resolve/main/tiny-random-LlamaForCausalLM-ONNX-Q4_K_M.gguf" \
-            -o fixtures/tiny-random-llama.gguf
-
-          # Verify it's a valid GGUF file (check magic bytes)
-          echo "Verifying tiny-random-llama.gguf..."
-          if ! head -c 4 fixtures/tiny-random-llama.gguf | grep -q "GGUF"; then
-            echo "ERROR: Downloaded file is not a valid GGUF file"
-            echo "File header:"
-            head -c 32 fixtures/tiny-random-llama.gguf | xxd
-            rm -f fixtures/tiny-random-llama.gguf
-            exit 1
-          fi
-          echo "✓ tiny-random-llama.gguf verified"
-        else
-          echo "✓ Using cached tiny-random-llama.gguf"
-        fi
-
-        # Download TinyLlama-1.1B (638MB) for coherent model tests
+        # Download TinyLlama-1.1B (638MB) for all integration tests
         if [ ! -f fixtures/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf ]; then
           echo "Downloading tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf (638MB)..."
           curl -fsSL --retry 3 --retry-delay 2 \
             "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf" \
             -o fixtures/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 
-          # Verify GGUF magic bytes
           echo "Verifying tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf..."
           if ! head -c 4 fixtures/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf | grep -q "GGUF"; then
             echo "ERROR: Downloaded file is not a valid GGUF file"
-            echo "File header:"
             head -c 32 fixtures/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf | xxd
             rm -f fixtures/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
             exit 1
@@ -198,11 +174,9 @@ jobs:
             "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q4_K_M.gguf" \
             -o fixtures/nomic-embed-text-v1.5.Q4_K_M.gguf
 
-          # Verify GGUF magic bytes
           echo "Verifying nomic-embed-text-v1.5.Q4_K_M.gguf..."
           if ! head -c 4 fixtures/nomic-embed-text-v1.5.Q4_K_M.gguf | grep -q "GGUF"; then
             echo "ERROR: Downloaded file is not a valid GGUF file"
-            echo "File header:"
             head -c 32 fixtures/nomic-embed-text-v1.5.Q4_K_M.gguf | xxd
             rm -f fixtures/nomic-embed-text-v1.5.Q4_K_M.gguf
             exit 1
@@ -226,43 +200,38 @@ jobs:
       working-directory: tests
       run: cmake --build build_integration --config Release
 
-    - name: Run integration tests (random model)
-      working-directory: tests
-      env:
-        LLAMA_TEST_MODEL: ${{ github.workspace }}/tests/fixtures/tiny-random-llama.gguf
-      run: |
-        echo "Running basic integration tests with tiny-random-llama..."
-        echo "Model path: $LLAMA_TEST_MODEL"
-        ls -lh "$LLAMA_TEST_MODEL"
-        # Run tests that work with random weights (exclude Empirical and RoPE Invariant)
-        ./build_integration/IntegrationRunner --success \
-          --test-case-exclude="Empirical:*" \
-          --test-case-exclude="RoPE Invariant:*"
-
-    - name: Run integration tests (coherent model)
+    - name: Run integration tests
       working-directory: tests
       env:
         LLAMA_TEST_MODEL: ${{ github.workspace }}/tests/fixtures/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
       run: |
-        echo "Running coherent model tests with TinyLlama-1.1B..."
+        echo "Running integration tests with TinyLlama-1.1B..."
         echo "Model path: $LLAMA_TEST_MODEL"
         ls -lh "$LLAMA_TEST_MODEL"
-        # Run only tests that require coherent models
         ./build_integration/IntegrationRunner --success \
-          --test-case="Empirical:*,RoPE Invariant:*"
+          --test-case-exclude="*Embedding*" 2>&1 | tee test_output.txt
+        # Fail if no tests actually executed (all filtered/skipped)
+        if grep -qE "test cases:.*\| 0 passed \| 0 failed \|" test_output.txt; then
+          echo "::error::No tests executed — all were skipped or filtered out"
+          exit 1
+        fi
 
-    - name: Run integration tests (embedding model)
+    - name: Run embedding tests
       working-directory: tests
       env:
-        LLAMA_TEST_MODEL: ${{ github.workspace }}/tests/fixtures/tiny-random-llama.gguf
+        LLAMA_TEST_MODEL: ${{ github.workspace }}/tests/fixtures/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
         LLAMA_EMBED_MODEL: ${{ github.workspace }}/tests/fixtures/nomic-embed-text-v1.5.Q4_K_M.gguf
       run: |
         echo "Running embedding tests with nomic-embed-text-v1.5..."
         echo "Embed model path: $LLAMA_EMBED_MODEL"
         ls -lh "$LLAMA_EMBED_MODEL"
-        # Run embedding-specific tests
         ./build_integration/IntegrationRunner --success \
-          --test-case="*Embedding*"
+          --test-case="*Embedding*" 2>&1 | tee test_output.txt
+        # Fail if no tests actually executed (all filtered/skipped)
+        if grep -qE "test cases:.*\| 0 passed \| 0 failed \|" test_output.txt; then
+          echo "::error::No tests executed — all were skipped or filtered out"
+          exit 1
+        fi
 
     - name: Upload test results
       if: always()
