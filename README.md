@@ -6,9 +6,11 @@
 [![C++](https://img.shields.io/badge/C++-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
 [![llama.cpp](https://img.shields.io/badge/llama.cpp-b6870-green.svg)](https://github.com/ggml-org/llama.cpp/releases/tag/b6870)
 
-**Branched Inference for llama.cpp**
+**Covalent Inference for llama.cpp**
 
-Composable C++ primitives library for llama.cpp with advanced patterns (handle-based APIs, shared model weights, multi-sequence management) enabling applications from simple streaming to complex inference orchestration.
+Composable C++ primitives for forkable decode state and shared-prefix (KV) branching in llama.cpp.
+
+Fork a generation into a tree — branches share a prefix while keeping independent machinery (sampler chain, seed, grammar, logits snapshot, perplexity tracker) for controlled divergence at decode time.
 
 ## The Branch API
 
@@ -47,6 +49,7 @@ auto released = winner.release_kv();
 ```
 
 **What `fork()` clones:**
+
 - KV cache sequence (via `llama_memory_seq_cp`)
 - Sampler chain (penalties, PRNG, top-k/p filters)
 - Grammar constraints (GBNF parser state)
