@@ -62,6 +62,7 @@ jobs:
       env:
         ASAN_OPTIONS: detect_leaks=1
       run: |
+        set -o pipefail
         echo "Running with AddressSanitizer, UBSan, Integer, Float, and LeakSanitizer..."
         ./build_san/TestRunner --success 2>&1 | tee sanitizer_output.txt
         # Check for any runtime errors (warnings are ok, errors are not)
@@ -205,6 +206,7 @@ jobs:
       env:
         LLAMA_TEST_MODEL: ${{ github.workspace }}/tests/fixtures/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
       run: |
+        set -o pipefail
         echo "Running integration tests with TinyLlama-1.1B..."
         echo "Model path: $LLAMA_TEST_MODEL"
         ls -lh "$LLAMA_TEST_MODEL"
@@ -222,6 +224,7 @@ jobs:
         LLAMA_TEST_MODEL: ${{ github.workspace }}/tests/fixtures/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
         LLAMA_EMBED_MODEL: ${{ github.workspace }}/tests/fixtures/nomic-embed-text-v1.5.Q4_K_M.gguf
       run: |
+        set -o pipefail
         echo "Running embedding tests with nomic-embed-text-v1.5..."
         echo "Embed model path: $LLAMA_EMBED_MODEL"
         ls -lh "$LLAMA_EMBED_MODEL"

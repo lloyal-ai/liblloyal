@@ -259,6 +259,19 @@ extract_template_stop_tokens(const llama_model *model,
     }
   }
 
+  // Fallback to EOS when no template-specific stops found
+  // Covers Zephyr-style templates that use eos_token (</s>) as the stop signal
+  if (stops.empty()) {
+    auto eos_token = llama_vocab_eos(vocab);
+    if (eos_token != LLAMA_TOKEN_NULL) {
+      std::string eos_text =
+          detail::common_token_to_piece(vocab, eos_token, true);
+      if (!eos_text.empty()) {
+        stops.push_back(eos_text);
+      }
+    }
+  }
+
   return stops;
 }
 

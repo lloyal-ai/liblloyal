@@ -120,16 +120,19 @@ TEST_CASE("Behavioral: KV cache state size is stable") {
   size_t state_size = kv::state_size(ctx, 0);
   REQUIRE(state_size > 0);
 
-  // Calculate expected size based on model architecture
-  // KV state contains: n_tokens * n_layer * n_embd * 2 (K+V) * sizeof(fp16)
+  // Calculate expected size based on model architecture (GQA-aware)
+  // KV state contains: n_tokens * n_layer * n_head_kv * head_dim * 2 (K+V) * sizeof(fp16)
   // Plus metadata overhead (sequence info, position info, etc.)
   int32_t n_layer = llama_model_n_layer(model.get());
   int32_t n_embd = llama_model_n_embd(model.get());
+  int32_t n_head = llama_model_n_head(model.get());
+  int32_t n_head_kv = llama_model_n_head_kv(model.get());
+  int32_t head_dim = n_embd / n_head;
   int32_t n_tokens = 3; // Number of tokens in KV cache
 
   // Expected KV data size (K + V tensors, fp16 = 2 bytes per element)
-  // Simplified: KV cache for 3 tokens = 3 * n_layer * n_embd * 2 (K+V) * 2 bytes (fp16)
-  size_t expected_kv_data = n_tokens * n_layer * n_embd * 2 * 2;
+  // GQA-aware: uses n_head_kv (not n_head) since KV cache is per KV-head
+  size_t expected_kv_data = static_cast<size_t>(n_tokens) * n_layer * n_head_kv * head_dim * 2 * 2;
 
   // Add metadata overhead (sequence info, cell metadata, etc.)
   // Empirically measured ~100-200 bytes for tiny models, scales with layers
@@ -144,7 +147,9 @@ TEST_CASE("Behavioral: KV cache state size is stable") {
   size_t expected_min = static_cast<size_t>(expected_total * 0.5);
   size_t expected_max = static_cast<size_t>(expected_total * 1.5);
 
-  INFO("Model: n_layer=" << n_layer << ", n_embd=" << n_embd);
+  INFO("Model: n_layer=" << n_layer << ", n_embd=" << n_embd
+       << ", n_head=" << n_head << ", n_head_kv=" << n_head_kv
+       << ", head_dim=" << head_dim);
   INFO("Expected KV state size: ~" << expected_total << " bytes (±50%)");
   INFO("Actual KV state size: " << state_size << " bytes");
 

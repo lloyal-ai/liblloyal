@@ -341,19 +341,29 @@ TEST_CASE("Integration: llama_sampler_accept advances grammar state (Part 2)") {
   int decode_result = llama_decode(ctx, batch_helper.batch);
   REQUIRE(decode_result == 0);
 
-  // Create grammar
-  const char *grammar_str = "root ::= \"a\" \"b\" \"c\""; // Fixed sequence
-  llama_sampler *grammar_sampler =
-      llama_sampler_init_grammar(vocab, grammar_str, "root");
-  REQUIRE(grammar_sampler != nullptr);
-
-  // Find token IDs for 'a', 'b', 'c'
+  // Tokenize first, then build grammar from actual token pieces
+  // (SentencePiece tokenizers may produce leading-space pieces like " a")
   auto token_a_vec = tokenizer::tokenize(vocab, "a", false, false);
   auto token_b_vec = tokenizer::tokenize(vocab, "b", false, false);
+  auto token_c_vec = tokenizer::tokenize(vocab, "c", false, false);
 
-  if (!token_a_vec.empty() && !token_b_vec.empty()) {
+  if (!token_a_vec.empty() && !token_b_vec.empty() && !token_c_vec.empty()) {
     llama_token token_a = token_a_vec[0];
     llama_token token_b = token_b_vec[0];
+    llama_token token_c = token_c_vec[0];
+
+    // Detokenize with special=true to match grammar's internal token_to_piece cache
+    std::string piece_a = tokenizer::detokenize(vocab, token_a, true);
+    std::string piece_b = tokenizer::detokenize(vocab, token_b, true);
+    std::string piece_c = tokenizer::detokenize(vocab, token_c, true);
+
+    // Build grammar from actual pieces so it matches what the grammar sampler sees
+    std::string grammar_str = "root ::= \"" + piece_a + "\" \"" + piece_b + "\" \"" + piece_c + "\"";
+    INFO("Grammar: " << grammar_str);
+
+    llama_sampler *grammar_sampler =
+        llama_sampler_init_grammar(vocab, grammar_str.c_str(), "root");
+    REQUIRE(grammar_sampler != nullptr);
 
     // PART 2 PRIMITIVE: Accept token (advances grammar parser state)
     // After accepting 'a', grammar should only allow 'b' next
@@ -384,11 +394,12 @@ TEST_CASE("Integration: llama_sampler_accept advances grammar state (Part 2)") {
     CHECK(a_masked); // 'a' should be masked after accepting it
     INFO("✓ Grammar state advanced: 'a' masked=" << a_masked << ", 'b' allowed="
                                                  << b_allowed);
+
+    llama_sampler_free(grammar_sampler);
   } else {
-    INFO("[ SKIP ] Could not find tokens for 'a' and 'b' in vocabulary");
+    INFO("[ SKIP ] Could not find tokens for 'a', 'b', and 'c' in vocabulary");
   }
 
-  llama_sampler_free(grammar_sampler);
   llama_free(ctx);
 }
 

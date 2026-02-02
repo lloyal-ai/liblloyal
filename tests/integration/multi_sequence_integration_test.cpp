@@ -279,25 +279,35 @@ TEST_CASE("Integration: clone_sampler creates independent grammar state") {
   // Import grammar namespace
   using namespace lloyal;
 
-  // Create grammar that accepts "ab" or "ac" (branching grammar)
-  const char *grammar_str = "root ::= \"a\" [bc]";
-  llama_sampler *trunk = grammar::init_sampler(model.get(), grammar_str);
-  REQUIRE(trunk != nullptr);
-
-  // Clone before accepting any tokens
-  llama_sampler *branch_a = grammar::clone_sampler(trunk);
-  llama_sampler *branch_b = grammar::clone_sampler(trunk);
-  REQUIRE(branch_a != nullptr);
-  REQUIRE(branch_b != nullptr);
-
-  // Get vocab for token lookup
+  // Get vocab and tokenize first to build grammar from actual token pieces
   auto vocab = llama_model_get_vocab(model.get());
   REQUIRE(vocab != nullptr);
 
-  // Find token for 'a'
   auto token_a_vec = tokenizer::tokenize(vocab, "a", false, false);
-  if (!token_a_vec.empty()) {
+  auto token_b_vec = tokenizer::tokenize(vocab, "b", false, false);
+  auto token_c_vec = tokenizer::tokenize(vocab, "c", false, false);
+
+  if (!token_a_vec.empty() && !token_b_vec.empty() && !token_c_vec.empty()) {
     llama_token token_a = token_a_vec[0];
+
+    // Detokenize with special=true to match grammar's internal token_to_piece cache
+    std::string piece_a = tokenizer::detokenize(vocab, token_a, true);
+    std::string piece_b = tokenizer::detokenize(vocab, token_b_vec[0], true);
+    std::string piece_c = tokenizer::detokenize(vocab, token_c_vec[0], true);
+
+    // Build grammar from actual pieces; use alternation instead of character class
+    // (character class [bc] won't match multi-char pieces like " b")
+    std::string grammar_str = "root ::= \"" + piece_a + "\" (\"" + piece_b + "\" | \"" + piece_c + "\")";
+    INFO("Grammar: " << grammar_str);
+
+    llama_sampler *trunk = grammar::init_sampler(model.get(), grammar_str.c_str());
+    REQUIRE(trunk != nullptr);
+
+    // Clone before accepting any tokens
+    llama_sampler *branch_a = grammar::clone_sampler(trunk);
+    llama_sampler *branch_b = grammar::clone_sampler(trunk);
+    REQUIRE(branch_a != nullptr);
+    REQUIRE(branch_b != nullptr);
 
     // Accept 'a' on trunk - this should advance trunk's state
     llama_sampler_accept(trunk, token_a);
@@ -310,12 +320,14 @@ TEST_CASE("Integration: clone_sampler creates independent grammar state") {
     llama_sampler_accept(branch_b, token_a);
 
     INFO("✓ Cloned samplers have independent state");
-  }
 
-  // Cleanup
-  llama_sampler_free(trunk);
-  llama_sampler_free(branch_a);
-  llama_sampler_free(branch_b);
+    // Cleanup
+    llama_sampler_free(trunk);
+    llama_sampler_free(branch_a);
+    llama_sampler_free(branch_b);
+  } else {
+    INFO("[ SKIP ] Could not find tokens for 'a', 'b', and 'c' in vocabulary");
+  }
 }
 
 TEST_CASE("Integration: clone_sampler preserves advanced grammar state") {
@@ -329,18 +341,28 @@ TEST_CASE("Integration: clone_sampler preserves advanced grammar state") {
 
   using namespace lloyal;
 
-  // Grammar: "abc" - fixed sequence
-  const char *grammar_str = "root ::= \"a\" \"b\" \"c\"";
-  llama_sampler *trunk = grammar::init_sampler(model.get(), grammar_str);
-  REQUIRE(trunk != nullptr);
-
   auto vocab = llama_model_get_vocab(model.get());
+  REQUIRE(vocab != nullptr);
+
   auto token_a_vec = tokenizer::tokenize(vocab, "a", false, false);
   auto token_b_vec = tokenizer::tokenize(vocab, "b", false, false);
+  auto token_c_vec = tokenizer::tokenize(vocab, "c", false, false);
 
-  if (!token_a_vec.empty() && !token_b_vec.empty()) {
+  if (!token_a_vec.empty() && !token_b_vec.empty() && !token_c_vec.empty()) {
     llama_token token_a = token_a_vec[0];
     llama_token token_b = token_b_vec[0];
+
+    // Detokenize with special=true to match grammar's internal token_to_piece cache
+    std::string piece_a = tokenizer::detokenize(vocab, token_a, true);
+    std::string piece_b = tokenizer::detokenize(vocab, token_b, true);
+    std::string piece_c = tokenizer::detokenize(vocab, token_c_vec[0], true);
+
+    // Build grammar from actual pieces
+    std::string grammar_str = "root ::= \"" + piece_a + "\" \"" + piece_b + "\" \"" + piece_c + "\"";
+    INFO("Grammar: " << grammar_str);
+
+    llama_sampler *trunk = grammar::init_sampler(model.get(), grammar_str.c_str());
+    REQUIRE(trunk != nullptr);
 
     // Advance trunk past 'a'
     llama_sampler_accept(trunk, token_a);
@@ -356,9 +378,10 @@ TEST_CASE("Integration: clone_sampler preserves advanced grammar state") {
     INFO("✓ Clone preserved grammar state after 'a'");
 
     llama_sampler_free(clone);
+    llama_sampler_free(trunk);
+  } else {
+    INFO("[ SKIP ] Could not find tokens for 'a', 'b', and 'c' in vocabulary");
   }
-
-  llama_sampler_free(trunk);
 }
 
 // ============================================================================
