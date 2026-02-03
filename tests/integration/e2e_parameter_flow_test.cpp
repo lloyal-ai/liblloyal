@@ -1,5 +1,6 @@
 #include <cstdlib>
 #include <doctest/doctest.h>
+#include "test_config.hpp"
 #include <llama/llama.h>
 #include <lloyal/decoder.hpp>
 #include <lloyal/kv.hpp>
@@ -50,12 +51,8 @@ TEST_CASE("E2E: Complete inference pipeline with custom parameters") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  // === Step 1: Load model with custom params ===
-  auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0; // CPU only for determinism
-  model_params.use_mmap = true;  // Memory-mapped loading
-
-  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  // === Step 1: Load model ===
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   // === Step 2: Create context with custom params ===
@@ -130,10 +127,7 @@ TEST_CASE("E2E: KV cache operations with parameterized context") {
   LlamaBackendGuard backend;
 
   // === Step 1: Load model ===
-  auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
-
-  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   // === Step 2: Create context with specific n_ctx ===

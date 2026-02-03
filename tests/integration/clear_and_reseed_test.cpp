@@ -1,5 +1,6 @@
 // File: packages/liblloyal/tests/integration/clear_and_reseed_test.cpp
 
+#include "test_config.hpp"
 #include <algorithm>
 #include <cmath>
 #include <doctest/doctest.h>
@@ -173,10 +174,7 @@ TEST_CASE("clear_and_reseed: Position contiguity") {
   REQUIRE_COHERENT_MODEL();
   LlamaBackendGuard backend;
 
-  auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
-
-  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   auto ctx_params = llama_context_default_params();
@@ -269,10 +267,7 @@ TEST_CASE("clear_and_reseed: Smoke test (non-catastrophic compression)") {
   REQUIRE_COHERENT_MODEL();
   LlamaBackendGuard backend;
 
-  auto model_params = llama_model_default_params();
-  model_params.n_gpu_layers = 0;
-
-  auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
+  auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
   auto ctx_params = llama_context_default_params();
