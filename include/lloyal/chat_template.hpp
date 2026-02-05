@@ -80,10 +80,11 @@ struct FormatResult {
  * @code
  * // Basic usage
  * auto result = chat_template::format(model, R"([{"role":"user","content":"Hi"}])");
+ * const auto* vocab = llama_model_get_vocab(model);
  * auto tokens = tokenizer::tokenize(vocab, result.prompt, true, true);
  *
  * // With custom template
- * auto result = chat_template::format(model, messages_json, custom_template);
+ * auto custom_result = chat_template::format(model, messages_json, custom_template);
  * @endcode
  */
 inline FormatResult format(const llama_model *model,
@@ -251,7 +252,10 @@ inline std::vector<llama_token> fallback_to_eog(const llama_model* model) {
  * @code
  * // Warm multi-turn continuation with exact cold/warm parity
  * auto separator = chat_template::get_turn_separator(model);
+ * const auto* vocab = llama_model_get_vocab(model);
+ * std::string delta_prompt = format_new_turn(messages);  // Your formatted new turn
  * auto delta_tokens = tokenizer::tokenize(vocab, delta_prompt, false, true);
+ *                                      // add_bos=false: continuing, not fresh start
  *
  * // Prepend separator to delta for exact match with cold path
  * std::vector<llama_token> prefill_tokens;
@@ -335,6 +339,10 @@ inline std::vector<llama_token> get_turn_separator(const llama_model* model) {
       }
     } else {
       // After EOG, only keep whitespace tokens
+      // NOTE: Only ASCII whitespace is checked. Unicode whitespace (NBSP, zero-width,
+      // etc.) is not handled because chat templates universally use ASCII whitespace
+      // for turn boundaries. If a template used Unicode whitespace, those tokens would
+      // be treated as the next message opener and excluded from the separator.
       std::string text = lloyal::tokenizer::detokenize(model, tok);
       bool is_whitespace = !text.empty() && std::all_of(text.begin(), text.end(),
           [](unsigned char c) { return c == ' ' || c == '\n' || c == '\r' || c == '\t'; });
