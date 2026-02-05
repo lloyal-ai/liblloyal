@@ -78,10 +78,13 @@ struct FormatResult {
  * @see lloyal::detail::format_chat_template_complete()
  *
  * @code
- * // Basic usage
+ * // Basic usage (cold start)
  * auto result = chat_template::format(model, R"([{"role":"user","content":"Hi"}])");
  * const auto* vocab = llama_model_get_vocab(model);
  * auto tokens = tokenizer::tokenize(vocab, result.prompt, true, true);
+ * // Note: tokenizer::tokenize(model, result.prompt) is simpler for cold start,
+ * // but explicit params are shown here for consistency with warm continuation
+ * // which requires add_bos=false (see get_turn_separator() example).
  *
  * // With custom template
  * auto custom_result = chat_template::format(model, messages_json, custom_template);
@@ -204,6 +207,9 @@ inline bool validate(const std::string &template_str) {
  * @see get_turn_separator()
  */
 inline std::vector<llama_token> fallback_to_eog(const llama_model* model) {
+  if (model == nullptr) {
+    return {};
+  }
   const llama_vocab* vocab = llama_model_get_vocab(model);
   llama_token eot = llama_vocab_eot(vocab);
   if (eot == LLAMA_TOKEN_NULL) {
@@ -234,9 +240,9 @@ inline std::vector<llama_token> fallback_to_eog(const llama_model* model) {
  *
  * | Template | Separator Tokens | Text Representation |
  * |----------|------------------|---------------------|
- * | ChatML   | `[im_end, \n]`   | `<\|im_end\|>\n`    |
- * | Llama-3  | `[eot_id]`       | `<\|eot_id\|>`      |
- * | Phi-3    | `[end, \n]`      | `<\|end\|>\n`       |
+ * | ChatML   | `[im_end, \n]`   | `<|im_end|>\n`      |
+ * | Llama-3  | `[eot_id]`       | `<|eot_id|>`        |
+ * | Phi-3    | `[end, \n]`      | `<|end|>\n`         |
  * | Zephyr   | `[eos, \n]`      | `</s>\n`            |
  *
  * @param model Llama model pointer (provides template and vocabulary)
@@ -246,6 +252,11 @@ inline std::vector<llama_token> fallback_to_eog(const llama_model* model) {
  *         Returns empty vector only if model has no EOG token.
  *
  * @note Result is typically cached by the caller (e.g., SessionContext).
+ *
+ * @note Uses sentinel strings with ASCII control characters for extraction.
+ *       Collision is theoretically possible but practically impossible. If
+ *       extraction fails or produces invalid results (no EOG token), the
+ *       function safely falls back to returning the model's EOG token.
  *
  * @see lloyal::tokenizer::is_eog()
  *
