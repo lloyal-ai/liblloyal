@@ -1,22 +1,20 @@
 /**
- * Integration tests for chat template round-trip pattern with real models
+ * Integration tests for chat template processing with real models
  *
- * Tests the full round-trip pattern with actual GGUF models:
- * 1. Load model and query GGUF metadata (add_bos, add_eos flags)
- * 2. Format template with metadata-aware conditional stripping
- * 3. Tokenize with metadata-aware BOS/EOS addition
- * 4. Verify tokens match model expectations
+ * Tests the chat template API with actual GGUF models:
+ * - Template formatting using llama.cpp common library
+ * - Turn separator extraction
+ * - Tokenization round-trip
  *
  * Requires: LLAMA_TEST_MODEL environment variable
  */
 
 #include <doctest/doctest.h>
 #include "test_config.hpp"
-#include <lloyal/helpers.hpp>
 #include <lloyal/chat_template.hpp>
 #include <lloyal/model_registry.hpp>
 #include <lloyal/tokenizer.hpp>
-#include <lloyal/nlohmann/json.hpp>
+#include <nlohmann/json.hpp>
 #include <llama/llama.h>
 #include <cstdlib>
 #include <string>
@@ -82,7 +80,7 @@ TEST_CASE("ChatTemplate Integration: extract chat template") {
   CHECK(tmpl.find("message") != std::string::npos);
 }
 
-// ===== ROUND-TRIP PATTERN TESTS =====
+// ===== FORMAT TESTS =====
 
 TEST_CASE("ChatTemplate Integration: format with model template") {
   REQUIRE_MODEL();
@@ -95,7 +93,7 @@ TEST_CASE("ChatTemplate Integration: format with model template") {
     {{"role", "user"}, {"content", "Hello, how are you?"}}
   });
 
-  auto result = lloyal::format_chat_template_complete(model.get(), messages.dump());
+  auto result = lloyal::chat_template::format(model.get(), messages.dump());
 
   // Should have formatted prompt containing the message content
   CHECK(!result.prompt.empty());
@@ -118,7 +116,7 @@ TEST_CASE("ChatTemplate Integration: multi-turn conversation") {
     {{"role", "user"}, {"content", "What is 3+3?"}}
   });
 
-  auto result = lloyal::format_chat_template_complete(model.get(), messages.dump());
+  auto result = lloyal::chat_template::format(model.get(), messages.dump());
 
   CHECK(!result.prompt.empty());
   // All messages should be present
@@ -142,7 +140,7 @@ TEST_CASE("ChatTemplate Integration: tokenization round-trip with metadata") {
     {{"role", "user"}, {"content", "Hello"}}
   });
 
-  auto result = lloyal::format_chat_template_complete(model.get(), messages.dump());
+  auto result = lloyal::chat_template::format(model.get(), messages.dump());
   REQUIRE(!result.prompt.empty());
 
   // Query metadata
@@ -159,24 +157,6 @@ TEST_CASE("ChatTemplate Integration: tokenization round-trip with metadata") {
     // When add_bos is true, tokenizer should prepend BOS
     CHECK(tokens[0] == bos);
   }
-  // Note: when add_bos=false we don't assert tokens[0] != bos because
-  // the template itself may produce text that tokenizes to the BOS token ID
-}
-
-TEST_CASE("ChatTemplate Integration: stop tokens extraction") {
-  REQUIRE_MODEL();
-  LlamaBackendGuard backend;
-
-  auto model = TestConfig::acquire_test_model();
-  REQUIRE(model != nullptr);
-
-  const char* template_str = llama_model_chat_template(model.get(), nullptr);
-  REQUIRE(template_str != nullptr);
-
-  auto stops = lloyal::extract_template_stop_tokens(model.get(), template_str);
-
-  // Should have extracted some stop tokens
-  CHECK(!stops.empty());
 }
 
 // ===== TEMPLATE OVERRIDE TESTS =====
@@ -199,7 +179,7 @@ TEST_CASE("ChatTemplate Integration: custom template override") {
     {{"role", "user"}, {"content", "Test message"}}
   });
 
-  auto result = lloyal::format_chat_template_complete(model.get(), messages.dump(), override_template);
+  auto result = lloyal::chat_template::format(model.get(), messages.dump(), override_template);
 
   CHECK(!result.prompt.empty());
   CHECK(result.prompt.find("<|im_start|>") != std::string::npos);
@@ -230,7 +210,7 @@ TEST_CASE("ChatTemplate Integration: long conversation (50 turns)") {
     });
   }
 
-  auto result = lloyal::format_chat_template_complete(model.get(), messages.dump());
+  auto result = lloyal::chat_template::format(model.get(), messages.dump());
 
   CHECK(!result.prompt.empty());
   // Check first and last messages are present
@@ -252,7 +232,7 @@ TEST_CASE("ChatTemplate Integration: very long message content") {
     {{"role", "user"}, {"content", long_content}}
   });
 
-  auto result = lloyal::format_chat_template_complete(model.get(), messages.dump());
+  auto result = lloyal::chat_template::format(model.get(), messages.dump());
 
   CHECK(!result.prompt.empty());
   CHECK(result.prompt.find(long_content) != std::string::npos);
@@ -269,7 +249,7 @@ TEST_CASE("ChatTemplate Integration: special characters in content") {
     {{"role", "user"}, {"content", "Quote: \"Hello\"\nNewline\tTab\rCarriage"}}
   });
 
-  auto result = lloyal::format_chat_template_complete(model.get(), messages.dump());
+  auto result = lloyal::chat_template::format(model.get(), messages.dump());
 
   CHECK(!result.prompt.empty());
 }
@@ -285,7 +265,7 @@ TEST_CASE("ChatTemplate Integration: unicode and emoji content") {
     {{"role", "user"}, {"content", "Hello 世界 🌍 Привет مرحبا"}}
   });
 
-  auto result = lloyal::format_chat_template_complete(model.get(), messages.dump());
+  auto result = lloyal::chat_template::format(model.get(), messages.dump());
 
   CHECK(!result.prompt.empty());
   CHECK(result.prompt.find("世界") != std::string::npos);
@@ -350,10 +330,6 @@ TEST_CASE("ChatTemplate Integration: get_turn_separator detokenizes correctly") 
 
   // Should contain at least one character (the EOG token text)
   CHECK(!text.empty());
-
-  // Common patterns: should end with newline or be a special token
-  // Note: Some templates (Llama-3) have just EOT with no trailing whitespace
-  // Others (ChatML, Zephyr) have EOG + newline
 }
 
 TEST_CASE("ChatTemplate Integration: get_turn_separator is stable (deterministic)") {
@@ -390,7 +366,7 @@ TEST_CASE("ChatTemplate Integration: get_turn_separator matches template boundar
     {{"role", "user"}, {"content", "Z"}}
   });
 
-  auto result = lloyal::format_chat_template_complete(model.get(), messages.dump());
+  auto result = lloyal::chat_template::format(model.get(), messages.dump());
   REQUIRE(!result.prompt.empty());
 
   // Tokenize the full prompt
@@ -510,4 +486,3 @@ TEST_CASE("ChatTemplate Integration: warm continuation pattern (documented examp
           << ") + delta(" << delta_tokens.size()
           << ") = " << prefill_tokens.size() << " tokens");
 }
-

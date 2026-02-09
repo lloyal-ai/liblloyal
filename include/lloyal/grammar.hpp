@@ -4,10 +4,10 @@
 // Copyright 2026 Lloyal Labs
 
 #include "common.hpp"
-#include "json-schema-to-grammar.hpp"
 #include "tokenizer.hpp"
 #include <llama/llama.h>
-#include <lloyal/nlohmann/json.hpp>
+#include <json-schema-to-grammar.h>  // llama.cpp common library
+#include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
 
@@ -16,10 +16,10 @@
  * @brief Grammar-Constrained Sampling
  *
  * Provides JSON schema to GBNF grammar conversion for structured output generation.
- * Wraps json-schema-to-grammar.hpp conversion logic with error handling and logging.
+ * Uses json_schema_to_grammar() from llama.cpp's common library.
  *
  * Architecture:
- * - Calls json_schema_to_grammar() from json-schema-to-grammar.hpp
+ * - Calls json_schema_to_grammar() from common/json-schema-to-grammar.h
  * - Adds error handling, logging, and consistent API
  * - Manages grammar sampler lifecycle
  *
@@ -54,10 +54,10 @@ inline std::string from_json_schema(const std::string &schema_json) {
     LLOYAL_LOG_DEBUG("[grammar::from_json_schema] Schema parsed, calling "
                      "json_schema_to_grammar");
 
-    // Call lloyal::json_schema_to_grammar from json-schema-to-grammar.hpp
+    // Call json_schema_to_grammar from llama.cpp common library
     // Parameters: (schema, force_gbnf)
     // force_gbnf=false allows EBNF optimization when possible
-    std::string grammar = lloyal::json_schema_to_grammar(schema, false);
+    std::string grammar = json_schema_to_grammar(schema, false);
 
     if (grammar.empty()) {
       LLOYAL_LOG_DEBUG("[grammar::from_json_schema] ERROR: Conversion produced "

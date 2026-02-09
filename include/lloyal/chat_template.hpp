@@ -13,30 +13,31 @@
  *
  * @section arch Architecture
  *
- * This module wraps lower-level helpers and adds:
+ * Uses llama.cpp's common library (chat.h) for template processing:
+ * - common_chat_templates_init(): Initialize templates from model
+ * - common_chat_templates_apply(): Apply template to messages
  * - Graceful degradation when template processing fails
  * - Turn separator extraction for warm prefill parity
- * - Clean FormatResult API for template formatting + stop token extraction
  *
  * @section deps Dependencies
- * - helpers.hpp: format_chat_template_complete(), validate_chat_template_helper()
+ * - common/chat.h: common_chat_templates_init, common_chat_templates_apply
  * - tokenizer.hpp: tokenize(), detokenize(), is_eog()
  *
  * @section fallback Fallback Hierarchy
  * 1. template_override (if provided)
  * 2. Model's built-in template (llama_model_chat_template)
- * 3. ChatML template (default)
+ * 3. ChatML template (default fallback in llama.cpp)
  * 4. Simple "role: content" format (last resort)
  *
- * @see lloyal::detail::format_chat_template_complete()
+ * @see common_chat_templates_init()
  * @see lloyal::tokenizer
  */
 
 #include "common.hpp"
-#include "helpers.hpp"
 #include "tokenizer.hpp"
 #include <llama/llama.h>
-#include "nlohmann/json.hpp"
+#include <chat.h>         // llama.cpp common library: common_chat_templates_*
+#include <nlohmann/json.hpp>
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -48,7 +49,7 @@ namespace lloyal::chat_template {
  *
  * Contains the formatted prompt text and any additional stop tokens
  * extracted from the template. Named FormatResult (not ChatTemplateResult)
- * to distinguish from helpers.hpp types.
+ * to distinguish from other types.
  */
 struct FormatResult {
   std::string prompt;                        ///< Formatted prompt text ready for tokenization
@@ -59,7 +60,7 @@ struct FormatResult {
  * @brief Format chat messages using model's chat template with fallback
  *
  * Orchestrates chat template processing with graceful degradation:
- * 1. Attempts format_chat_template_complete() from helpers.hpp
+ * 1. Attempts common_chat_templates_apply() from llama.cpp common
  * 2. Falls back to simple "role: content" format if template fails
  * 3. Returns empty result on JSON parsing errors (never throws)
  *
@@ -75,19 +76,13 @@ struct FormatResult {
  *
  * @note This function never throws. On error, returns empty prompt.
  *
- * @see lloyal::detail::format_chat_template_complete()
+ * @see common_chat_templates_apply()
  *
  * @code
  * // Basic usage (cold start)
  * auto result = chat_template::format(model, R"([{"role":"user","content":"Hi"}])");
  * const auto* vocab = llama_model_get_vocab(model);
  * auto tokens = tokenizer::tokenize(vocab, result.prompt, true, true);
- * // Note: tokenizer::tokenize(model, result.prompt) is simpler for cold start,
- * // but explicit params are shown here for consistency with warm continuation
- * // which requires add_bos=false (see get_turn_separator() example).
- *
- * // With custom template
- * auto custom_result = chat_template::format(model, messages_json, custom_template);
  * @endcode
  */
 inline FormatResult format(const llama_model *model,
@@ -96,58 +91,78 @@ inline FormatResult format(const llama_model *model,
   FormatResult result;
 
   try {
-    // Step 1: Call helpers.hpp function for template processing
-    // (This handles template selection, BOS/EOS tokens, and stop token
-    // extraction)
-    ChatTemplateResult helper_result =
-        format_chat_template_complete(model, messages_json, template_override);
+    // Parse JSON messages
+    using json = nlohmann::ordered_json;
+    json messages_array = json::parse(messages_json);
 
-    // Step 2: Check if template processing succeeded
-    if (helper_result.prompt.empty()) {
-      LLOYAL_LOG_DEBUG(
-          "[chat_template::format] Template processing failed, using fallback");
+    // Initialize templates from model (or override)
+    common_chat_templates_ptr tmpls = common_chat_templates_init(model, template_override);
+    if (!tmpls) {
+      LLOYAL_LOG_DEBUG("[chat_template::format] Template init failed, using fallback");
+      goto fallback;
+    }
 
-      // Step 3: Fallback to simple "role: content" format
-      try {
-        using json = nlohmann::ordered_json;
-        json messages = json::parse(messages_json);
-        std::string fallback;
-        for (const auto &msg : messages) {
-          if (msg.contains("role") && msg.contains("content")) {
-            fallback += msg["role"].get<std::string>() + ": " +
-                        msg["content"].get<std::string>() + "\n";
-          }
+    {
+      // Convert JSON to common_chat_msg vector
+      std::vector<common_chat_msg> messages;
+      for (const auto &msg : messages_array) {
+        common_chat_msg chat_msg;
+        if (msg.contains("role")) {
+          chat_msg.role = msg["role"].get<std::string>();
         }
+        if (msg.contains("content")) {
+          chat_msg.content = msg["content"].get<std::string>();
+        }
+        messages.push_back(chat_msg);
+      }
 
-        result.prompt = fallback;
-        result.additional_stops = {}; // No stop tokens for fallback
+      // Prepare template inputs
+      common_chat_templates_inputs inputs;
+      inputs.messages = messages;
+      inputs.add_generation_prompt = true;
+      inputs.use_jinja = true;
 
-        LLOYAL_LOG_DEBUG(
-            "[chat_template::format] Using fallback format (%zu bytes)",
-            fallback.size());
-        return result;
+      // Apply template
+      common_chat_params params = common_chat_templates_apply(tmpls.get(), inputs);
 
-      } catch (const std::exception &e) {
-        LLOYAL_LOG_DEBUG(
-            "[chat_template::format] ERROR: Failed to parse messages JSON: %s",
-            e.what());
-        result.prompt = "";
-        result.additional_stops = {};
-        return result;
+      result.prompt = params.prompt;
+      result.additional_stops = params.additional_stops;
+
+      LLOYAL_LOG_DEBUG(
+          "[chat_template::format] Successfully formatted with %zu stop tokens",
+          result.additional_stops.size());
+      return result;
+    }
+
+  } catch (const std::exception &e) {
+    LLOYAL_LOG_DEBUG("[chat_template::format] Template processing failed: %s", e.what());
+  }
+
+fallback:
+  // Fallback to simple "role: content" format
+  try {
+    using json = nlohmann::ordered_json;
+    json messages = json::parse(messages_json);
+    std::string fallback_prompt;
+    for (const auto &msg : messages) {
+      if (msg.contains("role") && msg.contains("content")) {
+        fallback_prompt += msg["role"].get<std::string>() + ": " +
+                    msg["content"].get<std::string>() + "\n";
       }
     }
 
-    // Step 4: Success - return formatted result
-    result.prompt = helper_result.prompt;
-    result.additional_stops = helper_result.additional_stops;
+    result.prompt = fallback_prompt;
+    result.additional_stops = {}; // No stop tokens for fallback
 
     LLOYAL_LOG_DEBUG(
-        "[chat_template::format] Successfully formatted with %zu stop tokens",
-        result.additional_stops.size());
+        "[chat_template::format] Using fallback format (%zu bytes)",
+        fallback_prompt.size());
     return result;
 
   } catch (const std::exception &e) {
-    LLOYAL_LOG_DEBUG("[chat_template::format] ERROR: %s", e.what());
+    LLOYAL_LOG_DEBUG(
+        "[chat_template::format] ERROR: Failed to parse messages JSON: %s",
+        e.what());
     result.prompt = "";
     result.additional_stops = {};
     return result;
@@ -167,7 +182,7 @@ inline FormatResult format(const llama_model *model,
  *
  * @note This function never throws. Returns false on any error.
  *
- * @see lloyal::detail::validate_chat_template_helper()
+ * @see common_chat_verify_template()
  *
  * @code
  * // Validate before using
@@ -181,8 +196,8 @@ inline FormatResult format(const llama_model *model,
  */
 inline bool validate(const std::string &template_str) {
   try {
-    // Call helpers.hpp validation function
-    bool isValid = validate_chat_template_helper(template_str);
+    // Use llama.cpp's common library validation
+    bool isValid = common_chat_verify_template(template_str, /* use_jinja */ true);
     LLOYAL_LOG_DEBUG("[chat_template::validate] Template validation: %s",
                      isValid ? "valid" : "invalid");
     return isValid;
@@ -219,6 +234,21 @@ inline std::vector<llama_token> fallback_to_eog(const llama_model* model) {
     return {eot};
   }
   return {};
+}
+
+/**
+ * @brief Get token text safely
+ *
+ * @param model Llama model pointer
+ * @param token Token ID
+ * @return Token text, or empty string if invalid
+ */
+inline std::string get_token_safe(const llama_model *model, llama_token token) {
+  if (!model || token == LLAMA_TOKEN_NULL) {
+    return "";
+  }
+  const auto *vocab = llama_model_get_vocab(model);
+  return lloyal::tokenizer::detokenize(model, token);
 }
 
 /**
@@ -281,95 +311,93 @@ inline std::vector<llama_token> get_turn_separator(const llama_model* model) {
 
   if (!model) return {};
 
-  // Resolve template
-  std::string template_str;
-  const char* model_template = llama_model_chat_template(model, nullptr);
-  if (model_template && strlen(model_template) > 0) {
-    template_str = model_template;
-  }
-  if (template_str.empty()) {
-    template_str = lloyal::detail::get_chatml_template();
-  }
-
-  // Extract BOS/EOS tokens
-  const auto* vocab = llama_model_get_vocab(model);
-  std::string bos_token = lloyal::detail::get_token_safe(model, llama_vocab_bos(vocab));
-  std::string eos_token = lloyal::detail::get_token_safe(model, llama_vocab_eos(vocab));
-  bool add_bos = llama_vocab_get_add_bos(vocab);
-
   // Collision-resistant sentinels
   const std::string SENTINEL = "\x1F__LLOYAL_SEP__\x1F";
   const std::string SENTINEL2 = "\x1F__LLOYAL_SEP2__\x1F";
 
-  // 3-message probe: captures REAL assistant→user boundary
-  json messages = json::array({
-    {{"role", "user"}, {"content", "X"}},
-    {{"role", "assistant"}, {"content", SENTINEL}},
-    {{"role", "user"}, {"content", SENTINEL2}}
-  });
+  try {
+    // Initialize templates from model
+    common_chat_templates_ptr tmpls = common_chat_templates_init(model, "");
+    if (!tmpls) {
+      return fallback_to_eog(model);
+    }
 
-  std::string formatted = lloyal::detail::apply_chat_template_helper(
-      template_str, messages, bos_token, eos_token,
-      false,    // add_generation_prompt=false
-      add_bos,
-      false     // add_eos=false — turn boundary, not sequence end
-  );
+    // 3-message probe: captures REAL assistant→user boundary
+    std::vector<common_chat_msg> messages = {
+      {.role = "user", .content = "X"},
+      {.role = "assistant", .content = SENTINEL},
+      {.role = "user", .content = SENTINEL2}
+    };
 
-  // Extract substring between sentinels
-  size_t sep_start = formatted.rfind(SENTINEL);
-  if (sep_start == std::string::npos) {
-    return fallback_to_eog(model);
-  }
-  sep_start += SENTINEL.length();
+    common_chat_templates_inputs inputs;
+    inputs.messages = messages;
+    inputs.add_generation_prompt = false;  // Don't add assistant prompt at end
+    inputs.use_jinja = true;
 
-  size_t sep_end = formatted.find(SENTINEL2, sep_start);
-  if (sep_end == std::string::npos) {
-    return fallback_to_eog(model);
-  }
+    auto params = common_chat_templates_apply(tmpls.get(), inputs);
+    const std::string& formatted = params.prompt;
 
-  std::string between = formatted.substr(sep_start, sep_end - sep_start);
-  if (between.empty()) {
-    return fallback_to_eog(model);
-  }
+    // Extract substring between sentinels
+    size_t sep_start = formatted.rfind(SENTINEL);
+    if (sep_start == std::string::npos) {
+      return fallback_to_eog(model);
+    }
+    sep_start += SENTINEL.length();
 
-  // Tokenize with parse_special=true
-  std::vector<llama_token> tokens = lloyal::tokenizer::tokenize(vocab, between, false, true);
-  if (tokens.empty()) {
-    return fallback_to_eog(model);
-  }
+    size_t sep_end = formatted.find(SENTINEL2, sep_start);
+    if (sep_end == std::string::npos) {
+      return fallback_to_eog(model);
+    }
 
-  // Extract: everything up to and including EOG + trailing whitespace
-  std::vector<llama_token> separator;
-  bool found_eog = false;
+    std::string between = formatted.substr(sep_start, sep_end - sep_start);
+    if (between.empty()) {
+      return fallback_to_eog(model);
+    }
 
-  for (auto tok : tokens) {
-    if (!found_eog) {
-      separator.push_back(tok);
-      if (lloyal::tokenizer::is_eog(model, tok)) {
-        found_eog = true;
-      }
-    } else {
-      // After EOG, only keep whitespace tokens
-      // NOTE: Only ASCII whitespace is checked. Unicode whitespace (NBSP, zero-width,
-      // etc.) is not handled because chat templates universally use ASCII whitespace
-      // for turn boundaries. If a template used Unicode whitespace, those tokens would
-      // be treated as the next message opener and excluded from the separator.
-      std::string text = lloyal::tokenizer::detokenize(model, tok);
-      bool is_whitespace = !text.empty() && std::all_of(text.begin(), text.end(),
-          [](unsigned char c) { return c == ' ' || c == '\n' || c == '\r' || c == '\t'; });
-      if (is_whitespace) {
+    // Tokenize with parse_special=true
+    const auto* vocab = llama_model_get_vocab(model);
+    std::vector<llama_token> tokens = lloyal::tokenizer::tokenize(vocab, between, false, true);
+    if (tokens.empty()) {
+      return fallback_to_eog(model);
+    }
+
+    // Extract: everything up to and including EOG + trailing whitespace
+    std::vector<llama_token> separator;
+    bool found_eog = false;
+
+    for (auto tok : tokens) {
+      if (!found_eog) {
         separator.push_back(tok);
+        if (lloyal::tokenizer::is_eog(model, tok)) {
+          found_eog = true;
+        }
       } else {
-        break;  // Non-whitespace = next message opener, stop
+        // After EOG, only keep whitespace tokens
+        // NOTE: Only ASCII whitespace is checked. Unicode whitespace (NBSP, zero-width,
+        // etc.) is not handled because chat templates universally use ASCII whitespace
+        // for turn boundaries. If a template used Unicode whitespace, those tokens would
+        // be treated as the next message opener and excluded from the separator.
+        std::string text = lloyal::tokenizer::detokenize(model, tok);
+        bool is_whitespace = !text.empty() && std::all_of(text.begin(), text.end(),
+            [](unsigned char c) { return c == ' ' || c == '\n' || c == '\r' || c == '\t'; });
+        if (is_whitespace) {
+          separator.push_back(tok);
+        } else {
+          break;  // Non-whitespace = next message opener, stop
+        }
       }
     }
-  }
 
-  if (separator.empty() || !found_eog) {
+    if (separator.empty() || !found_eog) {
+      return fallback_to_eog(model);
+    }
+
+    return separator;
+
+  } catch (const std::exception& e) {
+    LLOYAL_LOG_DEBUG("[chat_template::get_turn_separator] Error: %s", e.what());
     return fallback_to_eog(model);
   }
-
-  return separator;
 }
 
 } // namespace lloyal::chat_template

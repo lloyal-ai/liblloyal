@@ -44,6 +44,29 @@ target_include_directories(liblloyal INTERFACE
 )
 
 # =============================================================================
+# llama.cpp Common Library Include Path
+# =============================================================================
+# When building with LLAMA_BUILD_COMMON=ON, add paths for:
+#   - common/*.h headers (chat.h, common.h, json-schema-to-grammar.h)
+#   - vendor/nlohmann/* for JSON support
+
+if(TARGET common)
+    # Get llama.cpp source directory from the llama target
+    get_target_property(LLAMA_INCLUDE_DIRS llama INTERFACE_INCLUDE_DIRECTORIES)
+    foreach(dir ${LLAMA_INCLUDE_DIRS})
+        if(EXISTS "${dir}/llama.h")
+            get_filename_component(LLAMA_CPP_ROOT "${dir}" DIRECTORY)
+            target_include_directories(liblloyal INTERFACE
+                $<BUILD_INTERFACE:${LLAMA_CPP_ROOT}/common>
+                $<BUILD_INTERFACE:${LLAMA_CPP_ROOT}/vendor>
+            )
+            message(STATUS "liblloyal: Added common library includes from ${LLAMA_CPP_ROOT}")
+            break()
+        endif()
+    endforeach()
+endif()
+
+# =============================================================================
 # Dependencies
 # =============================================================================
 

@@ -38,11 +38,21 @@ add_executable(TestRunner
   stubs/llama_stubs.cpp
 )
 
+# Find nlohmann/json.hpp from llama.cpp vendor (needed by liblloyal headers)
+# Can be overridden via -DNLOHMANN_JSON_DIR=/path/to/nlohmann
+if(NOT DEFINED NLOHMANN_JSON_DIR)
+  # Default: lloyal.node structure
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../llama.cpp/vendor")
+    set(NLOHMANN_JSON_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../llama.cpp/vendor")
+  endif()
+endif()
+
 # Include directories
 # IMPORTANT: stubs/ must come BEFORE llama headers so our mock llama/llama.h is found first
 target_include_directories(TestRunner PRIVATE
   ./stubs                       # Mock llama.cpp (must be first!)
   ../include                    # liblloyal headers (<lloyal/*.hpp>)
+  ${NLOHMANN_JSON_DIR}          # nlohmann/json.hpp from llama.cpp vendor
 )
 
 # Link doctest
@@ -107,8 +117,8 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
   # Configure llama.cpp paths
   # Can be overridden via -DLLAMA_CPP_DIR=/path/to/llama.cpp
   if(NOT DEFINED LLAMA_CPP_DIR)
-    # Default: lloyal.node structure (../../vendor/llama.cpp)
-    set(LLAMA_CPP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../vendor/llama.cpp")
+    # Default: lloyal.node structure (../../llama.cpp)
+    set(LLAMA_CPP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../llama.cpp")
   endif()
 
   # Determine build directory
@@ -168,15 +178,55 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
       ${CMAKE_CURRENT_BINARY_DIR}/include/llama/ggml.h
   )
 
+  # Common library paths
+  set(LLAMA_CPP_COMMON_DIR "${LLAMA_CPP_DIR}/common")
+  set(LLAMA_CPP_VENDOR_DIR "${LLAMA_CPP_DIR}/vendor")
+
   target_include_directories(IntegrationRunner PRIVATE
     ../include                              # liblloyal headers
     ${CMAKE_CURRENT_BINARY_DIR}/include     # For llama/llama.h
     ${LLAMA_CPP_INCLUDE_DIR}                # llama.cpp headers
     ${GGML_INCLUDE_DIR}                     # ggml headers
+    ${LLAMA_CPP_COMMON_DIR}                 # common library headers (common.h, chat.h, etc.)
+    ${LLAMA_CPP_VENDOR_DIR}                 # vendor headers (nlohmann/json.hpp)
   )
 
+  # Find common library (static)
+  # lloyal-node builds to: build/llama.cpp/common/libcommon.a (parent of Release/)
+  # Standalone llama.cpp builds to: build/common/libcommon.a
+  get_filename_component(LLAMA_BUILD_PARENT "${LLAMA_CPP_DYLIB_DIR}" DIRECTORY)
+
+  find_library(LLAMA_COMMON_LIB
+    NAMES common libcommon
+    PATHS
+      ${LLAMA_BUILD_PARENT}/llama.cpp/common   # lloyal-node: build/llama.cpp/common
+      ${LLAMA_CPP_DYLIB_DIR}/llama.cpp/common  # alternative
+      ${LLAMA_CPP_DYLIB_DIR}/common            # standalone llama.cpp
+      ${LLAMA_CPP_DYLIB_DIR}
+    NO_DEFAULT_PATH
+  )
+
+  if(NOT LLAMA_COMMON_LIB)
+    # Fallback to expected paths
+    if(EXISTS "${LLAMA_BUILD_PARENT}/llama.cpp/common/libcommon.a")
+      set(LLAMA_COMMON_LIB "${LLAMA_BUILD_PARENT}/llama.cpp/common/libcommon.a")
+    elseif(EXISTS "${LLAMA_CPP_DYLIB_DIR}/llama.cpp/common/libcommon.a")
+      set(LLAMA_COMMON_LIB "${LLAMA_CPP_DYLIB_DIR}/llama.cpp/common/libcommon.a")
+    elseif(EXISTS "${LLAMA_CPP_DYLIB_DIR}/common/libcommon.a")
+      set(LLAMA_COMMON_LIB "${LLAMA_CPP_DYLIB_DIR}/common/libcommon.a")
+    elseif(EXISTS "${LLAMA_CPP_DYLIB_DIR}/libcommon.a")
+      set(LLAMA_COMMON_LIB "${LLAMA_CPP_DYLIB_DIR}/libcommon.a")
+    endif()
+  endif()
+
+  message(STATUS "Common library: ${LLAMA_COMMON_LIB}")
+
+  # Link order matters: common (static) needs symbols from llama/ggml (dynamic)
   target_link_libraries(IntegrationRunner PRIVATE
+    ${LLAMA_COMMON_LIB}
     ${LLAMA_CPP_DYLIB_DIR}/libllama.dylib
+    ${LLAMA_CPP_DYLIB_DIR}/libggml.dylib
+    ${LLAMA_CPP_DYLIB_DIR}/libggml-base.dylib
     doctest::doctest
   )
 
