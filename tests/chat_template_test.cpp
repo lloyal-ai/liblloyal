@@ -46,15 +46,16 @@ TEST_CASE("ChatTemplate: format with empty messages") {
   resetTestConfig();
 
   llama_model model{};
-  llama_vocab vocab{};
 
   json messages = json::array();
 
   auto result = lloyal::chat_template::format(&model, messages.dump());
 
-  // Empty messages should produce a result (may be empty or contain just prompt)
-  // The important thing is it doesn't crash
-  CHECK(true);
+  // Empty messages should produce empty or minimal result
+  // No stop tokens should be extracted from empty input
+  CHECK(result.additional_stops.empty());
+  // Prompt may be empty or contain just generation prompt prefix (model-dependent)
+  // The key contract: it doesn't crash and returns a valid FormatResult
 }
 
 TEST_CASE("ChatTemplate: format with null model") {

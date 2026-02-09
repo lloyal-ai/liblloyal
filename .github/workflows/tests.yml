@@ -18,11 +18,14 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y cmake build-essential
+        sudo apt-get install -y cmake build-essential nlohmann-json3-dev
 
     - name: Configure CMake
       working-directory: tests
-      run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      run: |
+        # Use system-installed nlohmann-json
+        cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+          -DNLOHMANN_JSON_DIR=/usr/include
 
     - name: Build tests
       working-directory: tests
@@ -44,14 +47,15 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y cmake build-essential
+        sudo apt-get install -y cmake build-essential nlohmann-json3-dev
 
     - name: Configure CMake with sanitizers
       working-directory: tests
       run: |
         cmake -S . -B build_san \
           -DCMAKE_BUILD_TYPE=Debug \
-          -DLLOYAL_ENABLE_SANITIZERS=ON
+          -DLLOYAL_ENABLE_SANITIZERS=ON \
+          -DNLOHMANN_JSON_DIR=/usr/include
 
     - name: Build tests with sanitizers
       working-directory: tests
@@ -83,14 +87,15 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y cmake build-essential
+        sudo apt-get install -y cmake build-essential nlohmann-json3-dev
 
     - name: Configure CMake with LLOYAL_STACK_BATCH=0
       working-directory: tests
       run: |
         cmake -S . -B build_abi_safe \
           -DCMAKE_BUILD_TYPE=Release \
-          -DCMAKE_CXX_FLAGS="-DLLOYAL_STACK_BATCH=0"
+          -DCMAKE_CXX_FLAGS="-DLLOYAL_STACK_BATCH=0" \
+          -DNLOHMANN_JSON_DIR=/usr/include
 
     - name: Build tests with safe batch path
       working-directory: tests
@@ -255,10 +260,8 @@ jobs:
 
     - name: Check formatting
       run: |
-        # Exclude vendored libraries and build artifacts from formatting checks
+        # Exclude build artifacts from formatting checks
         find include/ tests/ \( -name '*.hpp' -o -name '*.cpp' \) \
-          -not -path '*/nlohmann/*' \
-          -not -path '*/minja/*' \
           -not -path '*/build/*' \
           -not -path '*/build_*/*' \
           -not -path '*/_deps/*' \

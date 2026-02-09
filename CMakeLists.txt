@@ -51,19 +51,23 @@ target_include_directories(liblloyal INTERFACE
 #   - vendor/nlohmann/* for JSON support
 
 if(TARGET common)
-    # Get llama.cpp source directory from the llama target
-    get_target_property(LLAMA_INCLUDE_DIRS llama INTERFACE_INCLUDE_DIRECTORIES)
-    foreach(dir ${LLAMA_INCLUDE_DIRS})
-        if(EXISTS "${dir}/llama.h")
-            get_filename_component(LLAMA_CPP_ROOT "${dir}" DIRECTORY)
-            target_include_directories(liblloyal INTERFACE
-                $<BUILD_INTERFACE:${LLAMA_CPP_ROOT}/common>
-                $<BUILD_INTERFACE:${LLAMA_CPP_ROOT}/vendor>
-            )
-            message(STATUS "liblloyal: Added common library includes from ${LLAMA_CPP_ROOT}")
-            break()
-        endif()
-    endforeach()
+    if(TARGET llama)
+        # Get llama.cpp source directory from the llama target
+        get_target_property(LLAMA_INCLUDE_DIRS llama INTERFACE_INCLUDE_DIRECTORIES)
+        foreach(dir ${LLAMA_INCLUDE_DIRS})
+            if(EXISTS "${dir}/llama.h")
+                get_filename_component(LLAMA_CPP_ROOT "${dir}" DIRECTORY)
+                target_include_directories(liblloyal INTERFACE
+                    $<BUILD_INTERFACE:${LLAMA_CPP_ROOT}/common>
+                    $<BUILD_INTERFACE:${LLAMA_CPP_ROOT}/vendor>
+                )
+                message(STATUS "liblloyal: Added common library includes from ${LLAMA_CPP_ROOT}")
+                break()
+            endif()
+        endforeach()
+    endif()
+    # Link common library so consumers get symbols for common_chat_*, json_schema_to_grammar, etc.
+    target_link_libraries(liblloyal INTERFACE common)
 endif()
 
 # =============================================================================

@@ -47,6 +47,15 @@ if(NOT DEFINED NLOHMANN_JSON_DIR)
   endif()
 endif()
 
+# Validate nlohmann/json.hpp is available
+if(NOT NLOHMANN_JSON_DIR OR NOT EXISTS "${NLOHMANN_JSON_DIR}/nlohmann/json.hpp")
+  message(FATAL_ERROR
+    "nlohmann/json.hpp not found. Either:\n"
+    "  1. Set -DNLOHMANN_JSON_DIR=/path/to/dir containing nlohmann/\n"
+    "  2. Install system package: apt install nlohmann-json3-dev\n"
+    "  3. Ensure llama.cpp vendor directory exists at ../../llama.cpp/vendor")
+endif()
+
 # Include directories
 # IMPORTANT: stubs/ must come BEFORE llama headers so our mock llama/llama.h is found first
 target_include_directories(TestRunner PRIVATE
@@ -207,26 +216,62 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
   )
 
   if(NOT LLAMA_COMMON_LIB)
-    # Fallback to expected paths
-    if(EXISTS "${LLAMA_BUILD_PARENT}/llama.cpp/common/libcommon.a")
-      set(LLAMA_COMMON_LIB "${LLAMA_BUILD_PARENT}/llama.cpp/common/libcommon.a")
-    elseif(EXISTS "${LLAMA_CPP_DYLIB_DIR}/llama.cpp/common/libcommon.a")
-      set(LLAMA_COMMON_LIB "${LLAMA_CPP_DYLIB_DIR}/llama.cpp/common/libcommon.a")
-    elseif(EXISTS "${LLAMA_CPP_DYLIB_DIR}/common/libcommon.a")
-      set(LLAMA_COMMON_LIB "${LLAMA_CPP_DYLIB_DIR}/common/libcommon.a")
-    elseif(EXISTS "${LLAMA_CPP_DYLIB_DIR}/libcommon.a")
-      set(LLAMA_COMMON_LIB "${LLAMA_CPP_DYLIB_DIR}/libcommon.a")
-    endif()
+    # Fallback to expected paths (cross-platform static lib names)
+    set(_COMMON_PATHS
+      "${LLAMA_BUILD_PARENT}/llama.cpp/common"
+      "${LLAMA_CPP_DYLIB_DIR}/llama.cpp/common"
+      "${LLAMA_CPP_DYLIB_DIR}/common"
+      "${LLAMA_CPP_DYLIB_DIR}"
+    )
+    foreach(_path ${_COMMON_PATHS})
+      if(EXISTS "${_path}/libcommon.a")
+        set(LLAMA_COMMON_LIB "${_path}/libcommon.a")
+        break()
+      elseif(EXISTS "${_path}/common.lib")
+        set(LLAMA_COMMON_LIB "${_path}/common.lib")
+        break()
+      endif()
+    endforeach()
+  endif()
+
+  # Validate common library was found
+  if(NOT LLAMA_COMMON_LIB)
+    message(FATAL_ERROR
+      "libcommon not found. Ensure llama.cpp was built with LLAMA_BUILD_COMMON=ON.\n"
+      "Searched paths:\n"
+      "  - ${LLAMA_BUILD_PARENT}/llama.cpp/common\n"
+      "  - ${LLAMA_CPP_DYLIB_DIR}/common\n"
+      "  - ${LLAMA_CPP_DYLIB_DIR}")
   endif()
 
   message(STATUS "Common library: ${LLAMA_COMMON_LIB}")
 
-  # Link order matters: common (static) needs symbols from llama/ggml (dynamic)
+  # Find llama library (cross-platform)
+  find_library(LLAMA_LIB
+    NAMES llama
+    PATHS ${LLAMA_CPP_DYLIB_DIR}
+    NO_DEFAULT_PATH
+  )
+  if(NOT LLAMA_LIB)
+    # Fallback: construct expected path
+    set(LLAMA_LIB "${LLAMA_CPP_DYLIB_DIR}/libllama${CMAKE_SHARED_LIBRARY_SUFFIX}")
+  endif()
+
+  # Find ggml libraries if separate (lloyal-node structure has separate dylibs)
+  find_library(GGML_LIB NAMES ggml PATHS ${LLAMA_CPP_DYLIB_DIR} NO_DEFAULT_PATH)
+  find_library(GGML_BASE_LIB NAMES ggml-base PATHS ${LLAMA_CPP_DYLIB_DIR} NO_DEFAULT_PATH)
+
+  set(LLAMA_LIBS ${LLAMA_LIB})
+  if(GGML_LIB)
+    list(APPEND LLAMA_LIBS ${GGML_LIB})
+  endif()
+  if(GGML_BASE_LIB)
+    list(APPEND LLAMA_LIBS ${GGML_BASE_LIB})
+  endif()
+
   target_link_libraries(IntegrationRunner PRIVATE
     ${LLAMA_COMMON_LIB}
-    ${LLAMA_CPP_DYLIB_DIR}/libllama.dylib
-    ${LLAMA_CPP_DYLIB_DIR}/libggml.dylib
-    ${LLAMA_CPP_DYLIB_DIR}/libggml-base.dylib
+    ${LLAMA_LIBS}
     doctest::doctest
   )
 

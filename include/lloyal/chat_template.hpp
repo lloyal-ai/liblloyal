@@ -111,7 +111,16 @@ inline FormatResult format(const llama_model *model,
           chat_msg.role = msg["role"].get<std::string>();
         }
         if (msg.contains("content")) {
-          chat_msg.content = msg["content"].get<std::string>();
+          const auto& content = msg["content"];
+          if (content.is_null()) {
+            // Tool calls have null content
+            chat_msg.content = "";
+          } else if (content.is_string()) {
+            chat_msg.content = content.get<std::string>();
+          } else {
+            // Structured content (array of text/image parts) - serialize as JSON
+            chat_msg.content = content.dump();
+          }
         }
         messages.push_back(chat_msg);
       }
@@ -146,8 +155,17 @@ fallback:
     std::string fallback_prompt;
     for (const auto &msg : messages) {
       if (msg.contains("role") && msg.contains("content")) {
-        fallback_prompt += msg["role"].get<std::string>() + ": " +
-                    msg["content"].get<std::string>() + "\n";
+        std::string role = msg["role"].get<std::string>();
+        std::string content;
+        const auto& c = msg["content"];
+        if (c.is_null()) {
+          content = "";
+        } else if (c.is_string()) {
+          content = c.get<std::string>();
+        } else {
+          content = c.dump();
+        }
+        fallback_prompt += role + ": " + content + "\n";
       }
     }
 
@@ -247,7 +265,6 @@ inline std::string get_token_safe(const llama_model *model, llama_token token) {
   if (!model || token == LLAMA_TOKEN_NULL) {
     return "";
   }
-  const auto *vocab = llama_model_get_vocab(model);
   return lloyal::tokenizer::detokenize(model, token);
 }
 
