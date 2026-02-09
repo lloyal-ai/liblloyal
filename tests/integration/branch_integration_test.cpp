@@ -12,6 +12,7 @@
  * - RAII Branch wrapper cleanup
  */
 
+#include <cmath>
 #include <cstdlib>
 #include <cstddef>
 #include <doctest/doctest.h>
