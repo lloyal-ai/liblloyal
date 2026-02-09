@@ -205,6 +205,7 @@ jobs:
         cmake -S . -B build_integration \
           -DLLOYAL_BUILD_INTEGRATION_TESTS=ON \
           -DLLAMA_CPP_DIR=${{ github.workspace }}/llama.cpp \
+          -DNLOHMANN_JSON_DIR=/usr/include \
           -DCMAKE_BUILD_TYPE=Release
 
     - name: Build integration tests

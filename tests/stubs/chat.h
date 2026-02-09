@@ -9,8 +9,8 @@
 #include <string>
 #include <vector>
 
-// Forward declaration
-struct common_chat_templates;
+// Template storage (needs to be complete type before make_unique is called)
+struct common_chat_templates {};
 
 // Smart pointer type for templates
 using common_chat_templates_ptr = std::unique_ptr<common_chat_templates>;
@@ -87,6 +87,3 @@ inline bool common_chat_verify_template(
 
   return has_jinja && balanced;
 }
-
-// Empty struct definition (only needs to exist for unique_ptr)
-struct common_chat_templates {};
