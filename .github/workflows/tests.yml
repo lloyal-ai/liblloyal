@@ -18,11 +18,14 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y cmake build-essential
+        sudo apt-get install -y cmake build-essential nlohmann-json3-dev
 
     - name: Configure CMake
       working-directory: tests
-      run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      run: |
+        # Use system-installed nlohmann-json
+        cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+          -DNLOHMANN_JSON_DIR=/usr/include
 
     - name: Build tests
       working-directory: tests
@@ -44,14 +47,15 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y cmake build-essential
+        sudo apt-get install -y cmake build-essential nlohmann-json3-dev
 
     - name: Configure CMake with sanitizers
       working-directory: tests
       run: |
         cmake -S . -B build_san \
           -DCMAKE_BUILD_TYPE=Debug \
-          -DLLOYAL_ENABLE_SANITIZERS=ON
+          -DLLOYAL_ENABLE_SANITIZERS=ON \
+          -DNLOHMANN_JSON_DIR=/usr/include
 
     - name: Build tests with sanitizers
       working-directory: tests
@@ -83,14 +87,15 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y cmake build-essential
+        sudo apt-get install -y cmake build-essential nlohmann-json3-dev
 
     - name: Configure CMake with LLOYAL_STACK_BATCH=0
       working-directory: tests
       run: |
         cmake -S . -B build_abi_safe \
           -DCMAKE_BUILD_TYPE=Release \
-          -DCMAKE_CXX_FLAGS="-DLLOYAL_STACK_BATCH=0"
+          -DCMAKE_CXX_FLAGS="-DLLOYAL_STACK_BATCH=0" \
+          -DNLOHMANN_JSON_DIR=/usr/include
 
     - name: Build tests with safe batch path
       working-directory: tests
@@ -103,12 +108,17 @@ jobs:
         # Run decoder tests to verify decode_one() works with thread_local batch
         ./build_abi_safe/TestRunner --success --test-case="*decoder*"
 
-  integration-tests-macos:
-    name: Integration Tests (macOS)
-    runs-on: macos-latest
+  integration-tests:
+    name: Integration Tests (Linux)
+    runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake build-essential nlohmann-json3-dev
 
     - name: Read llama.cpp version
       id: llama_version
@@ -127,9 +137,9 @@ jobs:
       uses: actions/cache@v4
       with:
         path: llama.cpp/build
-        key: llama-macos-${{ runner.arch }}-${{ steps.llama_version.outputs.version }}
+        key: llama-linux-${{ runner.arch }}-${{ steps.llama_version.outputs.version }}
         restore-keys: |
-          llama-macos-${{ runner.arch }}-
+          llama-linux-${{ runner.arch }}-
 
     - name: Build llama.cpp
       run: |
@@ -195,6 +205,7 @@ jobs:
         cmake -S . -B build_integration \
           -DLLOYAL_BUILD_INTEGRATION_TESTS=ON \
           -DLLAMA_CPP_DIR=${{ github.workspace }}/llama.cpp \
+          -DNLOHMANN_JSON_DIR=/usr/include \
           -DCMAKE_BUILD_TYPE=Release
 
     - name: Build integration tests
@@ -255,10 +266,8 @@ jobs:
 
     - name: Check formatting
       run: |
-        # Exclude vendored libraries and build artifacts from formatting checks
+        # Exclude build artifacts from formatting checks
         find include/ tests/ \( -name '*.hpp' -o -name '*.cpp' \) \
-          -not -path '*/nlohmann/*' \
-          -not -path '*/minja/*' \
           -not -path '*/build/*' \
           -not -path '*/build_*/*' \
           -not -path '*/_deps/*' \
@@ -268,7 +277,7 @@ jobs:
   summary:
     name: Test Summary
     runs-on: ubuntu-latest
-    needs: [unit-tests, sanitizer-tests, abi-safe-path-tests, integration-tests-macos, lint]
+    needs: [unit-tests, sanitizer-tests, abi-safe-path-tests, integration-tests, lint]
     if: always()
 
     steps:
@@ -278,7 +287,7 @@ jobs:
         echo "Unit Tests: ${{ needs.unit-tests.result }}"
         echo "Sanitizer Tests: ${{ needs.sanitizer-tests.result }}"
         echo "ABI Safe Path Tests: ${{ needs.abi-safe-path-tests.result }}"
-        echo "Integration Tests (macOS): ${{ needs.integration-tests-macos.result }}"
+        echo "Integration Tests (Linux): ${{ needs.integration-tests.result }}"
         echo "Lint: ${{ needs.lint.result }}"
 
         FAILED=0
@@ -298,7 +307,7 @@ jobs:
           FAILED=1
         fi
 
-        if [ "${{ needs.integration-tests-macos.result }}" != "success" ]; then
+        if [ "${{ needs.integration-tests.result }}" != "success" ]; then
           echo "❌ Integration tests failed"
           FAILED=1
         fi

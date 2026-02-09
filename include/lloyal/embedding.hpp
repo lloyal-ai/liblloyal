@@ -4,7 +4,7 @@
 // Copyright 2026 Lloyal Labs
 
 #include "common.hpp"
-#include "helpers.hpp"
+#include <common.h>  // llama.cpp common library: common_batch_clear, common_batch_add
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -226,12 +226,12 @@ inline void encode(llama_context *ctx, const llama_token *tokens,
   llama_batch batch = llama_batch_init(n_batch, 0, 1);
   detail::BatchGuard batch_guard(batch);
 
-  // Clear batch
-  lloyal::batch_clear(batch);
+  // Clear batch using llama.cpp common library
+  common_batch_clear(batch);
 
   // Add ALL tokens with logits=true (required for embedding extraction)
   for (int32_t i = 0; i < n_tokens; ++i) {
-    lloyal::batch_add(batch, tokens[i], i, {0}, true, n_batch);
+    common_batch_add(batch, tokens[i], i, {0}, true);
   }
 
   // Decode/encode the batch (llama.cpp handles encoder vs decoder internally)

@@ -38,11 +38,30 @@ add_executable(TestRunner
   stubs/llama_stubs.cpp
 )
 
+# Find nlohmann/json.hpp from llama.cpp vendor (needed by liblloyal headers)
+# Can be overridden via -DNLOHMANN_JSON_DIR=/path/to/nlohmann
+if(NOT DEFINED NLOHMANN_JSON_DIR)
+  # Default: lloyal.node structure
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../llama.cpp/vendor")
+    set(NLOHMANN_JSON_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../llama.cpp/vendor")
+  endif()
+endif()
+
+# Validate nlohmann/json.hpp is available
+if(NOT NLOHMANN_JSON_DIR OR NOT EXISTS "${NLOHMANN_JSON_DIR}/nlohmann/json.hpp")
+  message(FATAL_ERROR
+    "nlohmann/json.hpp not found. Either:\n"
+    "  1. Set -DNLOHMANN_JSON_DIR=/path/to/dir containing nlohmann/\n"
+    "  2. Install system package: apt install nlohmann-json3-dev\n"
+    "  3. Ensure llama.cpp vendor directory exists at ../../llama.cpp/vendor")
+endif()
+
 # Include directories
 # IMPORTANT: stubs/ must come BEFORE llama headers so our mock llama/llama.h is found first
 target_include_directories(TestRunner PRIVATE
   ./stubs                       # Mock llama.cpp (must be first!)
   ../include                    # liblloyal headers (<lloyal/*.hpp>)
+  ${NLOHMANN_JSON_DIR}          # nlohmann/json.hpp from llama.cpp vendor
 )
 
 # Link doctest
@@ -107,8 +126,8 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
   # Configure llama.cpp paths
   # Can be overridden via -DLLAMA_CPP_DIR=/path/to/llama.cpp
   if(NOT DEFINED LLAMA_CPP_DIR)
-    # Default: lloyal.node structure (../../vendor/llama.cpp)
-    set(LLAMA_CPP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../vendor/llama.cpp")
+    # Default: lloyal.node structure (../../llama.cpp)
+    set(LLAMA_CPP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../llama.cpp")
   endif()
 
   # Determine build directory
@@ -168,15 +187,91 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
       ${CMAKE_CURRENT_BINARY_DIR}/include/llama/ggml.h
   )
 
+  # Common library paths
+  set(LLAMA_CPP_COMMON_DIR "${LLAMA_CPP_DIR}/common")
+  set(LLAMA_CPP_VENDOR_DIR "${LLAMA_CPP_DIR}/vendor")
+
   target_include_directories(IntegrationRunner PRIVATE
     ../include                              # liblloyal headers
     ${CMAKE_CURRENT_BINARY_DIR}/include     # For llama/llama.h
     ${LLAMA_CPP_INCLUDE_DIR}                # llama.cpp headers
     ${GGML_INCLUDE_DIR}                     # ggml headers
+    ${LLAMA_CPP_COMMON_DIR}                 # common library headers (common.h, chat.h, etc.)
+    ${LLAMA_CPP_VENDOR_DIR}                 # vendor headers (nlohmann/json.hpp)
   )
 
+  # Find common library (static)
+  # lloyal-node builds to: build/llama.cpp/common/libcommon.a (parent of Release/)
+  # Standalone llama.cpp builds to: build/common/libcommon.a
+  get_filename_component(LLAMA_BUILD_PARENT "${LLAMA_CPP_DYLIB_DIR}" DIRECTORY)
+
+  find_library(LLAMA_COMMON_LIB
+    NAMES common libcommon
+    PATHS
+      ${LLAMA_BUILD_PARENT}/llama.cpp/common   # lloyal-node: build/llama.cpp/common
+      ${LLAMA_CPP_DYLIB_DIR}/llama.cpp/common  # alternative
+      ${LLAMA_CPP_DYLIB_DIR}/common            # standalone llama.cpp
+      ${LLAMA_CPP_DYLIB_DIR}
+    NO_DEFAULT_PATH
+  )
+
+  if(NOT LLAMA_COMMON_LIB)
+    # Fallback to expected paths (cross-platform static lib names)
+    set(_COMMON_PATHS
+      "${LLAMA_BUILD_PARENT}/llama.cpp/common"
+      "${LLAMA_CPP_DYLIB_DIR}/llama.cpp/common"
+      "${LLAMA_CPP_DYLIB_DIR}/common"
+      "${LLAMA_CPP_DYLIB_DIR}"
+    )
+    foreach(_path ${_COMMON_PATHS})
+      if(EXISTS "${_path}/libcommon.a")
+        set(LLAMA_COMMON_LIB "${_path}/libcommon.a")
+        break()
+      elseif(EXISTS "${_path}/common.lib")
+        set(LLAMA_COMMON_LIB "${_path}/common.lib")
+        break()
+      endif()
+    endforeach()
+  endif()
+
+  # Validate common library was found
+  if(NOT LLAMA_COMMON_LIB)
+    message(FATAL_ERROR
+      "libcommon not found. Ensure llama.cpp was built with LLAMA_BUILD_COMMON=ON.\n"
+      "Searched paths:\n"
+      "  - ${LLAMA_BUILD_PARENT}/llama.cpp/common\n"
+      "  - ${LLAMA_CPP_DYLIB_DIR}/common\n"
+      "  - ${LLAMA_CPP_DYLIB_DIR}")
+  endif()
+
+  message(STATUS "Common library: ${LLAMA_COMMON_LIB}")
+
+  # Find llama library (cross-platform)
+  find_library(LLAMA_LIB
+    NAMES llama
+    PATHS ${LLAMA_CPP_DYLIB_DIR}
+    NO_DEFAULT_PATH
+  )
+  if(NOT LLAMA_LIB)
+    # Fallback: construct expected path
+    set(LLAMA_LIB "${LLAMA_CPP_DYLIB_DIR}/libllama${CMAKE_SHARED_LIBRARY_SUFFIX}")
+  endif()
+
+  # Find ggml libraries if separate (lloyal-node structure has separate dylibs)
+  find_library(GGML_LIB NAMES ggml PATHS ${LLAMA_CPP_DYLIB_DIR} NO_DEFAULT_PATH)
+  find_library(GGML_BASE_LIB NAMES ggml-base PATHS ${LLAMA_CPP_DYLIB_DIR} NO_DEFAULT_PATH)
+
+  set(LLAMA_LIBS ${LLAMA_LIB})
+  if(GGML_LIB)
+    list(APPEND LLAMA_LIBS ${GGML_LIB})
+  endif()
+  if(GGML_BASE_LIB)
+    list(APPEND LLAMA_LIBS ${GGML_BASE_LIB})
+  endif()
+
   target_link_libraries(IntegrationRunner PRIVATE
-    ${LLAMA_CPP_DYLIB_DIR}/libllama.dylib
+    ${LLAMA_COMMON_LIB}
+    ${LLAMA_LIBS}
     doctest::doctest
   )
 

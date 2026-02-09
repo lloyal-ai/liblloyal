@@ -4,7 +4,7 @@
 // Copyright 2026 Lloyal Labs
 
 #include "common.hpp"
-#include "helpers.hpp"
+#include <common.h>  // llama.cpp common library: common_batch_clear, common_batch_add
 #include <algorithm>
 #include <cstdint>
 #include <llama/llama.h>
@@ -39,7 +39,7 @@
  * Wraps llama.cpp decode APIs with batch management, chunking logic, and
  * orchestration primitives. Provides both batched and single-token decode operations.
  *
- * Uses batch utilities from helpers.hpp (batch_clear, batch_add) for token management.
+ * Uses batch utilities from llama.cpp common (common_batch_clear, common_batch_add).
  */
 
 namespace lloyal::detail {
@@ -58,19 +58,18 @@ struct BatchGuard {
  */
 inline void add_tokens_to_batch(llama_batch &batch, const llama_token *tokens,
                                 int32_t start_idx, int32_t n_eval,
-                                int32_t n_past, int32_t capacity,
+                                int32_t n_past, int32_t /* capacity */,
                                 llama_seq_id seq_id = 0) {
-  // Clear batch using helpers.hpp function
-  lloyal::batch_clear(batch);
+  // Clear batch using llama.cpp common library
+  common_batch_clear(batch);
 
   // Add tokens one by one, mark logits=true on LAST token only
   for (int32_t i = 0; i < n_eval; ++i) {
     const int32_t pos = n_past + i;
     const bool want_logits = (i == n_eval - 1);
 
-    // Add token to specified sequence
-    lloyal::batch_add(batch, tokens[start_idx + i], pos, {seq_id}, want_logits,
-                      capacity);
+    // Add token to specified sequence using llama.cpp common library
+    common_batch_add(batch, tokens[start_idx + i], pos, {seq_id}, want_logits);
   }
 }
 } // namespace lloyal::detail
