@@ -108,12 +108,17 @@ jobs:
         # Run decoder tests to verify decode_one() works with thread_local batch
         ./build_abi_safe/TestRunner --success --test-case="*decoder*"
 
-  integration-tests-macos:
-    name: Integration Tests (macOS)
-    runs-on: macos-latest
+  integration-tests:
+    name: Integration Tests (Linux)
+    runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake build-essential
 
     - name: Read llama.cpp version
       id: llama_version
@@ -132,9 +137,9 @@ jobs:
       uses: actions/cache@v4
       with:
         path: llama.cpp/build
-        key: llama-macos-${{ runner.arch }}-${{ steps.llama_version.outputs.version }}
+        key: llama-linux-${{ runner.arch }}-${{ steps.llama_version.outputs.version }}
         restore-keys: |
-          llama-macos-${{ runner.arch }}-
+          llama-linux-${{ runner.arch }}-
 
     - name: Build llama.cpp
       run: |
