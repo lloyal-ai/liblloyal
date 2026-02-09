@@ -118,7 +118,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y cmake build-essential
+        sudo apt-get install -y cmake build-essential nlohmann-json3-dev
 
     - name: Read llama.cpp version
       id: llama_version
