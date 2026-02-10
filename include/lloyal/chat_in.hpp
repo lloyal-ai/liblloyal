@@ -432,4 +432,129 @@ inline std::vector<llama_token> get_turn_separator(const llama_model* model) {
   }
 }
 
+/**
+ * @brief Pre-tokenized wrapper tokens for warm multi-turn continuation
+ *
+ * Contains the three token sequences needed to inject a new user turn
+ * into an existing conversation without re-formatting the full history.
+ * Extracted from the model's chat template via sentinel probing.
+ *
+ * @section usage Usage (warm continuation)
+ * @code{.cpp}
+ * auto warm = chat_in::get_warm_turn_tokens(model);
+ * auto content_tokens = tokenizer::tokenize(vocab, user_content, false, true);
+ * std::vector<llama_token> prefill;
+ * prefill.insert(prefill.end(), warm.turn_separator.begin(), warm.turn_separator.end());
+ * prefill.insert(prefill.end(), warm.user_prefix.begin(), warm.user_prefix.end());
+ * prefill.insert(prefill.end(), content_tokens.begin(), content_tokens.end());
+ * prefill.insert(prefill.end(), warm.user_to_assistant.begin(), warm.user_to_assistant.end());
+ * @endcode
+ */
+struct WarmTurnTokens {
+  std::vector<llama_token> turn_separator;    ///< Closes previous assistant turn (e.g., [im_end, \n] or [eot_id])
+  std::vector<llama_token> user_prefix;       ///< Opens new user turn (e.g., [im_start, "user", \n])
+  std::vector<llama_token> user_to_assistant; ///< Closes user turn + opens assistant (e.g., [im_end, \n, im_start, "assistant", \n])
+};
+
+/**
+ * @brief Extract warm turn wrapper tokens from model's chat template
+ *
+ * Uses sentinel probing to extract the pre-tokenized role wrappers needed
+ * for warm multi-turn continuation. The warm path becomes:
+ *   turn_separator + user_prefix + tokenize(content, false) + user_to_assistant
+ *
+ * This eliminates the need for full-conversation formatting and string diffing
+ * on warm turns, fixing the BOS bug where tokenize(delta) adds a spurious BOS
+ * on models with add_bos_token=true (e.g., Llama 3.2).
+ *
+ * @section algorithm Algorithm
+ *
+ * 1. Reuse get_turn_separator() for the separator tokens
+ * 2. Probe with sentinels: [user:"X", assistant:S1, user:S2] + add_generation_prompt
+ * 3. Extract user_prefix from text between S1 and S2, after stripping separator text
+ * 4. Extract user_to_assistant from text after S2 to end of formatted output
+ *
+ * @param model Llama model pointer (provides template and vocabulary)
+ * @return WarmTurnTokens with all three sequences populated.
+ *         Returns empty struct if template parsing fails.
+ *
+ * @note Result is typically cached by the caller (e.g., SessionContext).
+ */
+inline WarmTurnTokens get_warm_turn_tokens(const llama_model* model) {
+  WarmTurnTokens result;
+
+  if (!model) return result;
+
+  // Step 1: Get turn separator (reuse existing function)
+  result.turn_separator = get_turn_separator(model);
+  if (result.turn_separator.empty()) return result;
+
+  // Step 2: Probe for user_prefix and user_to_assistant
+  const std::string S1 = "\x1F__LLOYAL_W1__\x1F";
+  const std::string S2 = "\x1F__LLOYAL_W2__\x1F";
+
+  try {
+    common_chat_templates_ptr tmpls = common_chat_templates_init(model, "");
+    if (!tmpls) return result;
+
+    std::vector<common_chat_msg> messages = {
+      {.role = "user",      .content = "X"},
+      {.role = "assistant", .content = S1},
+      {.role = "user",      .content = S2}
+    };
+
+    common_chat_templates_inputs inputs;
+    inputs.messages = messages;
+    inputs.add_generation_prompt = true;  // Capture assistant prompt after user turn
+    inputs.use_jinja = true;
+
+    auto params = common_chat_templates_apply(tmpls.get(), inputs);
+    const std::string& fmt = params.prompt;
+
+    // Extract text between S1 and S2 (turn_sep + user_prefix)
+    // and text after S2 (user_to_assistant)
+    size_t s1_pos = fmt.rfind(S1);
+    if (s1_pos == std::string::npos) return result;
+    size_t s1_end = s1_pos + S1.length();
+
+    size_t s2_pos = fmt.find(S2, s1_end);
+    if (s2_pos == std::string::npos) return result;
+    size_t s2_end = s2_pos + S2.length();
+
+    std::string between_s1_s2 = fmt.substr(s1_end, s2_pos - s1_end);
+    std::string after_s2 = fmt.substr(s2_end);
+
+    // Strip turn separator text from between_s1_s2 to get user_prefix text
+    std::string sep_text = tokenizer::detokenize_batch(model, result.turn_separator);
+    std::string user_prefix_text = between_s1_s2;
+    if (user_prefix_text.length() >= sep_text.length() &&
+        user_prefix_text.substr(0, sep_text.length()) == sep_text) {
+      user_prefix_text = user_prefix_text.substr(sep_text.length());
+    }
+
+    // Tokenize (no BOS, parse special tokens)
+    const auto* vocab = llama_model_get_vocab(model);
+    if (!vocab) return result;
+
+    if (!user_prefix_text.empty()) {
+      result.user_prefix = tokenizer::tokenize(vocab, user_prefix_text, false, true);
+    }
+    if (!after_s2.empty()) {
+      result.user_to_assistant = tokenizer::tokenize(vocab, after_s2, false, true);
+    }
+
+    LLOYAL_LOG_DEBUG(
+        "[chat_in::get_warm_turn_tokens] separator=%zu, user_prefix=%zu, user_to_assistant=%zu tokens",
+        result.turn_separator.size(),
+        result.user_prefix.size(),
+        result.user_to_assistant.size());
+
+    return result;
+
+  } catch (const std::exception& e) {
+    LLOYAL_LOG_DEBUG("[chat_in::get_warm_turn_tokens] Error: %s", e.what());
+    return result;
+  }
+}
+
 } // namespace lloyal::chat_in
