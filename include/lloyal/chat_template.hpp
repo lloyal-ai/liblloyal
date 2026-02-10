@@ -103,27 +103,10 @@ inline FormatResult format(const llama_model *model,
     }
 
     {
-      // Convert JSON to common_chat_msg vector
-      std::vector<common_chat_msg> messages;
-      for (const auto &msg : messages_array) {
-        common_chat_msg chat_msg;
-        if (msg.contains("role")) {
-          chat_msg.role = msg["role"].get<std::string>();
-        }
-        if (msg.contains("content")) {
-          const auto& content = msg["content"];
-          if (content.is_null()) {
-            // Tool calls have null content
-            chat_msg.content = "";
-          } else if (content.is_string()) {
-            chat_msg.content = content.get<std::string>();
-          } else {
-            // Structured content (array of text/image parts) - serialize as JSON
-            chat_msg.content = content.dump();
-          }
-        }
-        messages.push_back(chat_msg);
-      }
+      // Parse JSON to common_chat_msg using llama.cpp's parser
+      // This preserves ALL message fields: tool_calls, name, tool_call_id,
+      // reasoning_content, content_parts - required for proper Jinja template rendering
+      std::vector<common_chat_msg> messages = common_chat_msgs_parse_oaicompat(messages_array);
 
       // Prepare template inputs
       common_chat_templates_inputs inputs;

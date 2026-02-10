@@ -159,23 +159,23 @@ jobs:
       run: |
         mkdir -p fixtures
 
-        # Download TinyLlama-1.1B (638MB) for all integration tests
-        if [ ! -f fixtures/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf ]; then
-          echo "Downloading tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf (638MB)..."
+        # Download SmolLM2-1.7B (1GB) for all integration tests
+        if [ ! -f fixtures/SmolLM2-1.7B-Instruct-Q4_K_M.gguf ]; then
+          echo "Downloading SmolLM2-1.7B-Instruct-Q4_K_M.gguf (1GB)..."
           curl -fsSL --retry 3 --retry-delay 2 \
-            "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf" \
-            -o fixtures/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+            "https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF/resolve/main/smollm2-1.7b-instruct-q4_k_m.gguf" \
+            -o fixtures/SmolLM2-1.7B-Instruct-Q4_K_M.gguf
 
-          echo "Verifying tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf..."
-          if ! head -c 4 fixtures/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf | grep -q "GGUF"; then
+          echo "Verifying SmolLM2-1.7B-Instruct-Q4_K_M.gguf..."
+          if ! head -c 4 fixtures/SmolLM2-1.7B-Instruct-Q4_K_M.gguf | grep -q "GGUF"; then
             echo "ERROR: Downloaded file is not a valid GGUF file"
-            head -c 32 fixtures/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf | xxd
-            rm -f fixtures/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+            head -c 32 fixtures/SmolLM2-1.7B-Instruct-Q4_K_M.gguf | xxd
+            rm -f fixtures/SmolLM2-1.7B-Instruct-Q4_K_M.gguf
             exit 1
           fi
-          echo "✓ tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf verified"
+          echo "✓ SmolLM2-1.7B-Instruct-Q4_K_M.gguf verified"
         else
-          echo "✓ Using cached tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
+          echo "✓ Using cached SmolLM2-1.7B-Instruct-Q4_K_M.gguf"
         fi
 
         # Download nomic-embed-text-v1.5 (67MB) for embedding tests
@@ -215,10 +215,10 @@ jobs:
     - name: Run integration tests
       working-directory: tests
       env:
-        LLAMA_TEST_MODEL: ${{ github.workspace }}/tests/fixtures/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+        LLAMA_TEST_MODEL: ${{ github.workspace }}/tests/fixtures/SmolLM2-1.7B-Instruct-Q4_K_M.gguf
       run: |
         set -o pipefail
-        echo "Running integration tests with TinyLlama-1.1B..."
+        echo "Running integration tests with SmolLM2-1.7B..."
         echo "Model path: $LLAMA_TEST_MODEL"
         ls -lh "$LLAMA_TEST_MODEL"
         ./build_integration/IntegrationRunner --success \
@@ -232,7 +232,7 @@ jobs:
     - name: Run embedding tests
       working-directory: tests
       env:
-        LLAMA_TEST_MODEL: ${{ github.workspace }}/tests/fixtures/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+        LLAMA_TEST_MODEL: ${{ github.workspace }}/tests/fixtures/SmolLM2-1.7B-Instruct-Q4_K_M.gguf
         LLAMA_EMBED_MODEL: ${{ github.workspace }}/tests/fixtures/nomic-embed-text-v1.5.Q4_K_M.gguf
       run: |
         set -o pipefail

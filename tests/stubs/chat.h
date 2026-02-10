@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <nlohmann/json.hpp>
 
 // Template storage (needs to be complete type before make_unique is called)
 struct common_chat_templates {};
@@ -15,10 +16,28 @@ struct common_chat_templates {};
 // Smart pointer type for templates
 using common_chat_templates_ptr = std::unique_ptr<common_chat_templates>;
 
-// Chat message structure
+// Tool call structure
+struct common_chat_tool_call {
+  std::string name;
+  std::string arguments;
+  std::string id;
+};
+
+// Content part structure
+struct common_chat_msg_content_part {
+  std::string type;
+  std::string text;
+};
+
+// Chat message structure - matches llama.cpp common/chat.h
 struct common_chat_msg {
   std::string role;
   std::string content;
+  std::vector<common_chat_msg_content_part> content_parts;
+  std::vector<common_chat_tool_call> tool_calls;
+  std::string reasoning_content;
+  std::string tool_name;
+  std::string tool_call_id;
 };
 
 // Template inputs
@@ -86,4 +105,71 @@ inline bool common_chat_verify_template(
   bool balanced = (open_expr == close_expr) && (open_stmt == close_stmt);
 
   return has_jinja && balanced;
+}
+
+// Parse JSON messages to common_chat_msg vector
+// Stub implementation that extracts all fields from OpenAI-compatible JSON
+inline std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(
+    const nlohmann::ordered_json& messages
+) {
+  std::vector<common_chat_msg> result;
+
+  for (const auto& msg : messages) {
+    common_chat_msg chat_msg;
+
+    if (msg.contains("role")) {
+      chat_msg.role = msg["role"].get<std::string>();
+    }
+
+    if (msg.contains("content")) {
+      const auto& content = msg["content"];
+      if (content.is_null()) {
+        chat_msg.content = "";
+      } else if (content.is_string()) {
+        chat_msg.content = content.get<std::string>();
+      } else if (content.is_array()) {
+        // Content parts array
+        for (const auto& part : content) {
+          common_chat_msg_content_part cp;
+          cp.type = part.value("type", "text");
+          cp.text = part.value("text", "");
+          chat_msg.content_parts.push_back(cp);
+        }
+      }
+    }
+
+    if (msg.contains("tool_calls")) {
+      for (const auto& tc : msg["tool_calls"]) {
+        common_chat_tool_call tool_call;
+        if (tc.contains("function")) {
+          const auto& func = tc["function"];
+          tool_call.name = func.value("name", "");
+          if (func.contains("arguments")) {
+            const auto& args = func["arguments"];
+            tool_call.arguments = args.is_string() ? args.get<std::string>() : args.dump();
+          }
+        }
+        if (tc.contains("id")) {
+          tool_call.id = tc["id"].get<std::string>();
+        }
+        chat_msg.tool_calls.push_back(tool_call);
+      }
+    }
+
+    if (msg.contains("reasoning_content")) {
+      chat_msg.reasoning_content = msg["reasoning_content"].get<std::string>();
+    }
+
+    if (msg.contains("name")) {
+      chat_msg.tool_name = msg["name"].get<std::string>();
+    }
+
+    if (msg.contains("tool_call_id")) {
+      chat_msg.tool_call_id = msg["tool_call_id"].get<std::string>();
+    }
+
+    result.push_back(chat_msg);
+  }
+
+  return result;
 }
