@@ -2,7 +2,7 @@
 #include <doctest/doctest.h>
 #include "test_config.hpp"
 #include <llama/llama.h>
-#include <lloyal/decoder.hpp>
+#include <lloyal/decode.hpp>
 #include <lloyal/grammar.hpp>
 #include <lloyal/kv.hpp>
 #include <lloyal/model_registry.hpp>
@@ -509,4 +509,258 @@ TEST_CASE("Integration: complete System 2 branching workflow") {
 
   llama_free(ctx);
   INFO("✓ Complete System 2 workflow validated");
+}
+
+// ============================================================================
+// Multi-Sequence Decode Primitives Tests (decode_multiseq, decode_scatter)
+// ============================================================================
+
+TEST_CASE("Integration: decode_multiseq - 32 branches divergent generation") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard backend;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model != nullptr);
+
+  constexpr int N_BRANCHES = 32;
+  constexpr int N_STEPS = 10;
+
+  auto ctx_params = llama_context_default_params();
+  ctx_params.n_ctx = 2048;
+  ctx_params.n_batch = 512;
+  ctx_params.n_seq_max = N_BRANCHES + 1;  // +1 for root sequence
+
+  llama_context *ctx = llama_init_from_model(model.get(), ctx_params);
+  REQUIRE(ctx != nullptr);
+
+  auto vocab = llama_model_get_vocab(model.get());
+  int32_t n_vocab = llama_vocab_n_tokens(vocab);
+
+  // Decode shared prefix to sequence 0
+  std::string prefix = "The quick brown fox jumps over the lazy dog";
+  auto prefix_tokens = tokenizer::tokenize(vocab, prefix, false, false);
+  REQUIRE_FALSE(prefix_tokens.empty());
+
+  decoder::decode_tokens(ctx, prefix_tokens, 0, ctx_params.n_batch, 0);
+  llama_pos prefix_len = static_cast<llama_pos>(prefix_tokens.size());
+  INFO("Decoded shared prefix (" << prefix_len << " tokens) to seq 0");
+
+  // Fork to 32 branches (seq_id 1..32)
+  for (int i = 1; i <= N_BRANCHES; ++i) {
+    kv::seq_cp(ctx, 0, static_cast<llama_seq_id>(i));
+  }
+  INFO("Forked to " << N_BRANCHES << " branches");
+
+  // Track positions for each branch
+  std::vector<llama_pos> positions(N_BRANCHES, prefix_len);
+
+  // Scratch buffer for decode_multiseq
+  decoder::MultiSeqScratch scratch;
+
+  // Run N_STEPS of divergent generation
+  for (int step = 0; step < N_STEPS; ++step) {
+    // Build items for decode_multiseq - each branch gets a different token
+    std::vector<decoder::MultiSeqItem> items;
+    items.reserve(N_BRANCHES);
+
+    for (int i = 0; i < N_BRANCHES; ++i) {
+      llama_seq_id seq_id = static_cast<llama_seq_id>(i + 1);
+      // Pick a different token for each branch (spread across vocab)
+      llama_token token = static_cast<llama_token>((step * N_BRANCHES + i) % n_vocab);
+
+      items.push_back({
+          .token = token,
+          .pos = positions[i],
+          .seq_id = seq_id,
+          .output_logits = (i == 0)  // Only request logits for first branch
+      });
+    }
+
+    // Decode all 32 branches in ONE llama_decode() call
+    int result = decoder::decode_multiseq(ctx, items, scratch);
+    REQUIRE(result == 0);
+
+    // Update positions
+    for (int i = 0; i < N_BRANCHES; ++i) {
+      positions[i] += 1;
+    }
+  }
+
+  INFO("Completed " << N_STEPS << " steps of divergent generation");
+
+  // Verify all branches have independent KV cache state
+  for (int i = 0; i < N_BRANCHES; ++i) {
+    llama_seq_id seq_id = static_cast<llama_seq_id>(i + 1);
+    llama_pos pos = kv::pos_max(ctx, seq_id);
+
+    // Each branch should be at prefix_len + N_STEPS - 1 (0-indexed)
+    llama_pos expected = prefix_len + N_STEPS - 1;
+    CHECK(pos == expected);
+  }
+
+  // Verify root sequence is unchanged
+  llama_pos root_pos = kv::pos_max(ctx, 0);
+  CHECK(root_pos == prefix_len - 1);
+
+  INFO("✓ All " << N_BRANCHES << " branches verified at independent positions");
+
+  llama_free(ctx);
+}
+
+TEST_CASE("Integration: decode_scatter - asymmetric prefill") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard backend;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model != nullptr);
+
+  // 8 sequences with wildly different prompt lengths
+  constexpr int N_SEQUENCES = 8;
+  const int prompt_lengths[] = {3, 7, 15, 42, 2, 28, 11, 5};
+
+  auto ctx_params = llama_context_default_params();
+  ctx_params.n_ctx = 2048;
+  ctx_params.n_batch = 512;
+  ctx_params.n_seq_max = N_SEQUENCES;
+
+  llama_context *ctx = llama_init_from_model(model.get(), ctx_params);
+  REQUIRE(ctx != nullptr);
+
+  auto vocab = llama_model_get_vocab(model.get());
+  int32_t n_vocab = llama_vocab_n_tokens(vocab);
+
+  // Generate token arrays for each sequence
+  std::vector<std::vector<llama_token>> token_arrays(N_SEQUENCES);
+  int32_t total_tokens = 0;
+
+  for (int i = 0; i < N_SEQUENCES; ++i) {
+    int len = prompt_lengths[i];
+    token_arrays[i].resize(len);
+    for (int j = 0; j < len; ++j) {
+      // Use deterministic but varied tokens
+      token_arrays[i][j] = static_cast<llama_token>((i * 100 + j) % n_vocab);
+    }
+    total_tokens += len;
+  }
+
+  INFO("Total tokens to decode: " << total_tokens << " across " << N_SEQUENCES << " sequences");
+
+  // Build scatter items
+  std::vector<decoder::ScatterItem> items;
+  items.reserve(N_SEQUENCES);
+
+  for (int i = 0; i < N_SEQUENCES; ++i) {
+    items.push_back({
+        .tokens = token_arrays[i].data(),
+        .n_tokens = static_cast<int32_t>(token_arrays[i].size()),
+        .start_pos = 0,
+        .seq_id = static_cast<llama_seq_id>(i),
+        .output_logits_last_only = true  // Get logits at end of each prompt
+    });
+  }
+
+  // Decode ALL sequences in ONE llama_decode() call
+  decoder::MultiSeqScratch scratch;
+  int result = decoder::decode_scatter(ctx, items, scratch);
+  REQUIRE(result == 0);
+
+  INFO("Decoded " << total_tokens << " tokens in single decode_scatter call");
+
+  // Verify each sequence has correct KV cache length
+  for (int i = 0; i < N_SEQUENCES; ++i) {
+    llama_pos pos = kv::pos_max(ctx, static_cast<llama_seq_id>(i));
+    llama_pos expected = prompt_lengths[i] - 1;  // 0-indexed
+    CHECK(pos == expected);
+    INFO("Seq " << i << ": expected pos=" << expected << ", actual=" << pos);
+  }
+
+  INFO("✓ Asymmetric prefill verified for all " << N_SEQUENCES << " sequences");
+
+  llama_free(ctx);
+}
+
+TEST_CASE("Integration: decode_scatter - interleaved generation and prefill") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard backend;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model != nullptr);
+
+  constexpr int N_SEQUENCES = 6;
+
+  auto ctx_params = llama_context_default_params();
+  ctx_params.n_ctx = 2048;
+  ctx_params.n_batch = 512;
+  ctx_params.n_seq_max = N_SEQUENCES;
+
+  llama_context *ctx = llama_init_from_model(model.get(), ctx_params);
+  REQUIRE(ctx != nullptr);
+
+  auto vocab = llama_model_get_vocab(model.get());
+  int32_t n_vocab = llama_vocab_n_tokens(vocab);
+
+  // Phase 1: Initialize all sequences with short prompts
+  const int initial_len = 5;
+  std::vector<std::vector<llama_token>> initial_tokens(N_SEQUENCES);
+
+  for (int i = 0; i < N_SEQUENCES; ++i) {
+    initial_tokens[i].resize(initial_len);
+    for (int j = 0; j < initial_len; ++j) {
+      initial_tokens[i][j] = static_cast<llama_token>((i * 50 + j) % n_vocab);
+    }
+    decoder::decode_tokens(ctx, initial_tokens[i], 0, ctx_params.n_batch,
+                           static_cast<llama_seq_id>(i));
+  }
+
+  INFO("Phase 1: Initialized " << N_SEQUENCES << " sequences with " << initial_len << " tokens each");
+
+  // Phase 2: Mixed workload - some generating (1 token), some prefilling (15 tokens)
+  // Seq 0, 2, 4: generating (1 token each)
+  // Seq 1, 3, 5: prefilling (15 tokens each)
+  const int prefill_len = 15;
+
+  std::vector<std::vector<llama_token>> mixed_tokens(N_SEQUENCES);
+  for (int i = 0; i < N_SEQUENCES; ++i) {
+    int len = (i % 2 == 0) ? 1 : prefill_len;
+    mixed_tokens[i].resize(len);
+    for (int j = 0; j < len; ++j) {
+      mixed_tokens[i][j] = static_cast<llama_token>((i * 200 + j + 1000) % n_vocab);
+    }
+  }
+
+  // Build scatter items for mixed workload
+  std::vector<decoder::ScatterItem> items;
+  items.reserve(N_SEQUENCES);
+
+  for (int i = 0; i < N_SEQUENCES; ++i) {
+    items.push_back({
+        .tokens = mixed_tokens[i].data(),
+        .n_tokens = static_cast<int32_t>(mixed_tokens[i].size()),
+        .start_pos = initial_len,  // Continue from where we left off
+        .seq_id = static_cast<llama_seq_id>(i),
+        .output_logits_last_only = true
+    });
+  }
+
+  // Decode mixed workload in ONE call
+  decoder::MultiSeqScratch scratch;
+  int result = decoder::decode_scatter(ctx, items, scratch);
+  REQUIRE(result == 0);
+
+  INFO("Phase 2: Decoded mixed workload (1 or 15 tokens per sequence)");
+
+  // Verify positions
+  for (int i = 0; i < N_SEQUENCES; ++i) {
+    llama_pos pos = kv::pos_max(ctx, static_cast<llama_seq_id>(i));
+    int expected_len = initial_len + ((i % 2 == 0) ? 1 : prefill_len);
+    llama_pos expected_pos = expected_len - 1;
+
+    CHECK(pos == expected_pos);
+    INFO("Seq " << i << ": " << (i % 2 == 0 ? "generating" : "prefilling")
+         << ", expected pos=" << expected_pos << ", actual=" << pos);
+  }
+
+  INFO("✓ Interleaved generation/prefill verified");
+
+  llama_free(ctx);
 }

@@ -1,6 +1,6 @@
 #include "llama_stubs.h"
 #include <doctest/doctest.h>
-#include <lloyal/decoder.hpp>
+#include <lloyal/decode.hpp>
 #include <vector>
 
 using namespace lloyal::decoder;

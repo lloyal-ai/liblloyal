@@ -19,7 +19,7 @@
 #include "test_config.hpp"
 #include <llama/llama.h>
 #include <lloyal/branch.hpp>
-#include <lloyal/decoder.hpp>
+#include <lloyal/decode.hpp>
 #include <lloyal/kv.hpp>
 #include <lloyal/model_registry.hpp>
 #include <lloyal/tokenizer.hpp>

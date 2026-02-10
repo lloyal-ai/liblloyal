@@ -48,7 +48,7 @@
 
 #include "boundaries.hpp"
 #include "common.hpp"
-#include "decoder.hpp"
+#include "decode.hpp"
 #include "grammar.hpp"
 #include "kv.hpp"
 #include "logits.hpp"

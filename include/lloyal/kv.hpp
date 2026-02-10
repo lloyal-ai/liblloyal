@@ -27,7 +27,7 @@
  */
 
 #include "common.hpp"
-#include "decoder.hpp"
+#include "decode.hpp"
 #include <cstdint>
 #include <llama/llama.h>
 #include <vector>
