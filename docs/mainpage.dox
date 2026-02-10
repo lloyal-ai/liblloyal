@@ -15,7 +15,7 @@
  * - **Sampling** - Grammar-constrained, persistent chains, 52 parameters
  * - **Metrics** - Dual-level entropy/surprisal, rolling perplexity, cloneable state
  * - **Embeddings** - Pooled extraction, L2 normalization, similarity
- * - **Chat Templates** - Jinja2 formatting with fallbacks
+ * - **Chat I/O** - Format-aware chat input/output with tools, grammar, and reasoning
  *
  * @section patterns_sec Advanced Patterns
  *
@@ -81,7 +81,8 @@
  * - @ref lloyal::metrics - Entropy, surprisal, and perplexity tracking
  * - @ref lloyal::embedding - Embedding extraction and similarity
  * - @ref lloyal::grammar - Grammar-constrained generation
- * - @ref lloyal::chat_template - Chat formatting with Jinja2 templates
+ * - @ref lloyal::chat_in - Chat input formatting with full format awareness
+ * - @ref lloyal::chat_out - Chat output parsing (tool calls, reasoning)
  * - @ref lloyal::ModelRegistry - Model weight sharing and caching
  *
  * @section docs_sec Documentation

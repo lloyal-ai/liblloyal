@@ -39,3 +39,6 @@ tests/fixtures/*.gguf
 # Generated documentation
 docs/api/html/
 docs/build/
+
+# Internal docs (not for public consumption)
+docs/_internal/
