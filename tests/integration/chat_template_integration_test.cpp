@@ -919,9 +919,9 @@ TEST_CASE("ChatTemplate Integration: warm continuation multi-turn token parity")
 // Sampling params struct for branch creation
 struct WarmTestParams {
   float temperature = 0.0f;     // Greedy for determinism
-  int32_t top_k = 40;
-  float top_p = 0.95f;
-  float min_p = 0.05f;
+  int32_t top_k = 0;            // Disabled - filters before greedy cause cross-backend non-determinism
+  float top_p = 1.0f;           // Disabled - filters before greedy cause cross-backend non-determinism
+  float min_p = 0.0f;           // Disabled - filters before greedy cause cross-backend non-determinism
   float typical_p = 1.0f;
   float penalty_repeat = 1.0f;
   float penalty_freq = 0.0f;
