@@ -31,7 +31,8 @@ add_executable(TestRunner
   decoder_seq_test.cpp
   tokenizer_test.cpp
   sampler_test.cpp
-  chat_template_test.cpp
+  chat_in_test.cpp
+  chat_out_test.cpp
   embedding_test.cpp
   metrics_test.cpp
   branch_test.cpp
@@ -167,7 +168,8 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
     integration/e2e_parameter_flow_test.cpp
     integration/sampler_integration_test.cpp
     integration/clear_and_reseed_test.cpp
-    integration/chat_template_integration_test.cpp
+    integration/chat_in_integration_test.cpp
+    integration/chat_out_integration_test.cpp
     integration/kv_file_persistence_test.cpp
     integration/embedding_integration_test.cpp
     integration/multi_sequence_integration_test.cpp
