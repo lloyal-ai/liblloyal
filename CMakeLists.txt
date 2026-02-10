@@ -10,7 +10,7 @@ project(liblloyal VERSION 0.1.0 LANGUAGES CXX)
 # specifiers.
 #
 # Dependencies:
-#   - llama.cpp (b7899 or compatible)
+#   - llama.cpp (b7981 or compatible)
 #   - C++20 compiler
 #
 # Usage:
@@ -178,19 +178,19 @@ endif()
 # Version Check for llama.cpp
 # =============================================================================
 
-# liblloyal is tested against llama.cpp b7899
+# liblloyal is tested against llama.cpp b7981
 # This is a soft check - we warn but don't fail the build
 if(DEFINED LLAMA_CPP_VERSION)
-    if(NOT LLAMA_CPP_VERSION STREQUAL "b7899")
+    if(NOT LLAMA_CPP_VERSION STREQUAL "b7981")
         message(WARNING
-            "liblloyal: Designed for llama.cpp b7899, found ${LLAMA_CPP_VERSION}. "
+            "liblloyal: Designed for llama.cpp b7981, found ${LLAMA_CPP_VERSION}. "
             "API compatibility not guaranteed.")
     else()
-        message(STATUS "liblloyal: Using recommended llama.cpp version b7899")
+        message(STATUS "liblloyal: Using recommended llama.cpp version b7981")
     endif()
 else()
     message(STATUS
-        "liblloyal: LLAMA_CPP_VERSION not set. Recommended: b7899. "
+        "liblloyal: LLAMA_CPP_VERSION not set. Recommended: b7981. "
         "Define LLAMA_CPP_VERSION in your llama.cpp CMakeLists to enable version check.")
 endif()
 
