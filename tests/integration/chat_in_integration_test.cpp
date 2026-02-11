@@ -1259,3 +1259,101 @@ TEST_CASE("ChatIn Integration: true warm continuation (no re-prefill)") {
     MESSAGE("TRUE WARM CONTINUATION: No re-prefill needed, generation matches!");
   }
 }
+
+// ===== STRING-DIFF WARM FORMAT PARITY =====
+// Proves: tokenize(full.substr(partial.size())) == token delta from full tokenization.
+// This validates the JS string-diff approach for warm continuation.
+
+TEST_CASE("ChatIn Integration: string-diff warm format parity") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard backend;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model != nullptr);
+
+  const auto* vocab = llama_model_get_vocab(model.get());
+  REQUIRE(vocab != nullptr);
+
+  // 1. Format full 3-message conversation
+  lloyal::chat_in::FormatInputs full_inputs;
+  full_inputs.messages_json = json::array({
+    {{"role", "user"}, {"content", "What is your name?"}},
+    {{"role", "assistant"}, {"content", "I am an AI assistant."}},
+    {{"role", "user"}, {"content", "Nice to meet you!"}}
+  }).dump();
+
+  auto full_result = lloyal::chat_in::format(model.get(), full_inputs);
+  REQUIRE(!full_result.prompt.empty());
+
+  auto cold_tokens = lloyal::tokenizer::tokenize(vocab, full_result.prompt, false, true);
+  REQUIRE(!cold_tokens.empty());
+
+  // 2. Format partial conversation (without last user message, no gen prompt)
+  lloyal::chat_in::FormatInputs partial_inputs;
+  partial_inputs.messages_json = json::array({
+    {{"role", "user"}, {"content", "What is your name?"}},
+    {{"role", "assistant"}, {"content", "I am an AI assistant."}}
+  }).dump();
+  partial_inputs.add_generation_prompt = false;
+
+  auto partial_result = lloyal::chat_in::format(model.get(), partial_inputs);
+  REQUIRE(!partial_result.prompt.empty());
+
+  // 3. Verify string prefix relationship
+  REQUIRE(full_result.prompt.size() > partial_result.prompt.size());
+  CHECK(full_result.prompt.substr(0, partial_result.prompt.size()) == partial_result.prompt);
+
+  // 4. Extract delta text via string diff
+  std::string delta_text = full_result.prompt.substr(partial_result.prompt.size());
+  REQUIRE(!delta_text.empty());
+
+  // 5. Tokenize delta text in isolation (no BOS, parse special tokens)
+  auto delta_tokens = lloyal::tokenizer::tokenize(vocab, delta_text, false, true);
+  REQUIRE(!delta_tokens.empty());
+
+  // 6. Get partial token sequence for comparison
+  auto partial_tokens = lloyal::tokenizer::tokenize(vocab, partial_result.prompt, false, true);
+
+  // 7. Expected delta: cold_tokens[partial_tokens.size():]
+  REQUIRE(cold_tokens.size() > partial_tokens.size());
+  std::vector<llama_token> expected_delta(
+    cold_tokens.begin() + partial_tokens.size(),
+    cold_tokens.end()
+  );
+
+  // 8. Verify delta tokens match
+  bool tokens_match = (delta_tokens.size() == expected_delta.size());
+  size_t mismatch_pos = 0;
+
+  if (tokens_match) {
+    for (size_t i = 0; i < delta_tokens.size(); i++) {
+      if (delta_tokens[i] != expected_delta[i]) {
+        tokens_match = false;
+        mismatch_pos = i;
+        break;
+      }
+    }
+  }
+
+  if (!tokens_match) {
+    MESSAGE("Delta tokens from string-diff (" << delta_tokens.size() << "):");
+    for (size_t i = 0; i < std::min(delta_tokens.size(), (size_t)20); i++) {
+      MESSAGE("  [" << i << "] " << delta_tokens[i]
+              << " (" << lloyal::tokenizer::detokenize(model.get(), delta_tokens[i]) << ")");
+    }
+    MESSAGE("Expected tokens from full tokenization (" << expected_delta.size() << "):");
+    for (size_t i = 0; i < std::min(expected_delta.size(), (size_t)20); i++) {
+      MESSAGE("  [" << i << "] " << expected_delta[i]
+              << " (" << lloyal::tokenizer::detokenize(model.get(), expected_delta[i]) << ")");
+    }
+    if (delta_tokens.size() == expected_delta.size()) {
+      MESSAGE("First mismatch at position " << mismatch_pos);
+    }
+  }
+
+  CHECK(tokens_match);
+
+  MESSAGE("String-diff warm format parity: delta_text=\""
+          << delta_text.substr(0, 60) << "...\""
+          << " → " << delta_tokens.size() << " tokens match expected");
+}

@@ -350,24 +350,6 @@ TEST_CASE("ChatIn: format with add_generation_prompt false omits assistant prefi
   CHECK(with_gen.prompt.substr(0, without_gen.prompt.size()) == without_gen.prompt);
 }
 
-// ===== WARM TURN TOKENS TESTS =====
-
-TEST_CASE("ChatIn: get_warm_turn_tokens with null model returns empty") {
-  auto result = lloyal::chat_in::get_warm_turn_tokens(nullptr);
-
-  CHECK(result.turn_separator.empty());
-  CHECK(result.user_prefix.empty());
-  CHECK(result.user_to_assistant.empty());
-}
-
-TEST_CASE("ChatIn: WarmTurnTokens struct default-constructs empty") {
-  lloyal::chat_in::WarmTurnTokens tokens;
-
-  CHECK(tokens.turn_separator.empty());
-  CHECK(tokens.user_prefix.empty());
-  CHECK(tokens.user_to_assistant.empty());
-}
-
 TEST_CASE("ChatIn: format returns default format when no tools") {
   resetTestConfig();
 
