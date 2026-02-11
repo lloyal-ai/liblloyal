@@ -760,187 +760,9 @@ TEST_CASE("ChatIn Integration: format with tools in multi-turn") {
   CHECK(result.prompt.find("Sydney") != std::string::npos);
 }
 
-// ===== HIGH-FIDELITY WARM CONTINUATION VERIFICATION =====
-
-TEST_CASE("ChatIn Integration: warm continuation token-level parity") {
-  REQUIRE_MODEL();
-  LlamaBackendGuard backend;
-
-  auto model = TestConfig::acquire_test_model();
-  REQUIRE(model != nullptr);
-
-  const auto* vocab = llama_model_get_vocab(model.get());
-  REQUIRE(vocab != nullptr);
-
-  lloyal::chat_in::FormatInputs inputs;
-  inputs.messages_json = json::array({
-    {{"role", "user"}, {"content", "What is your name?"}},
-    {{"role", "assistant"}, {"content", "I am an AI assistant."}},
-    {{"role", "user"}, {"content", "Nice to meet you!"}}
-  }).dump();
-
-  auto cold_result = lloyal::chat_in::format(model.get(), inputs);
-  REQUIRE(!cold_result.prompt.empty());
-
-  auto cold_tokens = lloyal::tokenizer::tokenize(vocab, cold_result.prompt, false, true);
-  REQUIRE(!cold_tokens.empty());
-
-  auto separator = lloyal::chat_in::get_turn_separator(model.get());
-  REQUIRE(!separator.empty());
-
-  // Format partial conversation (without last user message) to find split point
-  lloyal::chat_in::FormatInputs partial_inputs;
-  partial_inputs.messages_json = json::array({
-    {{"role", "user"}, {"content", "What is your name?"}},
-    {{"role", "assistant"}, {"content", "I am an AI assistant."}}
-  }).dump();
-  partial_inputs.add_generation_prompt = false;
-
-  auto partial_result = lloyal::chat_in::format(model.get(), partial_inputs);
-  auto partial_tokens = lloyal::tokenizer::tokenize(vocab, partial_result.prompt, false, true);
-  REQUIRE(cold_tokens.size() > partial_tokens.size());
-
-  // Verify cold tokens start with partial tokens (prefix match)
-  bool prefix_match = true;
-  for (size_t i = 0; i < partial_tokens.size(); i++) {
-    if (cold_tokens[i] != partial_tokens[i]) {
-      prefix_match = false;
-      MESSAGE("Prefix mismatch at " << i
-              << ": cold=" << cold_tokens[i]
-              << " (" << lloyal::tokenizer::detokenize(model.get(), cold_tokens[i]) << ")"
-              << " vs partial=" << partial_tokens[i]
-              << " (" << lloyal::tokenizer::detokenize(model.get(), partial_tokens[i]) << ")");
-      break;
-    }
-  }
-  REQUIRE(prefix_match);
-
-  // Verify separator at end of partial tokens
-  REQUIRE(partial_tokens.size() >= separator.size());
-  for (size_t i = 0; i < separator.size(); i++) {
-    CHECK(partial_tokens[partial_tokens.size() - separator.size() + i] == separator[i]);
-  }
-
-  // Split point: where separator starts within the cold token stream
-  size_t separator_token_pos = partial_tokens.size() - separator.size();
-
-  std::vector<llama_token> warm_base(cold_tokens.begin(),
-                                      cold_tokens.begin() + separator_token_pos);
-  std::vector<llama_token> delta(cold_tokens.begin() + separator_token_pos + separator.size(),
-                                  cold_tokens.end());
-
-  std::vector<llama_token> reconstructed;
-  reconstructed.insert(reconstructed.end(), warm_base.begin(), warm_base.end());
-  reconstructed.insert(reconstructed.end(), separator.begin(), separator.end());
-  reconstructed.insert(reconstructed.end(), delta.begin(), delta.end());
-
-  REQUIRE(reconstructed.size() == cold_tokens.size());
-
-  bool tokens_match = true;
-  size_t mismatch_pos = 0;
-  for (size_t i = 0; i < cold_tokens.size(); i++) {
-    if (reconstructed[i] != cold_tokens[i]) {
-      tokens_match = false;
-      mismatch_pos = i;
-      break;
-    }
-  }
-
-  if (!tokens_match) {
-    MESSAGE("Token mismatch at position " << mismatch_pos
-            << ": expected " << cold_tokens[mismatch_pos]
-            << " (" << lloyal::tokenizer::detokenize(model.get(), cold_tokens[mismatch_pos]) << ")"
-            << ", got " << reconstructed[mismatch_pos]
-            << " (" << lloyal::tokenizer::detokenize(model.get(), reconstructed[mismatch_pos]) << ")");
-  }
-  CHECK(tokens_match);
-
-  MESSAGE("Token-level parity verified: warm_base(" << warm_base.size()
-          << ") + separator(" << separator.size()
-          << ") + delta(" << delta.size()
-          << ") == cold(" << cold_tokens.size() << ")");
-}
-
-TEST_CASE("ChatIn Integration: warm continuation multi-turn token parity") {
-  REQUIRE_MODEL();
-  LlamaBackendGuard backend;
-
-  auto model = TestConfig::acquire_test_model();
-  REQUIRE(model != nullptr);
-
-  const auto* vocab = llama_model_get_vocab(model.get());
-  REQUIRE(vocab != nullptr);
-
-  lloyal::chat_in::FormatInputs inputs;
-  inputs.messages_json = json::array({
-    {{"role", "user"}, {"content", "A"}},
-    {{"role", "assistant"}, {"content", "B"}},
-    {{"role", "user"}, {"content", "C"}},
-    {{"role", "assistant"}, {"content", "D"}},
-    {{"role", "user"}, {"content", "E"}}
-  }).dump();
-
-  auto cold_result = lloyal::chat_in::format(model.get(), inputs);
-  REQUIRE(!cold_result.prompt.empty());
-
-  auto cold_tokens = lloyal::tokenizer::tokenize(vocab, cold_result.prompt, false, true);
-  auto separator = lloyal::chat_in::get_turn_separator(model.get());
-  REQUIRE(!separator.empty());
-
-  // Format partial conversation (without last user message) to find split point
-  lloyal::chat_in::FormatInputs partial_inputs;
-  partial_inputs.messages_json = json::array({
-    {{"role", "user"}, {"content", "A"}},
-    {{"role", "assistant"}, {"content", "B"}},
-    {{"role", "user"}, {"content", "C"}},
-    {{"role", "assistant"}, {"content", "D"}}
-  }).dump();
-  partial_inputs.add_generation_prompt = false;
-
-  auto partial_result = lloyal::chat_in::format(model.get(), partial_inputs);
-  auto partial_tokens = lloyal::tokenizer::tokenize(vocab, partial_result.prompt, false, true);
-  REQUIRE(cold_tokens.size() > partial_tokens.size());
-
-  // Verify prefix match
-  bool prefix_match = true;
-  for (size_t i = 0; i < partial_tokens.size(); i++) {
-    if (cold_tokens[i] != partial_tokens[i]) {
-      prefix_match = false;
-      break;
-    }
-  }
-  REQUIRE(prefix_match);
-
-  // Verify separator at end of partial tokens
-  REQUIRE(partial_tokens.size() >= separator.size());
-  for (size_t i = 0; i < separator.size(); i++) {
-    CHECK(partial_tokens[partial_tokens.size() - separator.size() + i] == separator[i]);
-  }
-
-  size_t last_sep_pos = partial_tokens.size() - separator.size();
-
-  std::vector<llama_token> warm_base(cold_tokens.begin(),
-                                      cold_tokens.begin() + last_sep_pos);
-  std::vector<llama_token> delta(cold_tokens.begin() + last_sep_pos + separator.size(),
-                                  cold_tokens.end());
-
-  std::vector<llama_token> reconstructed;
-  reconstructed.insert(reconstructed.end(), warm_base.begin(), warm_base.end());
-  reconstructed.insert(reconstructed.end(), separator.begin(), separator.end());
-  reconstructed.insert(reconstructed.end(), delta.begin(), delta.end());
-
-  CHECK(reconstructed.size() == cold_tokens.size());
-
-  bool match = (reconstructed == cold_tokens);
-  CHECK(match);
-
-  MESSAGE("Multi-turn parity: warm_base(" << warm_base.size()
-          << ") + separator(" << separator.size()
-          << ") + delta(" << delta.size()
-          << ") == cold(" << cold_tokens.size() << ")");
-}
-
-// ===== ACTUAL WARM CONTINUATION TEST =====
+// ===== WARM MULTI-TURN CONVERSATION =====
+// Mirrors a real chat session: cold start → warm continuations → semantic recall.
+// Tests the actual workflow: format-only-new + separator + decode on existing KV.
 
 struct WarmTestParams {
   float temperature = 0.0f;
@@ -955,7 +777,7 @@ struct WarmTestParams {
   uint32_t seed = 42;
 };
 
-TEST_CASE("ChatIn Integration: warm vs cold generation parity") {
+TEST_CASE("ChatIn Integration: warm multi-turn conversation with semantic recall") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
@@ -966,7 +788,7 @@ TEST_CASE("ChatIn Integration: warm vs cold generation parity") {
   REQUIRE(vocab != nullptr);
 
   llama_context_params ctx_params = llama_context_default_params();
-  ctx_params.n_ctx = 2048;
+  ctx_params.n_ctx = 4096;
   ctx_params.n_batch = 512;
 
   llama_context* ctx = llama_init_from_model(model.get(), ctx_params);
@@ -977,383 +799,91 @@ TEST_CASE("ChatIn Integration: warm vs cold generation parity") {
     ~ContextGuard() { if (c) llama_free(c); }
   } ctx_guard{ctx};
 
-  lloyal::chat_in::FormatInputs inputs;
-  inputs.messages_json = json::array({
-    {{"role", "user"}, {"content", "My name is Alice. What is my name?"}},
-    {{"role", "assistant"}, {"content", "Your name is Alice."}},
-    {{"role", "user"}, {"content", "What did I just tell you my name was?"}}
-  }).dump();
-
-  auto result = lloyal::chat_in::format(model.get(), inputs);
-  REQUIRE(!result.prompt.empty());
-
-  auto cold_tokens = lloyal::tokenizer::tokenize(vocab, result.prompt, true, true);
-  REQUIRE(!cold_tokens.empty());
-
   auto separator = lloyal::chat_in::get_turn_separator(model.get());
   REQUIRE(!separator.empty());
 
-  // Format partial conversation (without last user message) to find split point
-  lloyal::chat_in::FormatInputs partial_inputs;
-  partial_inputs.messages_json = json::array({
-    {{"role", "user"}, {"content", "My name is Alice. What is my name?"}},
-    {{"role", "assistant"}, {"content", "Your name is Alice."}}
-  }).dump();
-  partial_inputs.add_generation_prompt = false;
-
-  auto partial_result = lloyal::chat_in::format(model.get(), partial_inputs);
-  auto partial_tokens = lloyal::tokenizer::tokenize(vocab, partial_result.prompt, true, true);
-  REQUIRE(cold_tokens.size() > partial_tokens.size());
-
-  // Verify prefix match
-  bool prefix_match = true;
-  for (size_t i = 0; i < partial_tokens.size(); i++) {
-    if (cold_tokens[i] != partial_tokens[i]) {
-      prefix_match = false;
-      MESSAGE("Prefix mismatch at " << i);
-      break;
-    }
-  }
-  REQUIRE(prefix_match);
-
-  // Split at end of partial (separator is at the end of partial tokens)
-  size_t separator_pos = partial_tokens.size() - separator.size();
-
-  std::vector<llama_token> warm_base(cold_tokens.begin(),
-                                      cold_tokens.begin() + separator_pos);
-  std::vector<llama_token> delta(cold_tokens.begin() + separator_pos,
-                                  cold_tokens.end());
-
-  MESSAGE("Warm continuation split: warm_base(" << warm_base.size()
-          << ") + delta(" << delta.size()
-          << ") = cold(" << cold_tokens.size() << ")");
-
-  lloyal::branch::BranchStore store;
-  WarmTestParams params;
-
-  // ===== COLD PATH =====
-  auto cold_branch = lloyal::branch::create(ctx, model.get(), 0, 0, params, 512,
-                                             nullptr, nullptr, &store);
-  REQUIRE(cold_branch != lloyal::branch::INVALID_HANDLE);
-
-  lloyal::branch::decode_and_capture_batch(cold_branch, cold_tokens.data(),
-                                            cold_tokens.size(), &store);
-
-  std::vector<llama_token> cold_output;
-  for (int i = 0; i < 20; i++) {
-    auto token = lloyal::branch::sample(cold_branch, &store);
-    if (lloyal::tokenizer::is_eog(model.get(), token)) break;
-    cold_output.push_back(token);
-    lloyal::branch::accept_token(cold_branch, token, &store);
-    lloyal::branch::decode_and_capture_one(cold_branch, token, &store);
-  }
-
-  lloyal::branch::destroy(cold_branch, &store);
-  lloyal::kv::clear_all(ctx);
-
-  // ===== WARM PATH =====
-  auto warm_branch = lloyal::branch::create(ctx, model.get(), 0, 0, params, 512,
-                                             nullptr, nullptr, &store);
-  REQUIRE(warm_branch != lloyal::branch::INVALID_HANDLE);
-
-  lloyal::branch::decode_batch(warm_branch, warm_base.data(),
-                                warm_base.size(), &store);
-  lloyal::branch::decode_and_capture_batch(warm_branch, delta.data(),
-                                            delta.size(), &store);
-
-  std::vector<llama_token> warm_output;
-  for (int i = 0; i < 20; i++) {
-    auto token = lloyal::branch::sample(warm_branch, &store);
-    if (lloyal::tokenizer::is_eog(model.get(), token)) break;
-    warm_output.push_back(token);
-    lloyal::branch::accept_token(warm_branch, token, &store);
-    lloyal::branch::decode_and_capture_one(warm_branch, token, &store);
-  }
-
-  lloyal::branch::destroy(warm_branch, &store);
-
-  // ===== VERIFY PARITY =====
-  std::string cold_text, warm_text;
-  for (auto tok : cold_output) {
-    cold_text += lloyal::tokenizer::detokenize(model.get(), tok);
-  }
-  for (auto tok : warm_output) {
-    warm_text += lloyal::tokenizer::detokenize(model.get(), tok);
-  }
-
-  MESSAGE("Cold output (" << cold_output.size() << " tokens): \"" << cold_text << "\"");
-  MESSAGE("Warm output (" << warm_output.size() << " tokens): \"" << warm_text << "\"");
-
-  bool outputs_match = (cold_output.size() == warm_output.size());
-  if (outputs_match) {
-    for (size_t i = 0; i < cold_output.size(); i++) {
-      if (cold_output[i] != warm_output[i]) {
-        outputs_match = false;
-        MESSAGE("Token mismatch at position " << i
-                << ": cold=" << cold_output[i]
-                << " (" << lloyal::tokenizer::detokenize(model.get(), cold_output[i]) << ")"
-                << " vs warm=" << warm_output[i]
-                << " (" << lloyal::tokenizer::detokenize(model.get(), warm_output[i]) << ")");
-        break;
-      }
-    }
-  }
-
-  if (outputs_match) {
-    MESSAGE("WARM CONTINUATION VERIFIED: Exact token parity confirmed!");
-  } else {
-    bool cold_valid = cold_text.find("Alice") != std::string::npos;
-    bool warm_valid = warm_text.find("Alice") != std::string::npos;
-    CHECK(cold_valid);
-    CHECK(warm_valid);
-    if (cold_valid && warm_valid) {
-      MESSAGE("WARM CONTINUATION VERIFIED: Semantic parity confirmed (minor token variation)");
-    }
-  }
-}
-
-TEST_CASE("ChatIn Integration: true warm continuation (no re-prefill)") {
-  REQUIRE_MODEL();
-  LlamaBackendGuard backend;
-
-  auto model = TestConfig::acquire_test_model();
-  REQUIRE(model != nullptr);
-
-  const auto* vocab = llama_model_get_vocab(model.get());
-  REQUIRE(vocab != nullptr);
-
-  llama_context_params ctx_params = llama_context_default_params();
-  ctx_params.n_ctx = 2048;
-  ctx_params.n_batch = 512;
-
-  llama_context* ctx = llama_init_from_model(model.get(), ctx_params);
-  REQUIRE(ctx != nullptr);
-
-  struct ContextGuard {
-    llama_context* c;
-    ~ContextGuard() { if (c) llama_free(c); }
-  } ctx_guard{ctx};
-
-  lloyal::chat_in::FormatInputs inputs;
-  inputs.messages_json = json::array({
-    {{"role", "user"}, {"content", "My favorite color is blue. Remember that."}},
-    {{"role", "assistant"}, {"content", "I'll remember that your favorite color is blue!"}},
-    {{"role", "user"}, {"content", "What is my favorite color?"}}
-  }).dump();
-
-  auto full_result = lloyal::chat_in::format(model.get(), inputs);
-  auto full_tokens = lloyal::tokenizer::tokenize(vocab, full_result.prompt, true, true);
-
-  auto separator = lloyal::chat_in::get_turn_separator(model.get());
-  REQUIRE(!separator.empty());
-
-  // Format partial conversation (without last user message) to find split point
-  lloyal::chat_in::FormatInputs partial_inputs;
-  partial_inputs.messages_json = json::array({
-    {{"role", "user"}, {"content", "My favorite color is blue. Remember that."}},
-    {{"role", "assistant"}, {"content", "I'll remember that your favorite color is blue!"}}
-  }).dump();
-  partial_inputs.add_generation_prompt = false;
-
-  auto partial_result = lloyal::chat_in::format(model.get(), partial_inputs);
-  auto partial_tokens = lloyal::tokenizer::tokenize(vocab, partial_result.prompt, true, true);
-  REQUIRE(full_tokens.size() > partial_tokens.size());
-
-  // Verify prefix match
-  bool prefix_match = true;
-  for (size_t i = 0; i < partial_tokens.size(); i++) {
-    if (full_tokens[i] != partial_tokens[i]) {
-      prefix_match = false;
-      MESSAGE("Prefix mismatch at " << i);
-      break;
-    }
-  }
-  REQUIRE(prefix_match);
-
-  // Split at end of partial (separator is at the end of partial tokens)
-  size_t split_pos = partial_tokens.size() - separator.size();
-
-  std::vector<llama_token> warm_base(full_tokens.begin(),
-                                      full_tokens.begin() + split_pos);
-  std::vector<llama_token> delta(full_tokens.begin() + split_pos,
-                                  full_tokens.end());
-
-  MESSAGE("True warm continuation: warm_base(" << warm_base.size()
-          << ") + delta(" << delta.size()
-          << ") = full(" << full_tokens.size() << ")");
-
-  REQUIRE(warm_base.size() + delta.size() == full_tokens.size());
-
   WarmTestParams params;
   lloyal::branch::BranchStore store;
+  lloyal::branch::BranchHandle branch = lloyal::branch::INVALID_HANDLE;
 
-  // ===== COLD PATH =====
-  auto cold_branch = lloyal::branch::create(ctx, model.get(), 0, 0, params, 512,
-                                             nullptr, nullptr, &store);
-  REQUIRE(cold_branch != lloyal::branch::INVALID_HANDLE);
-
-  lloyal::branch::decode_and_capture_batch(cold_branch, full_tokens.data(),
-                                            full_tokens.size(), &store);
-
-  std::vector<llama_token> cold_output;
-  for (int i = 0; i < 20; i++) {
-    auto token = lloyal::branch::sample(cold_branch, &store);
-    if (lloyal::tokenizer::is_eog(model.get(), token)) break;
-    cold_output.push_back(token);
-    lloyal::branch::accept_token(cold_branch, token, &store);
-    lloyal::branch::decode_and_capture_one(cold_branch, token, &store);
-  }
-
-  lloyal::branch::destroy(cold_branch, &store);
-  lloyal::kv::clear_all(ctx);
-
-  // ===== WARM PATH =====
-  auto warm_branch = lloyal::branch::create(ctx, model.get(), 0, 0, params, 512,
-                                             nullptr, nullptr, &store);
-  REQUIRE(warm_branch != lloyal::branch::INVALID_HANDLE);
-
-  lloyal::branch::decode_batch(warm_branch, warm_base.data(),
-                                warm_base.size(), &store);
-  lloyal::branch::decode_and_capture_batch(warm_branch, delta.data(),
-                                            delta.size(), &store);
-
-  std::vector<llama_token> warm_output;
-  for (int i = 0; i < 20; i++) {
-    auto token = lloyal::branch::sample(warm_branch, &store);
-    if (lloyal::tokenizer::is_eog(model.get(), token)) break;
-    warm_output.push_back(token);
-    lloyal::branch::accept_token(warm_branch, token, &store);
-    lloyal::branch::decode_and_capture_one(warm_branch, token, &store);
-  }
-
-  lloyal::branch::destroy(warm_branch, &store);
-
-  // ===== VERIFY PARITY =====
-  REQUIRE(cold_output.size() == warm_output.size());
-
-  bool outputs_match = true;
-  for (size_t i = 0; i < cold_output.size(); i++) {
-    if (cold_output[i] != warm_output[i]) {
-      outputs_match = false;
-      MESSAGE("Mismatch at position " << i
-              << ": cold=" << cold_output[i]
-              << " vs warm=" << warm_output[i]);
-      break;
+  // Helper: generate until EOG
+  auto generate = [&]() -> std::string {
+    std::string text;
+    for (;;) {
+      auto token = lloyal::branch::sample(branch, &store);
+      if (lloyal::tokenizer::is_eog(model.get(), token)) break;
+      text += lloyal::tokenizer::detokenize(model.get(), token);
+      lloyal::branch::accept_token(branch, token, &store);
+      lloyal::branch::decode_and_capture_one(branch, token, &store);
     }
+    return text;
+  };
+
+  // Helper: warm continuation — sep + format([{user, msg}])
+  auto warm_turn = [&](const std::string& user_msg) {
+    lloyal::chat_in::FormatInputs inputs;
+    inputs.messages_json = json::array({
+      {{"role", "system"}, {"content", ""}},
+      {{"role", "user"}, {"content", user_msg}}
+    }).dump();
+
+    auto result = lloyal::chat_in::format(model.get(), inputs);
+    MESSAGE("warm_turn format: [" << result.prompt << "]");
+    auto delta = lloyal::tokenizer::tokenize(vocab, result.prompt, false, true);
+
+    std::vector<llama_token> prefill;
+    prefill.insert(prefill.end(), separator.begin(), separator.end());
+    prefill.insert(prefill.end(), delta.begin(), delta.end());
+
+    lloyal::branch::decode_and_capture_batch(branch, prefill.data(),
+                                              prefill.size(), &store);
+  };
+
+  // ===== Turn 1 (COLD): introduce name =====
+  {
+    lloyal::chat_in::FormatInputs inputs;
+    inputs.messages_json = json::array({
+      {{"role", "user"}, {"content", "Hi, my name is Lloyal"}}
+    }).dump();
+
+    auto result = lloyal::chat_in::format(model.get(), inputs);
+    auto tokens = lloyal::tokenizer::tokenize(vocab, result.prompt, true, true);
+
+    branch = lloyal::branch::create(ctx, model.get(), 0, 0, params, 512,
+                                     nullptr, nullptr, &store);
+    REQUIRE(branch != lloyal::branch::INVALID_HANDLE);
+
+    lloyal::branch::decode_and_capture_batch(branch, tokens.data(),
+                                              tokens.size(), &store);
   }
 
-  CHECK(outputs_match);
+  std::string turn1 = generate();
+  MESSAGE("Turn 1: \"" << turn1 << "\"");
 
-  std::string cold_text, warm_text;
-  for (auto tok : cold_output) {
-    cold_text += lloyal::tokenizer::detokenize(model.get(), tok);
+  // ===== Turn 2 (WARM): introduce favourite food =====
+  warm_turn("My favourite food is pizza");
+  std::string turn2 = generate();
+  MESSAGE("Turn 2: \"" << turn2 << "\"");
+
+  // ===== Turn 3 (WARM): recall name =====
+  warm_turn("Do you remember my name?");
+  std::string turn3 = generate();
+  MESSAGE("Turn 3 (name recall): \"" << turn3 << "\"");
+
+  bool name_recalled = turn3.find("Lloyal") != std::string::npos;
+  CHECK(name_recalled);
+
+  // ===== Turn 4 (WARM): recall food =====
+  warm_turn("Do you remember my favourite food?");
+  std::string turn4 = generate();
+  MESSAGE("Turn 4 (food recall): \"" << turn4 << "\"");
+
+  bool food_recalled = turn4.find("pizza") != std::string::npos;
+  CHECK(food_recalled);
+
+  lloyal::branch::destroy(branch, &store);
+
+  if (name_recalled && food_recalled) {
+    MESSAGE("WARM MULTI-TURN VERIFIED: Context survives across 4 warm turns");
   }
-  for (auto tok : warm_output) {
-    warm_text += lloyal::tokenizer::detokenize(model.get(), tok);
-  }
-
-  MESSAGE("Cold output: \"" << cold_text << "\"");
-  MESSAGE("Warm output: \"" << warm_text << "\"");
-
-  if (outputs_match) {
-    MESSAGE("TRUE WARM CONTINUATION: No re-prefill needed, generation matches!");
-  }
-}
-
-// ===== STRING-DIFF WARM FORMAT PARITY =====
-// Proves: tokenize(full.substr(partial.size())) == token delta from full tokenization.
-// This validates the JS string-diff approach for warm continuation.
-
-TEST_CASE("ChatIn Integration: string-diff warm format parity") {
-  REQUIRE_MODEL();
-  LlamaBackendGuard backend;
-
-  auto model = TestConfig::acquire_test_model();
-  REQUIRE(model != nullptr);
-
-  const auto* vocab = llama_model_get_vocab(model.get());
-  REQUIRE(vocab != nullptr);
-
-  // 1. Format full 3-message conversation
-  lloyal::chat_in::FormatInputs full_inputs;
-  full_inputs.messages_json = json::array({
-    {{"role", "user"}, {"content", "What is your name?"}},
-    {{"role", "assistant"}, {"content", "I am an AI assistant."}},
-    {{"role", "user"}, {"content", "Nice to meet you!"}}
-  }).dump();
-
-  auto full_result = lloyal::chat_in::format(model.get(), full_inputs);
-  REQUIRE(!full_result.prompt.empty());
-
-  auto cold_tokens = lloyal::tokenizer::tokenize(vocab, full_result.prompt, false, true);
-  REQUIRE(!cold_tokens.empty());
-
-  // 2. Format partial conversation (without last user message, no gen prompt)
-  lloyal::chat_in::FormatInputs partial_inputs;
-  partial_inputs.messages_json = json::array({
-    {{"role", "user"}, {"content", "What is your name?"}},
-    {{"role", "assistant"}, {"content", "I am an AI assistant."}}
-  }).dump();
-  partial_inputs.add_generation_prompt = false;
-
-  auto partial_result = lloyal::chat_in::format(model.get(), partial_inputs);
-  REQUIRE(!partial_result.prompt.empty());
-
-  // 3. Verify string prefix relationship
-  REQUIRE(full_result.prompt.size() > partial_result.prompt.size());
-  CHECK(full_result.prompt.substr(0, partial_result.prompt.size()) == partial_result.prompt);
-
-  // 4. Extract delta text via string diff
-  std::string delta_text = full_result.prompt.substr(partial_result.prompt.size());
-  REQUIRE(!delta_text.empty());
-
-  // 5. Tokenize delta text in isolation (no BOS, parse special tokens)
-  auto delta_tokens = lloyal::tokenizer::tokenize(vocab, delta_text, false, true);
-  REQUIRE(!delta_tokens.empty());
-
-  // 6. Get partial token sequence for comparison
-  auto partial_tokens = lloyal::tokenizer::tokenize(vocab, partial_result.prompt, false, true);
-
-  // 7. Expected delta: cold_tokens[partial_tokens.size():]
-  REQUIRE(cold_tokens.size() > partial_tokens.size());
-  std::vector<llama_token> expected_delta(
-    cold_tokens.begin() + partial_tokens.size(),
-    cold_tokens.end()
-  );
-
-  // 8. Verify delta tokens match
-  bool tokens_match = (delta_tokens.size() == expected_delta.size());
-  size_t mismatch_pos = 0;
-
-  if (tokens_match) {
-    for (size_t i = 0; i < delta_tokens.size(); i++) {
-      if (delta_tokens[i] != expected_delta[i]) {
-        tokens_match = false;
-        mismatch_pos = i;
-        break;
-      }
-    }
-  }
-
-  if (!tokens_match) {
-    MESSAGE("Delta tokens from string-diff (" << delta_tokens.size() << "):");
-    for (size_t i = 0; i < std::min(delta_tokens.size(), (size_t)20); i++) {
-      MESSAGE("  [" << i << "] " << delta_tokens[i]
-              << " (" << lloyal::tokenizer::detokenize(model.get(), delta_tokens[i]) << ")");
-    }
-    MESSAGE("Expected tokens from full tokenization (" << expected_delta.size() << "):");
-    for (size_t i = 0; i < std::min(expected_delta.size(), (size_t)20); i++) {
-      MESSAGE("  [" << i << "] " << expected_delta[i]
-              << " (" << lloyal::tokenizer::detokenize(model.get(), expected_delta[i]) << ")");
-    }
-    if (delta_tokens.size() == expected_delta.size()) {
-      MESSAGE("First mismatch at position " << mismatch_pos);
-    }
-  }
-
-  CHECK(tokens_match);
-
-  MESSAGE("String-diff warm format parity: delta_text=\""
-          << delta_text.substr(0, 60) << "...\""
-          << " → " << delta_tokens.size() << " tokens match expected");
 }

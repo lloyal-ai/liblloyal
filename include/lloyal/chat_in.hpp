@@ -175,6 +175,31 @@ inline FormatResult format(const llama_model *model, const FormatInputs& inputs)
       // Apply template
       common_chat_params params = common_chat_templates_apply(tmpls.get(), tmpl_inputs);
 
+      // Implicit empty system prompt stripping: if messages[0] is {system, ""},
+      // strip the resulting empty system block from the output. This lets callers
+      // suppress template auto-injection (e.g. SmolLM2/ChatML) by prepending an
+      // empty system message — the library completes the intent by removing the
+      // rendered empty block, leaving only the user+assistant portion.
+      if (!messages.empty() && messages[0].role == "system" && messages[0].content.empty()) {
+        common_chat_msg sys_msg;
+        sys_msg.role = "system";
+        sys_msg.content = "";
+
+        common_chat_templates_inputs sys_inputs;
+        sys_inputs.messages = {sys_msg};
+        sys_inputs.add_generation_prompt = false;
+        sys_inputs.use_jinja = true;
+        auto sys_params = common_chat_templates_apply(tmpls.get(), sys_inputs);
+
+        const auto& sys_prefix = sys_params.prompt;
+        if (!sys_prefix.empty() &&
+            params.prompt.size() >= sys_prefix.size() &&
+            params.prompt.substr(0, sys_prefix.size()) == sys_prefix) {
+          params.prompt = params.prompt.substr(sys_prefix.size());
+          LLOYAL_LOG_DEBUG("[chat_in::format] Stripped empty system prefix (%zu bytes)", sys_prefix.size());
+        }
+      }
+
       // Populate ALL result fields from common_chat_params
       result.prompt = params.prompt;
       result.additional_stops = params.additional_stops;

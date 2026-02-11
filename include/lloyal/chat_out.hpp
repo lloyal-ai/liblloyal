@@ -52,11 +52,32 @@ struct ToolCall {
 
 /**
  * @brief Result from parsing model output
+ *
+ * For thinking models (e.g. Qwen3), @c reasoning_content contains text from
+ * `<think>...</think>` blocks while @c content contains the visible response.
+ * Store both fields separately in your message history so that
+ * chat_in::format() can reconstruct the template correctly on subsequent turns.
+ *
+ * @code{.cpp}
+ * auto parsed = chat_out::parse(raw_output, fmt.format, fmt.reasoning_format,
+ *                                false, fmt.thinking_forced_open, fmt.parser);
+ *
+ * // Build assistant message with separate fields
+ * json assistant_msg = {{"role", "assistant"}, {"content", parsed.content}};
+ * if (!parsed.reasoning_content.empty()) {
+ *   assistant_msg["reasoning_content"] = parsed.reasoning_content;
+ * }
+ * messages.push_back(assistant_msg);
+ *
+ * // On next turn, format() reconstructs thinking blocks from reasoning_content
+ * full_inputs.messages_json = messages.dump();
+ * auto full_result = chat_in::format(model, full_inputs);
+ * @endcode
  */
 struct ParseResult {
-  std::string content;              ///< Main response text
-  std::string reasoning_content;    ///< Extracted thinking/reasoning blocks
-  std::vector<ToolCall> tool_calls; ///< Extracted tool calls (empty if none)
+  std::string content;              ///< Main response text (visible to user)
+  std::string reasoning_content;    ///< Extracted thinking/reasoning blocks (empty if none)
+  std::vector<ToolCall> tool_calls; ///< Extracted tool calls (empty array if none)
 };
 
 /**
@@ -92,6 +113,30 @@ struct ParseResult {
  * if (!parsed.tool_calls.empty()) {
  *   // Handle tool calls
  * }
+ * @endcode
+ *
+ * @par Cold Restart with Thinking Models
+ * When storing assistant messages for potential cold restart (re-formatting the
+ * full conversation from scratch), parse output to separate reasoning from content.
+ * This is important for thinking models (Qwen3, DeepSeek-R1, etc.) where the raw
+ * output contains `<think>...</think>` blocks — storing raw output as content would
+ * re-inject thinking tags as literal text when re-formatted.
+ *
+ *
+ * @code{.cpp}
+ * // After generating tokens, detokenize the raw output
+ * std::string raw_output = detokenized_text;
+ *
+ * // Parse: separates reasoning from content
+ * auto parsed = chat_out::parse(raw_output, fmt.format,
+ *     fmt.reasoning_format, false, fmt.thinking_forced_open, fmt.parser);
+ *
+ * // Store with separate fields for correct re-formatting on cold restart
+ * json msg = {{"role", "assistant"}, {"content", parsed.content}};
+ * if (!parsed.reasoning_content.empty()) {
+ *   msg["reasoning_content"] = parsed.reasoning_content;
+ * }
+ * messages.push_back(msg);
  * @endcode
  */
 inline ParseResult parse(
