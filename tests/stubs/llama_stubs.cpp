@@ -351,6 +351,10 @@ int llama_token_to_piece(const llama_vocab *vocab, llama_token /*token*/,
 // Singleton vocab handle for get_vocab
 static llama_vocab g_vocab_handle;
 
+uint32_t llama_n_batch(const llama_context * /*ctx*/) {
+  return 512;  // Default batch size
+}
+
 float *llama_get_logits_ith(llama_context * /*ctx*/, int32_t /*i*/) {
   if (g_stub_config.logits.empty()) {
     return nullptr;

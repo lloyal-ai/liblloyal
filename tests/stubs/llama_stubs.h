@@ -153,6 +153,9 @@ extern "C" {
         bool special
     );
 
+    // Context parameters
+    uint32_t llama_n_batch(const llama_context* ctx);
+
     // Sampling operations
     float* llama_get_logits_ith(llama_context* ctx, int32_t i);
     int llama_vocab_n_tokens(const llama_vocab* vocab);

@@ -26,47 +26,56 @@
 
 #include <llama/llama.h>
 #include <stdexcept>
+#include <string>
 
 namespace lloyal::logits {
 
 /**
- * Get raw logits pointer (zero-copy)
+ * @brief Zero-copy access to logits from the last decode call
  *
  * Returns a pointer to the internal llama.cpp logits buffer.
- * This is a zero-copy operation - no data is copied.
+ * This is a zero-copy operation — no data is copied.
  *
  * @param ctx Llama context (must not be null)
- * @param step Step index: -1 for last step (default), or specific step index
- * @returns Pointer to float array of size vocab_size
+ * @param index Batch index passed to llama_get_logits_ith():
+ *              - `-1` — last token (default; single-sequence decode)
+ *              - `i`  — batch slot `i` from decode::each()
+ *              - flattened cursor position from decode::scatter()
+ * @returns Pointer to float array of size n_vocab
  * @throws std::runtime_error if ctx is null or logits unavailable
  *
- * IMPORTANT - Pointer Lifetime:
- * - Valid only until next decode()/encode()/dispose() call
- * - Points to llama.cpp internal memory (do NOT free)
- * - Requires decode() was called with logits=true for the step
+ * @warning Pointer lifetime: valid only until the next
+ *          decode()/encode()/dispose() call. Points to llama.cpp
+ *          internal memory — do NOT free. Requires decode() was
+ *          called with logits=true for this index.
  *
- * EXAMPLE:
- *   // After decode with logits=true
+ * @example
+ * @code
+ *   // Single-sequence (last token):
  *   float* logits = lloyal::logits::get(ctx);
- *   int n_vocab = lloyal::tokenizer::vocab_size(model);
  *
- *   // Compute entropy, sample, etc. - all synchronous
- *   float max_logit = *std::max_element(logits, logits + n_vocab);
+ *   // Batched (decode::each slot i):
+ *   float* logits = lloyal::logits::get(ctx, i);
  *
- *   // After next decode(), logits pointer is INVALID
- *   await ctx.decode(next_tokens);
- *   // logits now points to different/stale data!
+ *   // Batched (decode::scatter flattened cursor):
+ *   int32_t cursor = sum_of_previous_token_counts + n_tokens_k - 1;
+ *   float* logits = lloyal::logits::get(ctx, cursor);
+ * @endcode
+ *
+ * @see BranchStore::decode_each() for batch-slot index usage
+ * @see BranchStore::decode_scatter() for flattened-cursor index usage
  */
-inline float* get(llama_context* ctx, int32_t step = -1) {
+inline float* get(llama_context* ctx, int32_t index = -1) {
     if (!ctx) {
         throw std::runtime_error("logits::get - NULL context");
     }
 
-    float* ptr = llama_get_logits_ith(ctx, step);
+    float* ptr = llama_get_logits_ith(ctx, index);
     if (!ptr) {
         throw std::runtime_error(
-            "logits::get - Failed to get logits. "
-            "Ensure decode() was called with logits=true for this step."
+            "logits::get - Failed to get logits at index " +
+            std::to_string(index) + ". "
+            "Ensure decode() was called with logits=true for this index."
         );
     }
 

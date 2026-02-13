@@ -437,9 +437,9 @@ public:
     // Capture logits and update positions
     llama_context* ctx = states[0]->ctx;
     for (int32_t i = 0; i < n; ++i) {
-      const float* raw_logits = llama_get_logits_ith(ctx, i);
-      if (!raw_logits || states[i]->n_vocab <= 0) {
-        throw std::runtime_error("BranchStore::decode_each - failed to get logits at index " + std::to_string(i));
+      const float* raw_logits = logits::get(ctx, i);  // throws on null
+      if (states[i]->n_vocab <= 0) {
+        throw std::runtime_error("BranchStore::decode_each - invalid vocab size at index " + std::to_string(i));
       }
       std::memcpy(states[i]->logits_snapshot.data(), raw_logits,
                   states[i]->n_vocab * sizeof(float));
@@ -572,9 +572,9 @@ public:
           int32_t idx = chunk_indices[k];
           int32_t logit_pos = cursor + chunk_items[k].n_tokens - 1;
 
-          const float* raw_logits = llama_get_logits_ith(ctx, logit_pos);
-          if (!raw_logits || states[idx]->n_vocab <= 0) {
-            throw std::runtime_error("BranchStore::decode_scatter - failed to get logits for item " + std::to_string(idx));
+          const float* raw_logits = logits::get(ctx, logit_pos);  // throws on null
+          if (states[idx]->n_vocab <= 0) {
+            throw std::runtime_error("BranchStore::decode_scatter - invalid vocab size for item " + std::to_string(idx));
           }
           std::memcpy(states[idx]->logits_snapshot.data(), raw_logits,
                       states[idx]->n_vocab * sizeof(float));
