@@ -12,27 +12,6 @@
 #include <vector>
 
 /**
- * LLOYAL_STACK_BATCH - Controls llama_batch construction strategy
- *
- * When 1 (default): Use zero-allocation stack-constructed batch in decode::one()
- *   - Fastest: no heap allocation per decode
- *   - Risk: breaks if llama_batch struct layout changes
- *
- * When 0: Use thread_local batch via llama_batch_init()
- *   - Slightly slower: one-time init per thread
- *   - Safe: uses llama.cpp's own initializer, handles new fields
- *
- * If build breaks after llama.cpp update due to llama_batch changes:
- *   1. Set LLOYAL_STACK_BATCH=0 to unblock immediately
- *   2. Update decode::one() to match new struct layout
- *   3. Update ABI stability test assertions
- *   4. Re-enable LLOYAL_STACK_BATCH=1
- */
-#ifndef LLOYAL_STACK_BATCH
-#define LLOYAL_STACK_BATCH 1
-#endif
-
-/**
  * @file decode.hpp
  * @brief Batch Decoding Operations
  *
@@ -54,7 +33,7 @@
 namespace lloyal::decode {
 
 /**
- * Process tokens through model to update KV cache
+ * @brief Decode multiple tokens into the KV cache with auto-chunking
  *
  * Orchestration logic:
  * 1. Initializes batch with RAII cleanup
@@ -100,6 +79,9 @@ namespace lloyal::decode {
  * @throws std::runtime_error if ctx is NULL or tokens are invalid (validation errors)
  *
  * CRITICAL: Call kv::remove_range() BEFORE this function, never after.
+ *
+ * @see one() for single-token decode (autoregressive generation)
+ * @see scatter() for multi-token decode across multiple sequences
  */
 [[nodiscard]] inline int many(llama_context *ctx, const llama_token *tokens,
                                int32_t n_tokens, int32_t n_past, int32_t n_batch,
@@ -165,9 +147,7 @@ namespace lloyal::decode {
   return 0;
 }
 
-/**
- * Convenience overload for std::vector<llama_token>
- */
+/// @overload
 [[nodiscard]] inline int many(llama_context *ctx,
                                const std::vector<llama_token> &tokens,
                                int32_t n_past, int32_t n_batch,
@@ -177,20 +157,28 @@ namespace lloyal::decode {
 }
 
 /**
- * Decode a single token with zero heap allocation (when LLOYAL_STACK_BATCH=1)
+ * @brief Decode a single token into the KV cache
  *
- * Uses stack-allocated llama_batch to avoid llama_batch_init() overhead.
- * This is the fast path for single-token expansion.
+ * Fast path for autoregressive generation. Uses a thread_local batch
+ * (one-time init per thread) so repeated calls avoid allocation entirely.
  *
- * If LLOYAL_STACK_BATCH=0, uses thread_local batch for ABI safety.
+ * Typical usage in a generation loop:
+ * @code
+ *   llama_token tok = sampler::sample(ctx, vocab);
+ *   if (decode::one(ctx, tok, n_past++) != 0) { handle error }
+ * @endcode
  *
- * @param ctx Llama context
- * @param tok Token to decode
- * @param pos Position in KV cache
- * @param seq_id Sequence ID (default: 0)
- * @param want_logits Request logits for this token (default: true)
+ * @param ctx    Llama context (must not be null)
+ * @param tok    Token to decode
+ * @param pos    KV cache position for this token
+ * @param seq_id Sequence ID to update (default: 0)
+ * @param want_logits Whether to compute logits after this token (default: true).
+ *                    Set to false when prefilling tokens that don't need sampling.
  * @return 0 on success, non-zero on decode failure
  * @throws std::runtime_error if ctx is NULL
+ *
+ * @see many() for batched multi-token decode with auto-chunking
+ * @see each() for single-token decode across multiple sequences
  */
 [[nodiscard]] inline int one(llama_context *ctx, llama_token tok, llama_pos pos,
                               llama_seq_id seq_id = 0, bool want_logits = true) {
@@ -198,27 +186,6 @@ namespace lloyal::decode {
     throw std::runtime_error("decode::one - NULL context");
   }
 
-#if LLOYAL_STACK_BATCH
-  // Fast path: zero-allocation stack-constructed batch
-  // WARNING: ABI-fragile - breaks if llama_batch struct layout changes
-  llama_token tok_arr[1] = {tok};
-  llama_pos pos_arr[1] = {pos};
-  int32_t n_seq_id_arr[1] = {1};
-  llama_seq_id seq_arr[1] = {seq_id};
-  llama_seq_id *seq_ptrs[1] = {seq_arr};
-  int8_t logits_arr[1] = {static_cast<int8_t>(want_logits)};
-
-  llama_batch batch{};
-  batch.n_tokens = 1;
-  batch.token = tok_arr;
-  batch.embd = nullptr;
-  batch.pos = pos_arr;
-  batch.n_seq_id = n_seq_id_arr;
-  batch.seq_id = seq_ptrs;
-  batch.logits = logits_arr;
-#else
-  // Safe path: thread_local batch via llama.cpp's own initializer
-  // Handles any new fields with defaults, survives ABI changes
   thread_local llama_batch batch = llama_batch_init(1, 0, 1);
 
   batch.n_tokens = 1;
@@ -227,7 +194,6 @@ namespace lloyal::decode {
   batch.n_seq_id[0] = 1;
   batch.seq_id[0][0] = seq_id;
   batch.logits[0] = static_cast<int8_t>(want_logits);
-#endif
 
   return llama_decode(ctx, batch);
 }
@@ -237,28 +203,31 @@ namespace lloyal::decode {
 // ============================================================================
 
 /**
- * @brief Input item for decode::each: one token for one sequence
+ * @brief Input item for decode::each — one token for one sequence
  */
 struct EachItem {
-  llama_token token;
-  llama_pos pos;
-  llama_seq_id seq_id;
-  bool output_logits = false;
+  llama_token token;            ///< Token to decode
+  llama_pos pos;                ///< KV cache position for this token
+  llama_seq_id seq_id;          ///< Target sequence ID
+  bool output_logits = false;   ///< Whether to compute logits after this token
 };
 
 /**
- * @brief Input item for decode::scatter: multiple tokens for one sequence
+ * @brief Input item for decode::scatter — multiple tokens for one sequence
  */
 struct ScatterItem {
-  const llama_token* tokens;
-  int32_t n_tokens;
-  llama_pos start_pos;
-  llama_seq_id seq_id;
-  bool output_logits_last_only = false;
+  const llama_token* tokens;              ///< Token array (not owned)
+  int32_t n_tokens;                       ///< Number of tokens in array
+  llama_pos start_pos;                    ///< KV cache position for first token
+  llama_seq_id seq_id;                    ///< Target sequence ID
+  bool output_logits_last_only = false;   ///< Compute logits only for last token
 };
 
 /**
- * @brief Reusable scratch buffers for multi-seq batch construction
+ * @brief Reusable scratch buffers for multi-sequence batch construction
+ *
+ * Holds pre-allocated vectors that back the llama_batch pointers.
+ * Reuse a single Scratch across calls to avoid per-decode allocation.
  */
 struct Scratch {
   std::vector<llama_token> tokens_;
@@ -303,6 +272,9 @@ struct Scratch {
  * @param scratch Reusable scratch buffers
  * @return 0 on success, non-zero on failure
  * @throws std::runtime_error if ctx is NULL
+ *
+ * @see one() for single-sequence single-token decode
+ * @see scatter() for multi-token-per-sequence variant
  */
 [[nodiscard]] inline int each(llama_context* ctx,
                                const EachItem* items,
@@ -331,7 +303,7 @@ struct Scratch {
   return llama_decode(ctx, batch);
 }
 
-// Vector overload
+/// @overload
 [[nodiscard]] inline int each(llama_context* ctx,
                                const std::vector<EachItem>& items,
                                Scratch& scratch) {
@@ -341,7 +313,8 @@ struct Scratch {
 /**
  * @brief Decode multiple tokens per sequence in a single llama_decode() call
  *
- * Packs token runs from multiple sequences into one llama_batch.
+ * Single-batch primitive: packs token runs from multiple sequences into one
+ * llama_batch. Does NOT auto-chunk — total tokens must fit in n_batch.
  *
  * @param ctx Llama context (must not be null)
  * @param items Array of (tokens, n_tokens, start_pos, seq_id) tuples
@@ -351,11 +324,15 @@ struct Scratch {
  * @throws std::runtime_error if ctx is NULL or items are invalid
  *
  * @note Does NOT auto-chunk. Total tokens must fit in n_batch.
+ *
+ * @see many() for single-sequence multi-token decode with auto-chunking
+ * @see each() for single-token-per-sequence variant
+ * @see BranchStore::decode_scatter for auto-chunking branch-level variant
  */
 [[nodiscard]] inline int scatter(llama_context* ctx,
-                                  const ScatterItem* items,
-                                  int32_t n,
-                                  Scratch& scratch) {
+                                        const ScatterItem* items,
+                                        int32_t n,
+                                        Scratch& scratch) {
   if (!ctx) {
     throw std::runtime_error("decode::scatter - NULL context");
   }
@@ -401,80 +378,11 @@ struct Scratch {
   return llama_decode(ctx, batch);
 }
 
-// Vector overload
+/// @overload
 [[nodiscard]] inline int scatter(llama_context* ctx,
-                                  const std::vector<ScatterItem>& items,
-                                  Scratch& scratch) {
+                                        const std::vector<ScatterItem>& items,
+                                        Scratch& scratch) {
   return scatter(ctx, items.data(), static_cast<int32_t>(items.size()), scratch);
 }
 
 } // namespace lloyal::decode
-
-// ============================================================================
-// Backward Compatibility Aliases (deprecated)
-// ============================================================================
-// These aliases provide backward compatibility during migration.
-// They will be removed in a future release.
-
-namespace lloyal::decoder {
-
-using MultiSeqItem = decode::EachItem;
-using ScatterItem = decode::ScatterItem;
-using MultiSeqScratch = decode::Scratch;
-
-// decode_tokens -> decode::many (throws on error for backward compat)
-inline void decode_tokens(llama_context *ctx, const llama_token *tokens,
-                          int32_t n_tokens, int32_t n_past, int32_t n_batch,
-                          llama_seq_id seq_id = 0) {
-  int result = decode::many(ctx, tokens, n_tokens, n_past, n_batch, seq_id);
-  if (result != 0) {
-    throw std::runtime_error("decoder::decode_tokens - llama_decode failed");
-  }
-}
-
-inline void decode_tokens(llama_context *ctx,
-                          const std::vector<llama_token> &tokens,
-                          int32_t n_past, int32_t n_batch,
-                          llama_seq_id seq_id = 0) {
-  decode_tokens(ctx, tokens.data(), static_cast<int32_t>(tokens.size()), n_past,
-                n_batch, seq_id);
-}
-
-// decode_one -> decode::one (throws on error for backward compat)
-inline void decode_one(llama_context *ctx, llama_token tok, llama_pos pos,
-                       llama_seq_id seq_id = 0, bool want_logits = true) {
-  int result = decode::one(ctx, tok, pos, seq_id, want_logits);
-  if (result != 0) {
-    throw std::runtime_error("decoder::decode_one - llama_decode failed");
-  }
-}
-
-// decode_multiseq -> decode::each
-[[nodiscard]] inline int decode_multiseq(llama_context* ctx,
-                                         const MultiSeqItem* items,
-                                         int32_t n,
-                                         MultiSeqScratch& scratch) {
-  return decode::each(ctx, items, n, scratch);
-}
-
-[[nodiscard]] inline int decode_multiseq(llama_context* ctx,
-                                         const std::vector<MultiSeqItem>& items,
-                                         MultiSeqScratch& scratch) {
-  return decode::each(ctx, items, scratch);
-}
-
-// decode_scatter -> decode::scatter
-[[nodiscard]] inline int decode_scatter(llama_context* ctx,
-                                        const ScatterItem* items,
-                                        int32_t n,
-                                        MultiSeqScratch& scratch) {
-  return decode::scatter(ctx, items, n, scratch);
-}
-
-[[nodiscard]] inline int decode_scatter(llama_context* ctx,
-                                        const std::vector<ScatterItem>& items,
-                                        MultiSeqScratch& scratch) {
-  return decode::scatter(ctx, items, scratch);
-}
-
-} // namespace lloyal::decoder

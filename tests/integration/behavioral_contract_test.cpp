@@ -304,7 +304,7 @@ TEST_CASE("Behavioral: Batch decode processing is consistent") {
   // Decode tokens using our batching facade
   std::vector<llama_token> tokens(50, 100); // 50 identical tokens
 
-  REQUIRE_NOTHROW(decoder::decode_tokens(ctx, tokens, 0, 128));
+  REQUIRE(decode::many(ctx, tokens, 0, 128) == 0);
 
   // Verify KV cache has expected state
   llama_pos max_pos = kv::pos_max(ctx, 0);
@@ -328,8 +328,8 @@ TEST_CASE("Behavioral: Error conditions produce expected behavior") {
 
   // Test null safety (should throw, not crash)
   std::vector<llama_token> empty_tokens;
-  CHECK_THROWS(decoder::decode_tokens(nullptr, empty_tokens, 0, 128));
-  CHECK_THROWS(decoder::decode_tokens(ctx, empty_tokens, 0, 128));
+  CHECK_THROWS(decode::many(nullptr, empty_tokens, 0, 128));
+  CHECK_THROWS(decode::many(ctx, empty_tokens, 0, 128));
 
   // Test empty KV cache state (should return 0, not crash)
   size_t empty_size = kv::state_size(ctx, 0);

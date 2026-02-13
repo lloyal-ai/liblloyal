@@ -563,7 +563,9 @@ inline void clear_and_reseed(llama_context *ctx,
   // Re-decode sinks at position 0
   if (!original_sinks.empty()) {
     LLOYAL_LOG_DEBUG("[kv::clear_and_reseed] Re-decoding %zu sinks at position 0", original_sinks.size());
-    lloyal::decoder::decode_tokens(ctx, original_sinks, 0, n_batch);
+    if (lloyal::decode::many(ctx, original_sinks, 0, n_batch) != 0) {
+      throw std::runtime_error("kv::clear_and_reseed - llama_decode failed on sinks");
+    }
   }
 
   // Re-decode tail at position sinks.size()
@@ -571,7 +573,9 @@ inline void clear_and_reseed(llama_context *ctx,
     int32_t tail_start_pos = static_cast<int32_t>(original_sinks.size());
     LLOYAL_LOG_DEBUG("[kv::clear_and_reseed] Re-decoding %zu tail tokens at position %d",
                      tail.size(), tail_start_pos);
-    lloyal::decoder::decode_tokens(ctx, tail, tail_start_pos, n_batch);
+    if (lloyal::decode::many(ctx, tail, tail_start_pos, n_batch) != 0) {
+      throw std::runtime_error("kv::clear_and_reseed - llama_decode failed on tail");
+    }
   }
 
   // Verify final state

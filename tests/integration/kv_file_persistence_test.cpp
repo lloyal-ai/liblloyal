@@ -54,7 +54,7 @@ TEST_CASE("Integration: write_file/read_file round-trip") {
   auto tokens = tokenizer::tokenize(vocab, test_text, false, false);
   REQUIRE_FALSE(tokens.empty());
 
-  decoder::decode_tokens(ctx, tokens, 0, ctx_params.n_batch);
+  REQUIRE(decode::many(ctx, tokens, 0, ctx_params.n_batch) == 0);
 
   // 2. Write state to file
   const std::string filepath = "test_session.llama";
@@ -104,7 +104,7 @@ TEST_CASE("Integration: write_file creates valid session format") {
 
   // Populate cache
   std::vector<llama_token> tokens = {1, 100, 200, 300, 400};
-  decoder::decode_tokens(ctx, tokens, 0, ctx_params.n_batch);
+  REQUIRE(decode::many(ctx, tokens, 0, ctx_params.n_batch) == 0);
 
   // Write file
   const std::string filepath = "validation_test.llama";
@@ -185,7 +185,7 @@ TEST_CASE("Integration: write_file/read_file preserves generation capability") {
   // Setup: decode prompt
   std::string prompt = "Hello world";
   auto tokens = tokenizer::tokenize(vocab, prompt, false, false);
-  decoder::decode_tokens(ctx, tokens, 0, ctx_params.n_batch);
+  REQUIRE(decode::many(ctx, tokens, 0, ctx_params.n_batch) == 0);
 
   // Sample one token BEFORE save
   llama_token token_before = sampler::greedy(ctx, vocab);
@@ -234,7 +234,7 @@ TEST_CASE("Integration: write_file/read_file with larger context") {
   auto tokens = tokenizer::tokenize(vocab, long_text, false, false);
   REQUIRE(tokens.size() > 20); // Ensure we have a reasonable token count
 
-  decoder::decode_tokens(ctx, tokens, 0, ctx_params.n_batch);
+  REQUIRE(decode::many(ctx, tokens, 0, ctx_params.n_batch) == 0);
 
   // Write and read
   const std::string filepath = "large_context_test.llama";

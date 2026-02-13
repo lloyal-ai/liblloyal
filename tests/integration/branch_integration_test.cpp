@@ -27,69 +27,6 @@
 #include <string>
 #include <vector>
 
-// ============================================================================
-// ABI Stability Check for llama_batch
-// ============================================================================
-// decoder::decode_one() uses a manually-constructed llama_batch on the stack
-// for zero-allocation performance. This test catches ABI drift if llama.cpp
-// adds/removes/reorders fields in the llama_batch struct.
-//
-// If this test fails after updating llama.cpp:
-// 1. Check what changed in llama_batch (llama.h)
-// 2. Update decoder::decode_one() to match
-// 3. Update these assertions
-// ============================================================================
-
-TEST_CASE("llama_batch ABI stability check") {
-  // Verify struct size hasn't changed unexpectedly
-  // Current llama_batch has 7 pointer/int fields:
-  //   int32_t n_tokens, token*, embd*, pos*, n_seq_id*, seq_id**, logits*
-  // On 64-bit: 4 + 8*6 = 52 bytes, padded to 56 bytes typically
-  // But actual size depends on alignment - just check it's reasonable
-  constexpr size_t batch_size = sizeof(llama_batch);
-  CHECK(batch_size >= 48);   // Minimum: 6 pointers + 1 int32
-  CHECK(batch_size <= 128);  // Maximum: generous padding allowance
-
-  // Verify field offsets match our manual construction in decode_one()
-  // This catches reordering even if size stays the same
-  llama_batch batch{};
-
-  // Set sentinel values
-  batch.n_tokens = 0x12345678;
-  llama_token tok = 0xABCD;
-  batch.token = &tok;
-
-  // Verify we can read back via struct - proves field offset is correct
-  CHECK(batch.n_tokens == 0x12345678);
-  CHECK(batch.token == &tok);
-  CHECK(*batch.token == 0xABCD);
-
-  // Verify all expected fields exist and are accessible
-  // (Compile error here means field was removed/renamed)
-  [[maybe_unused]] auto* p1 = batch.token;
-  [[maybe_unused]] auto* p2 = batch.embd;
-  [[maybe_unused]] auto* p3 = batch.pos;
-  [[maybe_unused]] auto* p4 = batch.n_seq_id;
-  [[maybe_unused]] auto* p5 = batch.seq_id;
-  [[maybe_unused]] auto* p6 = batch.logits;
-
-  // Verify llama_batch_init produces compatible struct
-  // This is the "ground truth" - if our manual construction differs, we're wrong
-  llama_batch init_batch = llama_batch_init(1, 0, 1);
-  CHECK(init_batch.n_tokens == 0);  // init sets to 0, not capacity
-  CHECK(init_batch.token != nullptr);
-  CHECK(init_batch.pos != nullptr);
-  CHECK(init_batch.n_seq_id != nullptr);
-  CHECK(init_batch.seq_id != nullptr);
-  CHECK(init_batch.logits != nullptr);
-  // embd is nullptr when embd param is 0
-  CHECK(init_batch.embd == nullptr);
-
-  llama_batch_free(init_batch);
-
-  MESSAGE("llama_batch ABI check passed - struct layout matches decode_one() assumptions");
-}
-
 using namespace lloyal;
 using namespace lloyal::branch;
 
@@ -1410,5 +1347,249 @@ TEST_CASE("branch integration: slot reuse does not leak steer_fn") {
   MESSAGE("greedy=" << greedy_token << ", A(steered)=" << a_token << ", B=" << b_token);
 
   destroy(b, &store);
+  llama_free(ctx);
+}
+
+// ============================================================================
+// Batched Branch Decode Tests (BranchStore::decode_each / decode_scatter)
+// ============================================================================
+
+TEST_CASE("branch integration: BranchStore::decode_each batches N branches") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 1024;
+  cparams.n_batch = 128;
+  cparams.n_seq_max = 8;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+
+  BranchStore store(16);
+  TestParams params;
+
+  const llama_vocab* vocab = llama_model_get_vocab(model.get());
+  int32_t n_vocab = llama_vocab_n_tokens(vocab);
+  auto prompt = tokenizer::tokenize(vocab, "The answer is", true, false);
+  REQUIRE(!prompt.empty());
+
+  // Create root branch and decode shared prefix
+  BranchHandle root = create(ctx, model.get(), 0, 0, params, 64, nullptr, nullptr, &store);
+  REQUIRE(root != INVALID_HANDLE);
+  decode_batch(root, prompt.data(), prompt.size(), &store);
+  llama_pos prefix_pos = get_position(root, &store);
+
+  // Fork 4 children
+  constexpr int N = 4;
+  BranchHandle children[N];
+  for (int i = 0; i < N; ++i) {
+    children[i] = fork(root, static_cast<llama_seq_id>(i + 1), &store);
+    REQUIRE(children[i] != INVALID_HANDLE);
+    CHECK(get_position(children[i], &store) == prefix_pos);
+  }
+
+  // Pick a different token for each child
+  llama_token tokens[N];
+  for (int i = 0; i < N; ++i) {
+    tokens[i] = static_cast<llama_token>((100 + i * 50) % n_vocab);
+  }
+
+  // Batch decode all 4 in one GPU dispatch
+  decode::Scratch scratch;
+  CHECK_NOTHROW(store.decode_each(children, tokens, N, scratch));
+
+  // Verify all 4 branches advanced by 1
+  for (int i = 0; i < N; ++i) {
+    CHECK(get_position(children[i], &store) == prefix_pos + 1);
+  }
+
+  // Verify all 4 branches have valid logits in their snapshots
+  for (int i = 0; i < N; ++i) {
+    const float* logits = get_logits(children[i], &store);
+    REQUIRE(logits != nullptr);
+
+    // Check logits have non-zero values
+    float sum = 0.0f;
+    for (int j = 0; j < std::min(100, n_vocab); ++j) {
+      sum += std::abs(logits[j]);
+    }
+    CHECK(sum > 0.0f);
+  }
+
+  // Verify logits are at independent memory locations
+  for (int i = 0; i < N; ++i) {
+    for (int j = i + 1; j < N; ++j) {
+      CHECK(get_logits(children[i], &store) != get_logits(children[j], &store));
+    }
+  }
+
+  // Root should be unchanged
+  CHECK(get_position(root, &store) == prefix_pos);
+
+  INFO("decode_each: batched " << N << " branches in single dispatch");
+
+  destroy(root, &store);
+  for (int i = 0; i < N; ++i) {
+    destroy(children[i], &store);
+  }
+  llama_free(ctx);
+}
+
+TEST_CASE("branch integration: BranchStore::decode_scatter batches asymmetric prefill") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 2048;
+  cparams.n_batch = 512;
+  cparams.n_seq_max = 8;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+
+  BranchStore store(16);
+  TestParams params;
+
+  const llama_vocab* vocab = llama_model_get_vocab(model.get());
+  int32_t n_vocab = llama_vocab_n_tokens(vocab);
+  auto prompt = tokenizer::tokenize(vocab, "Hello", true, false);
+  REQUIRE(!prompt.empty());
+
+  // Create root and decode shared prefix
+  BranchHandle root = create(ctx, model.get(), 0, 0, params, 512, nullptr, nullptr, &store);
+  REQUIRE(root != INVALID_HANDLE);
+  decode_batch(root, prompt.data(), prompt.size(), &store);
+  llama_pos prefix_pos = get_position(root, &store);
+
+  // Fork 3 children with different token counts
+  constexpr int N = 3;
+  const int32_t counts[] = {5, 20, 8};
+
+  BranchHandle children[N];
+  for (int i = 0; i < N; ++i) {
+    children[i] = fork(root, static_cast<llama_seq_id>(i + 1), &store);
+    REQUIRE(children[i] != INVALID_HANDLE);
+  }
+
+  // Build token arrays for each child
+  std::vector<llama_token> token_buf_0(counts[0]);
+  std::vector<llama_token> token_buf_1(counts[1]);
+  std::vector<llama_token> token_buf_2(counts[2]);
+
+  for (int j = 0; j < counts[0]; ++j) token_buf_0[j] = static_cast<llama_token>((100 + j) % n_vocab);
+  for (int j = 0; j < counts[1]; ++j) token_buf_1[j] = static_cast<llama_token>((200 + j) % n_vocab);
+  for (int j = 0; j < counts[2]; ++j) token_buf_2[j] = static_cast<llama_token>((300 + j) % n_vocab);
+
+  const llama_token* arrays[] = {token_buf_0.data(), token_buf_1.data(), token_buf_2.data()};
+
+  // Batch decode all 3 with different token counts
+  decode::Scratch scratch;
+  CHECK_NOTHROW(store.decode_scatter(children, arrays, counts, N, scratch));
+
+  // Verify positions advanced correctly
+  for (int i = 0; i < N; ++i) {
+    CHECK(get_position(children[i], &store) == prefix_pos + counts[i]);
+  }
+
+  // Verify logits captured for all 3
+  for (int i = 0; i < N; ++i) {
+    const float* logits = get_logits(children[i], &store);
+    REQUIRE(logits != nullptr);
+
+    float sum = 0.0f;
+    for (int j = 0; j < std::min(100, n_vocab); ++j) {
+      sum += std::abs(logits[j]);
+    }
+    CHECK(sum > 0.0f);
+  }
+
+  INFO("decode_scatter: batched asymmetric prefill (" << counts[0] << ", " << counts[1] << ", " << counts[2] << " tokens)");
+
+  destroy(root, &store);
+  for (int i = 0; i < N; ++i) {
+    destroy(children[i], &store);
+  }
+  llama_free(ctx);
+}
+
+TEST_CASE("branch integration: BranchStore::decode_scatter auto-chunks with small n_batch") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 2048;
+  cparams.n_batch = 16;  // Small batch to force chunking
+  cparams.n_seq_max = 8;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+
+  BranchStore store(16);
+  TestParams params;
+
+  const llama_vocab* vocab = llama_model_get_vocab(model.get());
+  int32_t n_vocab = llama_vocab_n_tokens(vocab);
+  auto prompt = tokenizer::tokenize(vocab, "Test", true, false);
+  REQUIRE(!prompt.empty());
+
+  // Create root and decode prefix
+  BranchHandle root = create(ctx, model.get(), 0, 0, params, 16, nullptr, nullptr, &store);
+  REQUIRE(root != INVALID_HANDLE);
+  decode_batch(root, prompt.data(), prompt.size(), &store);
+  llama_pos prefix_pos = get_position(root, &store);
+
+  // Fork 3 children, each getting 10 tokens.
+  // Total = 30 tokens but n_batch = 16, so chunking is required.
+  constexpr int N = 3;
+  const int32_t counts[] = {10, 10, 10};
+
+  BranchHandle children[N];
+  for (int i = 0; i < N; ++i) {
+    children[i] = fork(root, static_cast<llama_seq_id>(i + 1), &store);
+    REQUIRE(children[i] != INVALID_HANDLE);
+  }
+
+  // Build token arrays
+  std::vector<llama_token> token_buf_0(counts[0]);
+  std::vector<llama_token> token_buf_1(counts[1]);
+  std::vector<llama_token> token_buf_2(counts[2]);
+
+  for (int j = 0; j < counts[0]; ++j) token_buf_0[j] = static_cast<llama_token>((50 + j) % n_vocab);
+  for (int j = 0; j < counts[1]; ++j) token_buf_1[j] = static_cast<llama_token>((150 + j) % n_vocab);
+  for (int j = 0; j < counts[2]; ++j) token_buf_2[j] = static_cast<llama_token>((250 + j) % n_vocab);
+
+  const llama_token* arrays[] = {token_buf_0.data(), token_buf_1.data(), token_buf_2.data()};
+
+  // Batch decode — should auto-chunk since total > n_batch
+  decode::Scratch scratch;
+  CHECK_NOTHROW(store.decode_scatter(children, arrays, counts, N, scratch));
+
+  // Verify all positions and logits
+  for (int i = 0; i < N; ++i) {
+    CHECK(get_position(children[i], &store) == prefix_pos + counts[i]);
+
+    const float* logits = get_logits(children[i], &store);
+    REQUIRE(logits != nullptr);
+
+    float sum = 0.0f;
+    for (int j = 0; j < std::min(100, n_vocab); ++j) {
+      sum += std::abs(logits[j]);
+    }
+    CHECK(sum > 0.0f);
+  }
+
+  INFO("decode_scatter: auto-chunked with n_batch=16, total_tokens=30");
+
+  destroy(root, &store);
+  for (int i = 0; i < N; ++i) {
+    destroy(children[i], &store);
+  }
   llama_free(ctx);
 }
