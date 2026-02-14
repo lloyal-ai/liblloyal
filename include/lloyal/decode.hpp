@@ -176,7 +176,9 @@ namespace lloyal::decode {
       const int32_t pos = n_past + i;
       const bool want_logits = is_last_chunk && (i == n_eval - 1);
 
-      // Add token to specified sequence using llama.cpp common library
+      // Add token via llama.cpp common library (function-call ABI).
+      // {seq_id} constructs a temporary vector per token — acceptable cost
+      // vs direct field writes which create struct-layout ABI coupling.
       common_batch_add(batch, tokens[processed + i], pos, {seq_id}, want_logits);
     }
 

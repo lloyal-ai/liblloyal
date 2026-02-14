@@ -75,6 +75,8 @@ struct ModelKeyHash {
   }
 };
 
+#undef LLOYAL_NO_SANITIZE_OVERFLOW
+
 /**
  * @brief Thread-safe weak-pointer cache for sharing llama_model instances
  *
@@ -92,6 +94,13 @@ struct ModelKeyHash {
  * @warning acquire() holds an internal mutex for the entire duration of
  *          llama_model_load_from_file() on a cache miss. This can block
  *          other threads for seconds on large models.
+ *
+ * @warning **Do not call acquire() from global or static constructors.**
+ *          The internal cache (`inline static std::unordered_map`) relies
+ *          on dynamic initialization. If a global/static object in another
+ *          translation unit calls acquire() during its own construction,
+ *          the cache may not yet be initialized (SIOF). Call acquire()
+ *          only after main() has started.
  *
  * @example
  * @code

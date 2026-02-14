@@ -208,7 +208,11 @@ struct DecodeEachItem {
  * Structural wins over parallel arrays:
  * - Can't have a handle without its tokens
  * - span::size() is size_t — negative counts impossible
- * - span with size > 0 can't have null data
+ * - `tokens` is a non-owning view (pointer + length). If `size() > 0`,
+ *   `data()` must point to valid, dereferenceable memory.
+ *
+ * @warning Caller must keep the pointed-to token data alive until
+ *          decode_scatter() returns. Do not pass spans of temporaries.
  */
 struct DecodeScatterItem {
   BranchHandle handle;
@@ -558,8 +562,10 @@ public:
         int32_t idx = chunk.item_indices[0];
         int32_t tc = static_cast<int32_t>(items[idx].tokens.size());
 
+        // Clamp to context batch limit — branch n_batch may exceed it
+        const int32_t safe_batch = std::min(states[idx]->n_batch, batch_limit);
         if (decode::many(ctx, items[idx].tokens.data(), tc,
-                         states[idx]->position, states[idx]->n_batch,
+                         states[idx]->position, safe_batch,
                          states[idx]->seq_id) != 0) {
           throw std::runtime_error("BranchStore::decode_scatter - decode::many failed for oversized item " + std::to_string(idx));
         }
@@ -650,43 +656,27 @@ private:
 
 /// @cond INTERNAL
 namespace detail {
-inline BranchStore*& global_store_ptr() {
-  static BranchStore* ptr = nullptr;
-  return ptr;
-}
-
 inline BranchStore& global_store() {
-  BranchStore*& ptr = global_store_ptr();
-  if (!ptr) {
-    ptr = new BranchStore();
-  }
-  return *ptr;
+  static BranchStore instance;
+  return instance;
 }
 }  // namespace detail
 /// @endcond
 
 /**
- * @brief Tear down the global branch store
+ * @brief Shut down the global branch store (no-op)
  *
- * Frees all branches in the global store and deallocates it.
- * Call this BEFORE llama_backend_free() to ensure proper teardown order.
+ * The global store uses a function-local static (Meyer's Singleton) with
+ * thread-safe initialization. It cannot be deleted at runtime.
  *
- * Safe to call multiple times or if the global store was never used.
+ * To free llama resources before llama_backend_free(), call branch::prune()
+ * on each branch individually. BranchStore itself only owns std::vector
+ * memory — its implicit destructor does not call any llama functions.
  *
- * @note After calling this, any handles obtained from the global store are invalid.
- *
- * @example
- * @code
- *   branch::shutdown_global_store();
- *   llama_backend_free();
- * @endcode
+ * @note Retained for API compatibility. Safe to call, but does nothing.
  */
 inline void shutdown_global_store() {
-  BranchStore*& ptr = detail::global_store_ptr();
-  if (ptr) {
-    delete ptr;
-    ptr = nullptr;
-  }
+  // No-op: global store has static lifetime.
 }
 
 // ===== BRANCH API =====
