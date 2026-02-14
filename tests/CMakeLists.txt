@@ -283,6 +283,40 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
     INSTALL_RPATH "${LLAMA_CPP_DYLIB_DIR}"
   )
 
+  # Optional: UBSan for integration tests (pass -DLLOYAL_ENABLE_UBSAN_INTEGRATION=ON)
+  # NOTE: ASan is deliberately excluded — libllama.dylib is not ASan-instrumented,
+  # and mixing instrumented/uninstrumented code causes false positives or crashes.
+  # UBSan checks are local to our compiled code and work fine across the boundary.
+  option(LLOYAL_ENABLE_UBSAN_INTEGRATION "Enable UBSan for IntegrationRunner (no ASan)" OFF)
+  if(LLOYAL_ENABLE_UBSAN_INTEGRATION)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+      message(STATUS "Enabling UBSan for IntegrationRunner (Clang: UBSan + Integer + Float)")
+      target_compile_options(IntegrationRunner PRIVATE
+        -fsanitize=undefined
+        -fsanitize=integer              # Clang-only: unsigned overflow & implicit truncation
+        -fsanitize=float-divide-by-zero # Clang-only: float division by zero
+        -fno-sanitize=unsigned-shift-base  # Allow shifting into sign bit
+        -fno-omit-frame-pointer
+        -g
+      )
+      target_link_options(IntegrationRunner PRIVATE
+        -fsanitize=undefined
+        -fsanitize=integer
+        -fsanitize=float-divide-by-zero
+      )
+    else()
+      message(STATUS "Enabling UBSan for IntegrationRunner (GCC: UBSan)")
+      target_compile_options(IntegrationRunner PRIVATE
+        -fsanitize=undefined
+        -fno-omit-frame-pointer
+        -g
+      )
+      target_link_options(IntegrationRunner PRIVATE
+        -fsanitize=undefined
+      )
+    endif()
+  endif()
+
   # Optional: Add test to CTest
   add_test(NAME integration_tests COMMAND IntegrationRunner)
   set_tests_properties(integration_tests PROPERTIES

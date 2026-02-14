@@ -47,7 +47,7 @@
  * @code{.cpp}
  * #include <lloyal/model_registry.hpp>
  * #include <lloyal/tokenizer.hpp>
- * #include <lloyal/decoder.hpp>
+ * #include <lloyal/decode.hpp>
  * #include <lloyal/sampler.hpp>
  *
  * // Load model (shared weights)

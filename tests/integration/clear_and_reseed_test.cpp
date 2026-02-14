@@ -7,7 +7,7 @@
 #include <iomanip>
 #include <iostream>
 #include <llama/llama.h>
-#include <lloyal/decoder.hpp>
+#include <lloyal/decode.hpp>
 #include <lloyal/kv.hpp>
 #include <lloyal/model_registry.hpp>
 #include <lloyal/sampler.hpp>
@@ -292,16 +292,16 @@ TEST_CASE("clear_and_reseed: Smoke test (non-catastrophic compression)") {
   auto prompt_tokens = tokenizer::tokenize(vocab, prompt, false, false);
   
   std::vector<llama_token> all_tokens = prompt_tokens;
-  decoder::decode_tokens(ctx, prompt_tokens, 0, ctx_params.n_batch);
+  REQUIRE(decode::many(ctx, prompt_tokens, 0, ctx_params.n_batch) == 0);
   int n_past = static_cast<int>(prompt_tokens.size());
 
   const int TARGET_LENGTH = 1500;
   INFO("Generating " << TARGET_LENGTH << " tokens...");
-  
+
   while (all_tokens.size() < TARGET_LENGTH) {
     llama_token next = sampler::greedy(ctx, vocab);
     all_tokens.push_back(next);
-    decoder::decode_tokens(ctx, {next}, n_past++, ctx_params.n_batch);
+    REQUIRE(decode::many(ctx, std::vector<llama_token>{next}, n_past++, ctx_params.n_batch) == 0);
   }
 
   // === PHASE 2: Capture BEFORE ===

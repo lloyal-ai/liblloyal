@@ -2,7 +2,7 @@
 #include <doctest/doctest.h>
 #include "test_config.hpp"
 #include <llama/llama.h>
-#include <lloyal/decoder.hpp>
+#include <lloyal/decode.hpp>
 #include <lloyal/kv.hpp>
 #include <lloyal/model_registry.hpp>
 #include <lloyal/sampler.hpp>

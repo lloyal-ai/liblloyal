@@ -30,7 +30,7 @@
  *     int32_t dim = embedding::dimension(model);
  *
  *     // Decode tokens with pooling enabled
- *     decoder::decode_tokens(ctx, tokens, 0, 512);
+ *     decode::many(ctx, tokens, 0, 512);
  *
  *     // Extract normalized embeddings
  *     auto vec = embedding::get(ctx, embedding::Normalize::L2);
@@ -177,7 +177,7 @@ struct BatchGuard {
 /**
  * Encode tokens for embedding extraction
  *
- * Unlike decoder::decode_tokens(), this marks ALL tokens with logits=true which is
+ * Unlike decode::many(), this marks ALL tokens with logits=true which is
  * required for embedding extraction.
  *
  * NOTE: Use this with a dedicated embedding context (embeddings=true, pooling
@@ -265,7 +265,7 @@ inline void encode(llama_context *ctx, const std::vector<llama_token> &tokens,
  *
  * EXAMPLE:
  *   auto tokens = tokenizer::tokenize(model, "Hello world");
- *   decoder::decode_tokens(ctx, tokens, 0, 512);
+ *   decode::many(ctx, tokens, 0, 512);
  *   auto embedding = embedding::get(ctx, Normalize::L2);
  */
 inline std::vector<float> get(llama_context *ctx,

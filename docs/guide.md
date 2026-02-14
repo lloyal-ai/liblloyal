@@ -124,7 +124,7 @@ Minimal example demonstrating complete inference pipeline.
 ```cpp
 #include <lloyal/model_registry.hpp>
 #include <lloyal/tokenizer.hpp>
-#include <lloyal/decoder.hpp>
+#include <lloyal/decode.hpp>
 #include <lloyal/sampler.hpp>
 #include <llama/llama.h>
 
@@ -214,10 +214,10 @@ auto tokens = lloyal::tokenizer::tokenize(vocab, prompt, false, parse_special);
 
 ### Decoding
 
-**From:** `include/lloyal/decoder.hpp`
+**From:** `include/lloyal/decode.hpp`
 
 ```cpp
-#include <lloyal/decoder.hpp>
+#include <lloyal/decode.hpp>
 
 // Decode token batch (initial prompt)
 std::vector<llama_token> tokens = {1, 100, 200, 300};

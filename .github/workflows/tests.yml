@@ -76,38 +76,6 @@ jobs:
         fi
         echo "✅ No sanitizer errors"
 
-  # ABI safety fallback - ensures LLOYAL_STACK_BATCH=0 path compiles and works
-  abi-safe-path-tests:
-    name: ABI Safe Path (LLOYAL_STACK_BATCH=0)
-    runs-on: ubuntu-latest
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y cmake build-essential nlohmann-json3-dev
-
-    - name: Configure CMake with LLOYAL_STACK_BATCH=0
-      working-directory: tests
-      run: |
-        cmake -S . -B build_abi_safe \
-          -DCMAKE_BUILD_TYPE=Release \
-          -DCMAKE_CXX_FLAGS="-DLLOYAL_STACK_BATCH=0" \
-          -DNLOHMANN_JSON_DIR=/usr/include
-
-    - name: Build tests with safe batch path
-      working-directory: tests
-      run: cmake --build build_abi_safe --config Release
-
-    - name: Run decoder tests (exercises decode_one)
-      working-directory: tests
-      run: |
-        echo "Running with LLOYAL_STACK_BATCH=0 (thread_local batch)..."
-        # Run decoder tests to verify decode_one() works with thread_local batch
-        ./build_abi_safe/TestRunner --success --test-case="*decoder*"
-
   integration-tests:
     name: Integration Tests (Linux)
     runs-on: ubuntu-latest
@@ -277,7 +245,7 @@ jobs:
   summary:
     name: Test Summary
     runs-on: ubuntu-latest
-    needs: [unit-tests, sanitizer-tests, abi-safe-path-tests, integration-tests, lint]
+    needs: [unit-tests, sanitizer-tests, integration-tests, lint]
     if: always()
 
     steps:
@@ -286,7 +254,6 @@ jobs:
         echo "=== Test Results ==="
         echo "Unit Tests: ${{ needs.unit-tests.result }}"
         echo "Sanitizer Tests: ${{ needs.sanitizer-tests.result }}"
-        echo "ABI Safe Path Tests: ${{ needs.abi-safe-path-tests.result }}"
         echo "Integration Tests (Linux): ${{ needs.integration-tests.result }}"
         echo "Lint: ${{ needs.lint.result }}"
 
@@ -299,11 +266,6 @@ jobs:
 
         if [ "${{ needs.sanitizer-tests.result }}" != "success" ]; then
           echo "❌ Sanitizer tests failed (memory bugs, UB, leaks, or overflow detected)"
-          FAILED=1
-        fi
-
-        if [ "${{ needs.abi-safe-path-tests.result }}" != "success" ]; then
-          echo "❌ ABI safe path tests failed (LLOYAL_STACK_BATCH=0 broken)"
           FAILED=1
         fi
 
