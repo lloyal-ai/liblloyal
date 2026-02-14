@@ -972,3 +972,82 @@ TEST_CASE("branch: RAII Branch self-move-assign is safe") {
   CHECK(b.valid());
   CHECK(b.handle() == h);
 }
+
+// ============================================================================
+// BranchStore Batched Decode Tests (span-based API)
+// ============================================================================
+
+TEST_CASE("branch: decode_each with empty span is no-op") {
+  BranchStore store(4);
+
+  std::span<const DecodeEachItem> empty;
+  CHECK_NOTHROW(store.decode_each(empty));
+}
+
+TEST_CASE("branch: decode_each with invalid handle throws") {
+  BranchStore store(4);
+
+  DecodeEachItem items[] = {{INVALID_HANDLE, 42}};
+  CHECK_THROWS(store.decode_each(items));
+}
+
+TEST_CASE("branch: decode_scatter with empty span is no-op") {
+  BranchStore store(4);
+
+  std::span<const DecodeScatterItem> empty;
+  CHECK_NOTHROW(store.decode_scatter(empty));
+}
+
+TEST_CASE("branch: decode_scatter with invalid handle throws") {
+  BranchStore store(4);
+
+  llama_token tokens[] = {1, 2, 3};
+  DecodeScatterItem items[] = {{INVALID_HANDLE, tokens}};
+  CHECK_THROWS(store.decode_scatter(items));
+}
+
+TEST_CASE("branch: decode_scatter with zero-length tokens span skips item") {
+  BranchStore store(4);
+  TestSamplingParams params;
+
+  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+
+  BranchHandle h = create(fake_ctx, fake_model, 0, 0, params, 512, nullptr, nullptr, &store);
+  REQUIRE(h != INVALID_HANDLE);
+
+  // Empty span — no tokens to decode
+  DecodeScatterItem items[] = {{h, std::span<const llama_token>{}}};
+  CHECK_NOTHROW(store.decode_scatter(items));
+
+  // Position should be unchanged
+  CHECK(get_position(h, &store) == 0);
+
+  destroy(h, &store);
+}
+
+TEST_CASE("branch: decode_scatter all items zero-length is no-op") {
+  BranchStore store(8);
+  TestSamplingParams params;
+
+  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+
+  BranchHandle h1 = create(fake_ctx, fake_model, 0, 10, params, 512, nullptr, nullptr, &store);
+  BranchHandle h2 = create(fake_ctx, fake_model, 1, 20, params, 512, nullptr, nullptr, &store);
+  REQUIRE(h1 != INVALID_HANDLE);
+  REQUIRE(h2 != INVALID_HANDLE);
+
+  DecodeScatterItem items[] = {
+    {h1, std::span<const llama_token>{}},
+    {h2, std::span<const llama_token>{}}
+  };
+  CHECK_NOTHROW(store.decode_scatter(items));
+
+  // Positions unchanged
+  CHECK(get_position(h1, &store) == 10);
+  CHECK(get_position(h2, &store) == 20);
+
+  destroy(h1, &store);
+  destroy(h2, &store);
+}

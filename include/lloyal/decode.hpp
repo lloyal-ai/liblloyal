@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <llama/llama.h>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
@@ -28,6 +29,44 @@
  *                    └─────────────────┴─────────────────┘
  *
  * Uses batch utilities from llama.cpp common (common_batch_clear, common_batch_add).
+ *
+ * ## Logit Indexing: How llama_get_logits_ith() Maps to Batch Positions
+ *
+ * llama.cpp packs logits into a dense output buffer — only tokens with
+ * `batch.logits[i] = true` get logits computed. The internal `output_ids`
+ * vector translates batch positions to packed rows:
+ *
+ * @code
+ *   Batch:      [tok0, tok1, tok2, tok3, tok4, tok5, tok6, tok7]
+ *   logits[]:   [  0,    0,    0,    0,    1,    0,    0,    1 ]
+ *
+ *   output_ids: [ -1,   -1,   -1,   -1,    0,   -1,   -1,    1]
+ *                                          ^                 ^
+ *                                       row 0             row 1
+ *
+ *   llama_get_logits_ith(ctx, 4)  → output_ids[4] = 0  → logits + 0*n_vocab  ✓
+ *   llama_get_logits_ith(ctx, 7)  → output_ids[7] = 1  → logits + 1*n_vocab  ✓
+ *   llama_get_logits_ith(ctx, 0)  → output_ids[0] = -1 → throws (no logits)
+ *   llama_get_logits_ith(ctx, -1) → n_outputs - 1 = 1  → logits + 1*n_vocab  (last output)
+ * @endcode
+ *
+ * Callers always pass **batch positions**, not packed indices. The
+ * `output_ids` indirection handles the translation. Negative indices
+ * bypass `output_ids` entirely: `-1` means the last output row,
+ * `-2` the second-to-last, etc.
+ *
+ * This matters for logit capture in BranchStore:
+ *
+ * | Decode pattern  | logits flag                    | Access index                        |
+ * |-----------------|--------------------------------|-------------------------------------|
+ * | decode::one     | Last token only                | `-1` (sole output)                  |
+ * | decode::many    | Last token of final chunk only | `-1` (sole output of last dispatch) |
+ * | decode::each    | All items (1:1 with branches)  | `i` (batch pos = item index)        |
+ * | decode::scatter | Last token per item            | `cursor + n_tokens[k] - 1`          |
+ *
+ * For `decode::many`, each chunk is a separate `llama_decode()` call that
+ * resets the output buffer. Only the final chunk's last token has logits,
+ * so after the last dispatch `n_outputs = 1` and `-1` yields row 0.
  */
 
 namespace lloyal::decode {
@@ -36,10 +75,9 @@ namespace lloyal::decode {
  * @brief Decode multiple tokens into the KV cache with auto-chunking
  *
  * Orchestration logic:
- * 1. Initializes batch with RAII cleanup
+ * 1. Uses a thread_local batch (heap-allocated once per thread, grows on demand)
  * 2. Chunks tokens into n_batch-sized pieces
  * 3. For each chunk: clear batch, add tokens, call llama_decode
- * 4. Automatic batch cleanup via RAII guard
  *
  * ## Sequence ID Parameter
  *
@@ -100,16 +138,29 @@ namespace lloyal::decode {
     throw std::runtime_error("decode::many - Invalid token array");
   }
 
-  // Initialize batch with RAII cleanup
-  // Single-sequence batch (n_seq_max = 1)
-  llama_batch batch = llama_batch_init(n_batch, 0, 1);
+  if (n_batch <= 0) {
+    throw std::runtime_error("decode::many - n_batch must be positive");
+  }
 
-  // RAII guard for automatic batch cleanup
-  struct BatchGuard {
-    llama_batch &batch;
-    explicit BatchGuard(llama_batch &b) : batch(b) {}
-    ~BatchGuard() { llama_batch_free(batch); }
-  } batch_guard(batch);
+  // Thread-local batch avoids per-call allocation. Grows if needed, never shrinks.
+  struct ThreadLocalBatch {
+    llama_batch batch{};
+    int32_t capacity = 0;
+
+    void ensure(int32_t n) {
+      if (n <= capacity) return;
+      if (capacity > 0) llama_batch_free(batch);
+      batch = llama_batch_init(n, 0, 1);
+      capacity = n;
+    }
+
+    ~ThreadLocalBatch() {
+      if (capacity > 0) llama_batch_free(batch);
+    }
+  };
+  thread_local ThreadLocalBatch tl;
+  tl.ensure(n_batch);
+  llama_batch& batch = tl.batch;
 
   // Process tokens in chunks
   int32_t processed = 0;
@@ -119,21 +170,23 @@ namespace lloyal::decode {
     // Clear batch using llama.cpp common library
     common_batch_clear(batch);
 
-    // Add tokens one by one, mark logits=true on LAST token only
+    // Add tokens one by one, mark logits=true only on the final chunk's last token
+    const bool is_last_chunk = (processed + n_eval >= n_tokens);
     for (int32_t i = 0; i < n_eval; ++i) {
       const int32_t pos = n_past + i;
-      const bool want_logits = (i == n_eval - 1);
+      const bool want_logits = is_last_chunk && (i == n_eval - 1);
 
       // Add token to specified sequence using llama.cpp common library
       common_batch_add(batch, tokens[processed + i], pos, {seq_id}, want_logits);
     }
 
     // Decode chunk (updates KV cache)
-    if (llama_decode(ctx, batch) != 0) {
+    const int rc = llama_decode(ctx, batch);
+    if (rc != 0) {
       LLOYAL_LOG_DEBUG(
-          "[decode::many] ERROR: llama_decode failed at position %d",
-          n_past);
-      return -1;
+          "[decode::many] ERROR: llama_decode failed at position %d (rc=%d)",
+          n_past, rc);
+      return rc;
     }
 
     n_past += n_eval;
@@ -186,16 +239,16 @@ namespace lloyal::decode {
     throw std::runtime_error("decode::one - NULL context");
   }
 
-  thread_local llama_batch batch = llama_batch_init(1, 0, 1);
+  struct ThreadLocalBatch {
+    llama_batch batch = llama_batch_init(1, 0, 1);
+    ~ThreadLocalBatch() { llama_batch_free(batch); }
+  };
+  thread_local ThreadLocalBatch tl;
 
-  batch.n_tokens = 1;
-  batch.token[0] = tok;
-  batch.pos[0] = pos;
-  batch.n_seq_id[0] = 1;
-  batch.seq_id[0][0] = seq_id;
-  batch.logits[0] = static_cast<int8_t>(want_logits);
+  common_batch_clear(tl.batch);
+  common_batch_add(tl.batch, tok, pos, {seq_id}, want_logits);
 
-  return llama_decode(ctx, batch);
+  return llama_decode(ctx, tl.batch);
 }
 
 // ============================================================================
@@ -214,13 +267,16 @@ struct EachItem {
 
 /**
  * @brief Input item for decode::scatter — multiple tokens for one sequence
+ *
+ * Uses std::span for a non-owning view of the token array. The span
+ * carries both pointer and length, eliminating raw-pointer + count
+ * mismatch bugs. An empty span (size 0) is valid and skipped by scatter().
  */
 struct ScatterItem {
-  const llama_token* tokens;              ///< Token array (not owned)
-  int32_t n_tokens;                       ///< Number of tokens in array
+  std::span<const llama_token> tokens;    ///< Token array (non-owning view)
   llama_pos start_pos;                    ///< KV cache position for first token
   llama_seq_id seq_id;                    ///< Target sequence ID
-  bool output_logits_last_only = false;   ///< Compute logits only for last token
+  bool output_logits = false;             ///< When true, compute logits for last token in this run
 };
 
 /**
@@ -246,6 +302,8 @@ struct Scratch {
     logits_.resize(n);
   }
 
+  /// ABI-sensitive: writes llama_batch fields directly (no common_batch_* wrapper
+  /// exists for external-buffer batches). Audit on llama.cpp submodule bumps.
   llama_batch as_batch(int32_t n_tokens) {
     llama_batch batch{};
     batch.n_tokens = n_tokens;
@@ -283,7 +341,10 @@ struct Scratch {
   if (!ctx) {
     throw std::runtime_error("decode::each - NULL context");
   }
-  if (n <= 0) return 0;
+  if (n < 0) {
+    throw std::runtime_error("decode::each - negative item count");
+  }
+  if (n == 0) return 0;
 
   scratch.resize(n);
 
@@ -317,7 +378,7 @@ struct Scratch {
  * llama_batch. Does NOT auto-chunk — total tokens must fit in n_batch.
  *
  * @param ctx Llama context (must not be null)
- * @param items Array of (tokens, n_tokens, start_pos, seq_id) tuples
+ * @param items Array of (tokens_span, start_pos, seq_id) tuples
  * @param n Number of items
  * @param scratch Reusable scratch buffers
  * @return 0 on success, non-zero on failure
@@ -336,16 +397,13 @@ struct Scratch {
   if (!ctx) {
     throw std::runtime_error("decode::scatter - NULL context");
   }
+  if (n < 0) {
+    throw std::runtime_error("decode::scatter - negative item count");
+  }
 
   int32_t total = 0;
   for (int32_t i = 0; i < n; ++i) {
-    if (items[i].n_tokens < 0) {
-      throw std::runtime_error("decode::scatter - negative n_tokens");
-    }
-    if (items[i].n_tokens > 0 && items[i].tokens == nullptr) {
-      throw std::runtime_error("decode::scatter - null tokens pointer");
-    }
-    total += items[i].n_tokens;
+    total += static_cast<int32_t>(items[i].tokens.size());
   }
   if (total == 0) return 0;
 
@@ -355,8 +413,9 @@ struct Scratch {
   for (int32_t i = 0; i < n; ++i) {
     const auto& item = items[i];
     const llama_pos base_pos = item.start_pos;
+    const int32_t item_n = static_cast<int32_t>(item.tokens.size());
 
-    for (int32_t j = 0; j < item.n_tokens; ++j) {
+    for (int32_t j = 0; j < item_n; ++j) {
       scratch.tokens_[cursor] = item.tokens[j];
       scratch.pos_[cursor] = base_pos + j;
       scratch.n_seq_id_[cursor] = 1;
@@ -364,7 +423,7 @@ struct Scratch {
       scratch.seq_id_ptrs_[cursor] = &scratch.seq_id_single_[cursor];
 
       const bool want_logits =
-          item.output_logits_last_only ? (j == item.n_tokens - 1) : false;
+          item.output_logits ? (j == item_n - 1) : false;
       scratch.logits_[cursor] = want_logits ? int8_t{1} : int8_t{0};
 
       ++cursor;

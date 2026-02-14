@@ -49,6 +49,13 @@ struct ModelKey {
  * Computes combined hash of path, GPU layers, and mmap flag for use in
  * std::unordered_map. Uses XOR with golden ratio constant for good distribution.
  */
+// Compiler-specific sanitizer suppression (GCC/Clang only; no-op on MSVC)
+#if defined(__GNUC__) || defined(__clang__)
+  #define LLOYAL_NO_SANITIZE_OVERFLOW __attribute__((no_sanitize("unsigned-integer-overflow")))
+#else
+  #define LLOYAL_NO_SANITIZE_OVERFLOW
+#endif
+
 struct ModelKeyHash {
   /**
    * @brief Compute hash for ModelKey
@@ -58,7 +65,7 @@ struct ModelKeyHash {
    * @param k Key to hash
    * @return Combined hash value
    */
-  __attribute__((no_sanitize("unsigned-integer-overflow")))
+  LLOYAL_NO_SANITIZE_OVERFLOW
   size_t operator()(const ModelKey &k) const {
     std::hash<std::string> Hs;
     std::hash<int> Hi;

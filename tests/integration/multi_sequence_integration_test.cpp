@@ -656,11 +656,10 @@ TEST_CASE("Integration: decode_scatter - asymmetric prefill") {
 
   for (int i = 0; i < N_SEQUENCES; ++i) {
     items.push_back({
-        .tokens = token_arrays[i].data(),
-        .n_tokens = static_cast<int32_t>(token_arrays[i].size()),
+        .tokens = token_arrays[i],
         .start_pos = 0,
         .seq_id = static_cast<llama_seq_id>(i),
-        .output_logits_last_only = true  // Get logits at end of each prompt
+        .output_logits = true  // Get logits at end of each prompt
     });
   }
 
@@ -901,9 +900,9 @@ TEST_CASE("Integration: decode::scatter logits at correct cursor positions") {
   for (int i = 0; i < 7; ++i) tokens_c[i] = static_cast<llama_token>((300 + i) % n_vocab);
 
   std::vector<decode::ScatterItem> items = {
-      {.tokens = tokens_a.data(), .n_tokens = 5, .start_pos = 0, .seq_id = 0, .output_logits_last_only = true},
-      {.tokens = tokens_b.data(), .n_tokens = 3, .start_pos = 0, .seq_id = 1, .output_logits_last_only = true},
-      {.tokens = tokens_c.data(), .n_tokens = 7, .start_pos = 0, .seq_id = 2, .output_logits_last_only = true},
+      {.tokens = tokens_a, .start_pos = 0, .seq_id = 0, .output_logits = true},
+      {.tokens = tokens_b, .start_pos = 0, .seq_id = 1, .output_logits = true},
+      {.tokens = tokens_c, .start_pos = 0, .seq_id = 2, .output_logits = true},
   };
 
   decode::Scratch scratch;
@@ -1071,11 +1070,10 @@ TEST_CASE("Integration: decode_scatter - interleaved generation and prefill") {
 
   for (int i = 0; i < N_SEQUENCES; ++i) {
     items.push_back({
-        .tokens = mixed_tokens[i].data(),
-        .n_tokens = static_cast<int32_t>(mixed_tokens[i].size()),
+        .tokens = mixed_tokens[i],
         .start_pos = initial_len,  // Continue from where we left off
         .seq_id = static_cast<llama_seq_id>(i),
-        .output_logits_last_only = true
+        .output_logits = true
     });
   }
 

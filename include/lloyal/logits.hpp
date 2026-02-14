@@ -37,12 +37,16 @@ namespace lloyal::logits {
  * This is a zero-copy operation — no data is copied.
  *
  * @param ctx Llama context (must not be null)
- * @param index Batch index passed to llama_get_logits_ith():
- *              - `-1` — last token (default; single-sequence decode)
- *              - `i`  — batch slot `i` from decode::each()
- *              - flattened cursor position from decode::scatter()
+ * @param index **Batch position** passed to llama_get_logits_ith().
+ *              llama.cpp translates this to a packed output row via its
+ *              internal `output_ids` table — callers never need the packed
+ *              index directly. See decode.hpp file docs for the full
+ *              indexing explanation. Valid values:
+ *              - `-1` — last output (default; works for any decode pattern)
+ *              - `i`  — batch position `i` (must have had `batch.logits[i] = true`)
  * @returns Pointer to float array of size n_vocab
- * @throws std::runtime_error if ctx is null or logits unavailable
+ * @throws std::runtime_error if ctx is null, or logits were not requested
+ *         for this batch position (`batch.logits[index]` was false)
  *
  * @warning Pointer lifetime: valid only until the next
  *          decode()/encode()/dispose() call. Points to llama.cpp

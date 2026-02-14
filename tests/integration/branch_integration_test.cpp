@@ -1391,15 +1391,15 @@ TEST_CASE("branch integration: BranchStore::decode_each batches N branches") {
     CHECK(get_position(children[i], &store) == prefix_pos);
   }
 
-  // Pick a different token for each child
-  llama_token tokens[N];
+  // Build DecodeEachItem array
+  DecodeEachItem each_items[N];
   for (int i = 0; i < N; ++i) {
-    tokens[i] = static_cast<llama_token>((100 + i * 50) % n_vocab);
+    each_items[i].handle = children[i];
+    each_items[i].token = static_cast<llama_token>((100 + i * 50) % n_vocab);
   }
 
   // Batch decode all 4 in one GPU dispatch
-  decode::Scratch scratch;
-  CHECK_NOTHROW(store.decode_each(children, tokens, N, scratch));
+  CHECK_NOTHROW(store.decode_each(each_items));
 
   // Verify all 4 branches advanced by 1
   for (int i = 0; i < N; ++i) {
@@ -1485,11 +1485,14 @@ TEST_CASE("branch integration: BranchStore::decode_scatter batches asymmetric pr
   for (int j = 0; j < counts[1]; ++j) token_buf_1[j] = static_cast<llama_token>((200 + j) % n_vocab);
   for (int j = 0; j < counts[2]; ++j) token_buf_2[j] = static_cast<llama_token>((300 + j) % n_vocab);
 
-  const llama_token* arrays[] = {token_buf_0.data(), token_buf_1.data(), token_buf_2.data()};
+  DecodeScatterItem scatter_items[] = {
+    {children[0], token_buf_0},
+    {children[1], token_buf_1},
+    {children[2], token_buf_2}
+  };
 
   // Batch decode all 3 with different token counts
-  decode::Scratch scratch;
-  CHECK_NOTHROW(store.decode_scatter(children, arrays, counts, N, scratch));
+  CHECK_NOTHROW(store.decode_scatter(scatter_items));
 
   // Verify positions advanced correctly
   for (int i = 0; i < N; ++i) {
@@ -1565,11 +1568,14 @@ TEST_CASE("branch integration: BranchStore::decode_scatter auto-chunks with smal
   for (int j = 0; j < counts[1]; ++j) token_buf_1[j] = static_cast<llama_token>((150 + j) % n_vocab);
   for (int j = 0; j < counts[2]; ++j) token_buf_2[j] = static_cast<llama_token>((250 + j) % n_vocab);
 
-  const llama_token* arrays[] = {token_buf_0.data(), token_buf_1.data(), token_buf_2.data()};
+  DecodeScatterItem scatter_items[] = {
+    {children[0], token_buf_0},
+    {children[1], token_buf_1},
+    {children[2], token_buf_2}
+  };
 
   // Batch decode — should auto-chunk since total > n_batch
-  decode::Scratch scratch;
-  CHECK_NOTHROW(store.decode_scatter(children, arrays, counts, N, scratch));
+  CHECK_NOTHROW(store.decode_scatter(scatter_items));
 
   // Verify all positions and logits
   for (int i = 0; i < N; ++i) {

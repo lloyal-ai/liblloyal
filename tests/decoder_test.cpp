@@ -90,18 +90,66 @@ TEST_CASE("Decoder: vector overload delegates to array version") {
   CHECK(llamaStubConfig().decode_call_count == 1);
 }
 
-TEST_CASE("Decoder: BatchGuard RAII cleanup on failure") {
+TEST_CASE("Decoder: many() returns error on decode failure") {
   resetStubConfig();
 
   llama_context ctx{};
   std::vector<llama_token> tokens = {1, 2, 3};
   llamaStubConfig().decode_result = -1; // Force failure
 
-  int initial_free_count = llamaStubConfig().batch_free_call_count;
-
-  // Returns error (no longer throws)
+  // Returns error code, thread_local batch stays alive for reuse
   CHECK(many(&ctx, tokens, 0, 32) != 0);
 
-  // Verify: batch_free was called (RAII cleanup)
-  CHECK(llamaStubConfig().batch_free_call_count == initial_free_count + 1);
+  // Subsequent call with success should work (batch is reusable)
+  llamaStubConfig().decode_result = 0;
+  CHECK(many(&ctx, tokens, 0, 32) == 0);
+}
+
+// ============================================================================
+// n_batch validation (Fix 3)
+// ============================================================================
+
+TEST_CASE("Decoder: n_batch = 0 throws") {
+  resetStubConfig();
+
+  llama_context ctx{};
+  std::vector<llama_token> tokens = {1, 2, 3};
+  CHECK_THROWS(many(&ctx, tokens.data(), 3, 0, 0));
+}
+
+TEST_CASE("Decoder: n_batch = -1 throws") {
+  resetStubConfig();
+
+  llama_context ctx{};
+  std::vector<llama_token> tokens = {1, 2, 3};
+  CHECK_THROWS(many(&ctx, tokens.data(), 3, 0, -1));
+}
+
+// ============================================================================
+// Error code propagation (Fix 2)
+// ============================================================================
+
+TEST_CASE("Decoder: many returns actual llama_decode error code") {
+  resetStubConfig();
+
+  llama_context ctx{};
+  std::vector<llama_token> tokens = {1, 2, 3};
+
+  // Set a specific non-zero error code
+  llamaStubConfig().decode_result = 2;
+
+  int rc = many(&ctx, tokens, 0, 32);
+  CHECK(rc == 2);
+}
+
+TEST_CASE("Decoder: many returns -1 error code from llama_decode") {
+  resetStubConfig();
+
+  llama_context ctx{};
+  std::vector<llama_token> tokens = {1, 2, 3};
+
+  llamaStubConfig().decode_result = -1;
+
+  int rc = many(&ctx, tokens, 0, 32);
+  CHECK(rc == -1);
 }

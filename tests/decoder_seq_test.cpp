@@ -125,3 +125,43 @@ TEST_CASE("Decoder seq_id: error handling preserves seq_id tracking") {
   // The batch was built before the decode failed
   CHECK(llamaStubConfig().last_batch_seq_id == 42);
 }
+
+// ============================================================================
+// decode::each negative n validation (Fix 4)
+// ============================================================================
+
+TEST_CASE("Decoder each: n = -1 throws") {
+  resetStubConfig();
+
+  llama_context ctx{};
+  Scratch scratch;
+  CHECK_THROWS(each(&ctx, nullptr, -1, scratch));
+}
+
+TEST_CASE("Decoder each: n = 0 returns 0 (no-op)") {
+  resetStubConfig();
+
+  llama_context ctx{};
+  Scratch scratch;
+  CHECK(each(&ctx, nullptr, 0, scratch) == 0);
+}
+
+// ============================================================================
+// decode::scatter negative n validation (Fix 4)
+// ============================================================================
+
+TEST_CASE("Decoder scatter: n = -1 throws") {
+  resetStubConfig();
+
+  llama_context ctx{};
+  Scratch scratch;
+  CHECK_THROWS(scatter(&ctx, nullptr, -1, scratch));
+}
+
+TEST_CASE("Decoder scatter: n = 0 returns 0 (no-op)") {
+  resetStubConfig();
+
+  llama_context ctx{};
+  Scratch scratch;
+  CHECK(scatter(&ctx, nullptr, 0, scratch) == 0);
+}
