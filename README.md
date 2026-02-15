@@ -56,25 +56,41 @@ using namespace lloyal::branch;
 BranchStore store;
 store.init_tenancy(ctx);
 
-// Create root, fork candidates
+// Shared prompt: "Explain quantum entanglement"
 auto root = Branch::create(ctx, model, store, prompt_len, params);
 root.capture_logits();
 
-std::vector<Branch> candidates;
-for (int i = 0; i < n; i++)
-    candidates.push_back(root.fork());
+// Fork 4 branches — each will get a different reasoning prefix
+auto analogy  = root.fork();
+auto formal   = root.fork();
+auto socratic = root.fork();
+auto visual   = root.fork();
 
-// Generate — each branch samples independently
-for (auto& c : candidates) {
-    auto tok = c.sample();
-    c.accept(tok);
-    c.decode_and_capture_one(tok);
+// Scatter-prefill: inject divergent prefixes in one batched dispatch
+// 4 branches × variable lengths → auto bin-packed into minimal GPU calls
+store.decode_scatter({
+    {analogy.handle(),  tokenize("Think of it like two coins...")},   // 12 tokens
+    {formal.handle(),   tokenize("In quantum mechanics, the...")},    // 8 tokens
+    {socratic.handle(), tokenize("What happens when you measure...")},// 10 tokens
+    {visual.handle(),   tokenize("Imagine two particles...")},        // 7 tokens
+});
+
+// Generate 64 tokens — all 4 in lockstep, 1 GPU call per step
+std::vector<Branch*> branches = {&analogy, &formal, &socratic, &visual};
+for (int t = 0; t < 64; t++) {
+    std::vector<decode::EachItem> items;
+    for (auto* b : branches) {
+        auto tok = b->sample();
+        b->accept(tok);
+        items.push_back({b->handle(), tok});
+    }
+    store.decode_each(items);  // 4 branches, 1 llama_decode()
 }
 
-// Promote winner, nuke the rest in one seq_keep pass
-auto& winner = *std::min_element(candidates.begin(), candidates.end(),
-    [](auto& a, auto& b) { return a.perplexity() < b.perplexity(); });
-store.retainOnly(winner.handle());
+// Winner takes all — one seq_keep pass, 3 branches vaporized
+auto* winner = *std::min_element(branches.begin(), branches.end(),
+    [](auto* a, auto* b) { return a->perplexity() < b->perplexity(); });
+store.retainOnly(winner->handle());
 ```
 
 **What `fork()` clones:** KV cache sequence, sampler chain (penalties, PRNG, filters), grammar (GBNF parser state), metrics (model + sampling perplexity), logits snapshot, logit bias.
