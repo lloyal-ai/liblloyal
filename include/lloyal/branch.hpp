@@ -8,7 +8,7 @@
  * @brief Branch Primitive for Tree Search and Multi-Sequence Generation
  *
  * Consolidates all forkable state into a single handle-based API:
- * - KV cache sequence (via llama_memory_seq_cp)
+ * - KV cache sequence (via kv::seq_cp)
  * - Sampler chain (penalties, PRNG, top-k/p filters)
  * - Grammar constraints (GBNF parser state)
  * - Metrics (model + sampling perplexity trackers)
@@ -19,6 +19,12 @@
  * - Handle = (generation << 16) | index
  * - Generation counter prevents ABA bugs on slot reuse
  * - Freelist enables branch pooling without malloc churn
+ *
+ * KV cache constraint:
+ * - Each live branch occupies one llama_seq_id in the KV cache
+ * - Max simultaneous branches = llama_context_params.n_seq_max (<= LLAMA_MAX_SEQ = 256)
+ * - Slot table (65535) > n_seq_max — the store manages slots, not seq_ids
+ * - Caller must allocate and recycle seq_ids to stay within n_seq_max
  *
  * Fork semantics:
  * - fork() clones: KV, grammar, sampler chain, metrics, logits, logit_bias
@@ -48,7 +54,7 @@
 
 #include "boundaries.hpp"
 #include "common.hpp"
-#include "decoder.hpp"
+#include "decode.hpp"
 #include "grammar.hpp"
 #include "kv.hpp"
 #include "logits.hpp"
@@ -56,14 +62,18 @@
 #include "sampler.hpp"
 
 #include <llama/llama.h>
+#include <cassert>    // assert
 #include <cmath>      // std::exp, std::log, std::isinf, std::isfinite
 #include <cstdint>
 #include <cstring>    // std::memcpy
 #include <ctime>      // std::time
 #include <deque>      // std::deque (pointer stability for BranchStore)
+#include <functional> // std::function
 #include <limits>     // std::numeric_limits
 #include <mutex>
+#include <span>       // std::span (C++20)
 #include <stdexcept>  // std::runtime_error
+#include <string>     // std::to_string
 #include <utility>    // std::pair, std::exchange
 #include <vector>
 
@@ -178,17 +188,78 @@ struct BranchState {
   bool in_use = false;      ///< True when slot is allocated to an active branch
 };
 
+// ===== BATCHED DECODE ITEM TYPES =====
+
+/**
+ * @brief Item for decode_each: one token per branch
+ *
+ * Replaces parallel (handle[], token[]) arrays with a single struct,
+ * eliminating length-mismatch bugs structurally.
+ */
+struct DecodeEachItem {
+  BranchHandle handle;
+  llama_token token;
+};
+
+/**
+ * @brief Item for decode_scatter: variable tokens per branch
+ *
+ * Uses std::span for zero-copy non-owning view of tokens.
+ * Structural wins over parallel arrays:
+ * - Can't have a handle without its tokens
+ * - span::size() is size_t — negative counts impossible
+ * - `tokens` is a non-owning view (pointer + length). If `size() > 0`,
+ *   `data()` must point to valid, dereferenceable memory.
+ *
+ * @warning Caller must keep the pointed-to token data alive until
+ *          decode_scatter() returns. Do not pass spans of temporaries.
+ */
+struct DecodeScatterItem {
+  BranchHandle handle;
+  std::span<const llama_token> tokens;
+};
+
 // ===== BRANCH STORE (HANDLE TABLE) =====
 
 /**
- * @brief Handle table with generation counters and freelist pooling
+ * @brief Handle table and batched decode orchestrator for branch management
  *
- * Manages a pool of BranchState slots using handle-based addressing.
- * Slot 0 is permanently reserved (handle 0 = INVALID_HANDLE).
- * Auto-grows by doubling up to 65535 slots.
+ * Provides two concerns:
+ *
+ * **Slot management** — A pool of BranchState slots addressed by opaque handles
+ * with generation counters for ABA prevention. Slot 0 is permanently reserved
+ * (handle 0 = INVALID_HANDLE). Auto-grows by doubling up to 65535 slots.
+ * Methods: allocate(), release(), get().
+ *
+ * **Batched decode** — Orchestrates multi-branch GPU dispatches that amortize
+ * llama_decode() overhead across N branches. Each method validates handles,
+ * builds the appropriate decode primitive's input, dispatches, captures logits
+ * into per-branch snapshots, and advances positions atomically.
+ * Methods: decode_each(), decode_scatter().
+ *
+ * Batched decode methods vs free-function decode:
+ * | Method              | Tokens/branch | Chunking    | Logit capture |
+ * |---------------------|---------------|-------------|---------------|
+ * | decode_each()       | 1             | No (1 call) | Per-branch    |
+ * | decode_scatter()    | Variable      | Auto        | Per-branch    |
+ * | branch::decode_and_capture_one() | 1 | No       | Single branch |
+ *
+ * @warning **n_seq_max constraint:** Each live branch consumes one KV cache
+ *          sequence ID (llama_seq_id). The llama_context must be created with
+ *          `llama_context_params.n_seq_max` >= max simultaneous branches.
+ *          The hard ceiling is `LLAMA_MAX_SEQ` (256). BranchStore only manages
+ *          slots — it has no awareness of seq_ids or n_seq_max. The caller is
+ *          responsible for allocating and recycling seq_ids (e.g. via a
+ *          freelist) to stay within the context's limit. No runtime validation
+ *          is performed; exceeding n_seq_max causes undefined behavior in
+ *          the KV cache.
  *
  * @warning Thread safety: External synchronization required (caller's mutex).
  *          Typically SessionContext holds _decodeMutex for decode operations.
+ *
+ * @see branch::create() to initialize a branch in this store
+ * @see branch::fork() to clone a branch into a new sequence
+ * @see branch::prune() / branch::destroy() for teardown
  */
 class BranchStore {
 public:
@@ -341,6 +412,215 @@ public:
     return const_cast<BranchStore*>(this)->get(handle);
   }
 
+  // ===== BATCHED DECODE =====
+
+  /**
+   * @brief Decode one token per branch in a single GPU dispatch
+   *
+   * Packs N tokens (one per branch) into a single llama_batch and calls
+   * decode::each(), amortizing GPU dispatch overhead across all branches.
+   * After decode, captures logits from the batch into each branch's
+   * logits_snapshot and advances each branch's position by 1.
+   *
+   * @note Batch index mapping: item[i] in the batch corresponds to
+   *       `llama_get_logits_ith(ctx, i)`. This is a 1:1 mapping because
+   *       decode::each places exactly one token per batch slot.
+   *
+   * @note Uses an internal scratch buffer. Since BranchStore requires external
+   *       synchronization (caller's mutex), no concurrent access is possible.
+   *
+   * @param items    Span of {handle, token} pairs (all handles must be valid)
+   * @throws std::runtime_error if any handle is invalid, contexts don't match,
+   *         or decode fails
+   *
+   * @see decode::each() for the underlying single-batch primitive
+   * @see decode_scatter() for variable token counts per branch
+   */
+  void decode_each(std::span<const DecodeEachItem> items) {
+    if (items.empty()) return;
+
+    const int32_t n = static_cast<int32_t>(items.size());
+
+    // Validate handles and collect states
+    std::vector<BranchState*> states(n);
+    for (int32_t i = 0; i < n; ++i) {
+      states[i] = get(items[i].handle);
+      if (!states[i]) {
+        throw std::runtime_error("BranchStore::decode_each - invalid handle at index " + std::to_string(i));
+      }
+      if (i > 0 && states[i]->ctx != states[0]->ctx) {
+        throw std::runtime_error("BranchStore::decode_each - all branches must share the same context");
+      }
+    }
+
+    // Build EachItem array from branch states
+    std::vector<decode::EachItem> decode_items(n);
+    for (int32_t i = 0; i < n; ++i) {
+      decode_items[i].token = items[i].token;
+      decode_items[i].pos = states[i]->position;
+      decode_items[i].seq_id = states[i]->seq_id;
+      decode_items[i].output_logits = true;
+    }
+
+    // Single GPU dispatch
+    if (decode::each(states[0]->ctx, decode_items.data(), n, scratch_) != 0) {
+      throw std::runtime_error("BranchStore::decode_each - llama_decode failed");
+    }
+
+    // Capture logits and update positions
+    llama_context* ctx = states[0]->ctx;
+    for (int32_t i = 0; i < n; ++i) {
+      const float* raw_logits = logits::get(ctx, i);  // throws on null
+      if (states[i]->n_vocab <= 0) {
+        throw std::runtime_error("BranchStore::decode_each - invalid vocab size at index " + std::to_string(i));
+      }
+      assert(states[i]->logits_snapshot.size() >= static_cast<size_t>(states[i]->n_vocab));
+      std::memcpy(states[i]->logits_snapshot.data(), raw_logits,
+                  states[i]->n_vocab * sizeof(float));
+      states[i]->has_logits = true;
+      states[i]->position += 1;
+    }
+  }
+
+  /**
+   * @brief Decode variable token counts per branch with auto-chunking
+   *
+   * Two-pass algorithm:
+   *
+   * **Pass 1 — Build chunks:** Greedily bin-packs items into chunks up to
+   * `llama_n_batch(ctx)` tokens. Oversized items (tokens.size() > n_batch)
+   * get their own chunk and are dispatched via decode::many(). Zero-length
+   * items are silently skipped.
+   *
+   * **Pass 2 — Dispatch:** Iterates chunks, dispatching normal chunks via
+   * decode::scatter() and oversized chunks via decode::many(). Captures
+   * logits into per-branch snapshots and advances positions.
+   *
+   * @note Uses an internal scratch buffer. Since BranchStore requires external
+   *       synchronization (caller's mutex), no concurrent access is possible.
+   *
+   * @param items    Span of {handle, tokens} pairs (all handles must be valid)
+   * @throws std::runtime_error if any handle is invalid, contexts don't match,
+   *         or decode fails
+   *
+   * @see decode::scatter() for the underlying single-batch primitive
+   * @see decode::many() for the oversized-item fallback
+   * @see decode_each() for the simpler one-token-per-branch variant
+   */
+  void decode_scatter(std::span<const DecodeScatterItem> items) {
+    if (items.empty()) return;
+
+    const int32_t n = static_cast<int32_t>(items.size());
+
+    // Validate handles and collect states
+    std::vector<BranchState*> states(n);
+    for (int32_t i = 0; i < n; ++i) {
+      states[i] = get(items[i].handle);
+      if (!states[i]) {
+        throw std::runtime_error("BranchStore::decode_scatter - invalid handle at index " + std::to_string(i));
+      }
+      if (i > 0 && states[i]->ctx != states[0]->ctx) {
+        throw std::runtime_error("BranchStore::decode_scatter - all branches must share the same context");
+      }
+    }
+
+    llama_context* ctx = states[0]->ctx;
+    const int32_t batch_limit = static_cast<int32_t>(llama_n_batch(ctx));
+
+    // --- Pass 1: Build chunks ---
+    struct Chunk {
+      std::vector<int32_t> item_indices;
+      bool oversized = false;
+    };
+
+    std::vector<Chunk> chunks;
+    int32_t chunk_total = 0;
+
+    for (int32_t i = 0; i < n; ++i) {
+      int32_t tc = static_cast<int32_t>(items[i].tokens.size());
+      if (tc == 0) continue;
+
+      if (tc > batch_limit) {
+        chunks.push_back({{i}, true});
+        continue;
+      }
+
+      if (chunks.empty() || chunks.back().oversized ||
+          chunk_total + tc > batch_limit) {
+        chunks.push_back({{i}, false});
+        chunk_total = tc;
+      } else {
+        chunks.back().item_indices.push_back(i);
+        chunk_total += tc;
+      }
+    }
+
+    // --- Pass 2: Dispatch each chunk ---
+    for (const auto& chunk : chunks) {
+      if (chunk.oversized) {
+        // Single oversized item — dispatch via decode::many
+        int32_t idx = chunk.item_indices[0];
+        int32_t tc = static_cast<int32_t>(items[idx].tokens.size());
+
+        // Clamp to context batch limit — branch n_batch may exceed it
+        const int32_t safe_batch = std::min(states[idx]->n_batch, batch_limit);
+        if (decode::many(ctx, items[idx].tokens.data(), tc,
+                         states[idx]->position, safe_batch,
+                         states[idx]->seq_id) != 0) {
+          throw std::runtime_error("BranchStore::decode_scatter - decode::many failed for oversized item " + std::to_string(idx));
+        }
+
+        // Capture logits (many() outputs logits for last token at index -1)
+        const float* raw_logits = logits::get(ctx, -1);
+        if (states[idx]->n_vocab <= 0) {
+          throw std::runtime_error("BranchStore::decode_scatter - invalid vocab size");
+        }
+        assert(states[idx]->logits_snapshot.size() >= static_cast<size_t>(states[idx]->n_vocab));
+        std::memcpy(states[idx]->logits_snapshot.data(), raw_logits,
+                    states[idx]->n_vocab * sizeof(float));
+        states[idx]->has_logits = true;
+        states[idx]->position += tc;
+        continue;
+      }
+
+      // Normal chunk — build ScatterItems and dispatch
+      std::vector<decode::ScatterItem> scatter_items(chunk.item_indices.size());
+      for (size_t k = 0; k < chunk.item_indices.size(); ++k) {
+        int32_t idx = chunk.item_indices[k];
+        scatter_items[k].tokens = items[idx].tokens;
+        scatter_items[k].start_pos = states[idx]->position;
+        scatter_items[k].seq_id = states[idx]->seq_id;
+        scatter_items[k].output_logits = true;
+      }
+
+      if (decode::scatter(ctx, scatter_items.data(),
+                          static_cast<int32_t>(scatter_items.size()),
+                          scratch_) != 0) {
+        throw std::runtime_error("BranchStore::decode_scatter - decode::scatter failed");
+      }
+
+      // Capture logits for each item in the chunk
+      int32_t cursor = 0;
+      for (size_t k = 0; k < scatter_items.size(); ++k) {
+        int32_t idx = chunk.item_indices[k];
+        int32_t item_n = static_cast<int32_t>(scatter_items[k].tokens.size());
+        int32_t logit_pos = cursor + item_n - 1;
+
+        const float* raw_logits = logits::get(ctx, logit_pos);
+        if (states[idx]->n_vocab <= 0) {
+          throw std::runtime_error("BranchStore::decode_scatter - invalid vocab size for item " + std::to_string(idx));
+        }
+        assert(states[idx]->logits_snapshot.size() >= static_cast<size_t>(states[idx]->n_vocab));
+        std::memcpy(states[idx]->logits_snapshot.data(), raw_logits,
+                    states[idx]->n_vocab * sizeof(float));
+        states[idx]->has_logits = true;
+        states[idx]->position += static_cast<int32_t>(items[idx].tokens.size());
+
+        cursor += item_n;
+      }
+    }
+  }
+
 private:
   /// @brief Free owned resources (sampler, grammar, boundary tracker, metrics)
   void free_branch_resources(BranchState& slot) {
@@ -362,51 +642,41 @@ private:
     }
   }
 
-  std::deque<BranchState> slots_;   ///< Slot array (deque for pointer stability on grow)
+  /// Slot array. Uses std::deque (not std::vector) for pointer stability —
+  /// get() returns BranchState* that remain valid across allocate()/grow().
+  std::deque<BranchState> slots_;
   std::vector<uint16_t> freelist_;  ///< Available slot indices (LIFO)
+
+  /// Reusable scratch buffers for batched decode. Safe without locking because
+  /// BranchStore requires external synchronization (caller's mutex).
+  decode::Scratch scratch_;
 };
 
 // ===== GLOBAL STORE =====
 
 /// @cond INTERNAL
 namespace detail {
-inline BranchStore*& global_store_ptr() {
-  static BranchStore* ptr = nullptr;
-  return ptr;
-}
-
 inline BranchStore& global_store() {
-  BranchStore*& ptr = global_store_ptr();
-  if (!ptr) {
-    ptr = new BranchStore();
-  }
-  return *ptr;
+  static BranchStore instance;
+  return instance;
 }
 }  // namespace detail
 /// @endcond
 
 /**
- * @brief Tear down the global branch store
+ * @brief Shut down the global branch store (no-op)
  *
- * Frees all branches in the global store and deallocates it.
- * Call this BEFORE llama_backend_free() to ensure proper teardown order.
+ * The global store uses a function-local static (Meyer's Singleton) with
+ * thread-safe initialization. It cannot be deleted at runtime.
  *
- * Safe to call multiple times or if the global store was never used.
+ * To free llama resources before llama_backend_free(), call branch::prune()
+ * on each branch individually. BranchStore itself only owns std::vector
+ * memory — its implicit destructor does not call any llama functions.
  *
- * @note After calling this, any handles obtained from the global store are invalid.
- *
- * @example
- * @code
- *   branch::shutdown_global_store();
- *   llama_backend_free();
- * @endcode
+ * @note Retained for API compatibility. Safe to call, but does nothing.
  */
 inline void shutdown_global_store() {
-  BranchStore*& ptr = detail::global_store_ptr();
-  if (ptr) {
-    delete ptr;
-    ptr = nullptr;
-  }
+  // No-op: global store has static lifetime.
 }
 
 // ===== BRANCH API =====
@@ -421,7 +691,8 @@ inline void shutdown_global_store() {
  * @tparam P Any type satisfying the SamplingParamsLike concept
  * @param ctx Llama context (not owned, must outlive branch)
  * @param model Llama model (not owned, used for vocab size and sampler init)
- * @param seq_id KV cache sequence ID for this branch
+ * @param seq_id KV cache sequence ID for this branch. Must be < n_seq_max
+ *               configured on the context. Caller manages seq_id allocation.
  * @param start_pos Starting decode position (typically prompt length after prefill)
  * @param params Sampling parameters (temperature, top_k, top_p, penalties, etc.)
  * @param n_batch Batch size for decode operations (default 512)
@@ -532,7 +803,8 @@ inline void destroy(BranchHandle handle, BranchStore* store = nullptr) {
  * - steer_fn (may capture references — call set_steer() on the child if needed)
  *
  * @param source Handle of the branch to fork from
- * @param new_seq_id KV cache sequence ID for the child branch
+ * @param new_seq_id KV cache sequence ID for the child branch. Must be
+ *                   < n_seq_max configured on the context.
  * @param store Branch store (nullptr = global store)
  * @return Handle to the new child branch, or INVALID_HANDLE on failure
  *
@@ -798,25 +1070,25 @@ inline void decode_batch(
   }
 
   // Pass raw pointer directly - no vector copy needed
-  decoder::decode_tokens(
-      state->ctx, tokens, static_cast<int32_t>(n_tokens),
-      state->position, state->n_batch, state->seq_id);
+  if (decode::many(state->ctx, tokens, static_cast<int32_t>(n_tokens),
+                   state->position, state->n_batch, state->seq_id) != 0) {
+    throw std::runtime_error("decode_batch: llama_decode failed");
+  }
 
   state->position += static_cast<llama_pos>(n_tokens);
 }
 
 /**
- * @brief Decode a single token (zero-allocation fast path)
+ * @brief Decode a single token (no per-call allocation)
  *
- * Uses a stack-allocated llama_batch — no heap allocation.
+ * Uses decode::one() which maintains a thread_local batch — heap-allocated
+ * once per thread, reused across calls. No per-call allocation.
  * Does NOT capture logits; use decode_and_capture_one() if needed.
  *
  * @param handle Branch to decode into
  * @param token Token ID to decode
  * @param store Branch store (nullptr = global store)
  * @throws std::runtime_error if handle is invalid or decode fails
- *
- * @note Prefer this over decode_batch() for single-token MCTS expansion.
  */
 inline void decode_one(
     BranchHandle handle,
@@ -829,7 +1101,9 @@ inline void decode_one(
     throw std::runtime_error("decode_one: invalid branch handle");
   }
 
-  decoder::decode_one(state->ctx, token, state->position, state->seq_id, false);
+  if (decode::one(state->ctx, token, state->position, state->seq_id, false) != 0) {
+    throw std::runtime_error("decode_one: llama_decode failed");
+  }
   state->position += 1;
 }
 
@@ -895,9 +1169,10 @@ inline void decode_and_capture_batch(
   }
 
   // Pass raw pointer directly - no vector copy needed
-  decoder::decode_tokens(
-      state->ctx, tokens, static_cast<int32_t>(n_tokens),
-      state->position, state->n_batch, state->seq_id);
+  if (decode::many(state->ctx, tokens, static_cast<int32_t>(n_tokens),
+                   state->position, state->n_batch, state->seq_id) != 0) {
+    throw std::runtime_error("decode_and_capture_batch: llama_decode failed");
+  }
 
   state->position += static_cast<llama_pos>(n_tokens);
 
@@ -914,9 +1189,10 @@ inline void decode_and_capture_batch(
 }
 
 /**
- * @brief Decode a single token and capture logits (zero-allocation fast path)
+ * @brief Decode a single token and capture logits (no per-call allocation)
  *
- * Uses a stack-allocated llama_batch — no heap allocation.
+ * Uses decode::one() which maintains a thread_local batch — heap-allocated
+ * once per thread, reused across calls. No per-call allocation.
  * Combines decode_one() + capture_logits() in a single call.
  *
  * @param handle Branch to decode into
@@ -924,8 +1200,6 @@ inline void decode_and_capture_batch(
  * @param store Branch store (nullptr = global store)
  * @throws std::runtime_error if handle is invalid, decode fails,
  *         or logits capture fails
- *
- * @note Prefer this over decode_and_capture_batch() for single-token MCTS expansion.
  */
 inline void decode_and_capture_one(
     BranchHandle handle,
@@ -938,7 +1212,9 @@ inline void decode_and_capture_one(
     throw std::runtime_error("decode_and_capture_one: invalid branch handle");
   }
 
-  decoder::decode_one(state->ctx, token, state->position, state->seq_id, true);
+  if (decode::one(state->ctx, token, state->position, state->seq_id, true) != 0) {
+    throw std::runtime_error("decode_and_capture_one: llama_decode failed");
+  }
   state->position += 1;
 
   // logits::get() throws if logits unavailable
@@ -1022,19 +1298,12 @@ inline llama_token sample(BranchHandle handle, BranchStore* store = nullptr) {
     grammar::apply(state->grammar, &cur_p);
   }
 
-  // Apply logit bias if present
+  // Apply logit bias if present — O(n_biases) via direct index
+  // (candidates are in token-ID order; grammar::apply preserves order)
   if (!state->logit_bias.empty()) {
     for (const auto& bias : state->logit_bias) {
-      // Bounds check - silently skip invalid tokens
-      if (bias.token < 0 || bias.token >= state->n_vocab) {
-        continue;
-      }
-      // Find token in candidates and apply additive bias
-      for (size_t i = 0; i < cur_p.size; ++i) {
-        if (cur_p.data[i].id == bias.token) {
-          cur_p.data[i].logit += bias.bias;
-          break;
-        }
+      if (bias.token >= 0 && bias.token < state->n_vocab) {
+        cur_p.data[bias.token].logit += bias.bias;
       }
     }
   }

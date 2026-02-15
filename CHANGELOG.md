@@ -25,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Header-only C++ library for llama.cpp primitives
 - Core modules:
   - `tokenizer.hpp` - Tokenization/detokenization with special token handling
-  - `decoder.hpp` - Batch decoding with sequence awareness
+  - `decode.hpp` - Batch decoding with sequence awareness
   - `kv.hpp` - KV cache management and state operations
   - `sampler.hpp` - Parameterized sampling with grammar support
   - `metrics.hpp` - Dual-level entropy and perplexity tracking

@@ -1,12 +1,12 @@
 #include "llama_stubs.h"
 #include <doctest/doctest.h>
-#include <lloyal/decoder.hpp>
+#include <lloyal/decode.hpp>
 #include <vector>
 
-using namespace lloyal::decoder;
+using namespace lloyal::decode;
 
 /**
- * Tests for seq_id parameter in decode_tokens()
+ * Tests for seq_id parameter in decode::many()
  *
  * Validates that the seq_id parameter is correctly propagated through
  * to the batch operations and that backward compatibility is maintained.
@@ -20,7 +20,7 @@ TEST_CASE("Decoder seq_id: default seq_id is 0") {
   llamaStubConfig().decode_result = 0;
 
   // Call without seq_id parameter (should default to 0)
-  decode_tokens(&ctx, tokens, 0, 32);
+  CHECK(many(&ctx, tokens, 0, 32) == 0);
 
   CHECK(llamaStubConfig().last_batch_seq_id == 0);
   CHECK(llamaStubConfig().all_batches_used_seq_id == 0);
@@ -34,7 +34,7 @@ TEST_CASE("Decoder seq_id: explicit seq_id = 5") {
   llamaStubConfig().decode_result = 0;
 
   // Call with explicit seq_id = 5
-  decode_tokens(&ctx, tokens, 0, 32, 5);
+  CHECK(many(&ctx, tokens, 0, 32, 5) == 0);
 
   CHECK(llamaStubConfig().last_batch_seq_id == 5);
   CHECK(llamaStubConfig().all_batches_used_seq_id == 5);
@@ -48,7 +48,7 @@ TEST_CASE("Decoder seq_id: seq_id preserved across batch chunks") {
   llamaStubConfig().decode_result = 0;
 
   // Decode with seq_id = 7
-  decode_tokens(&ctx, long_tokens, 0, 32, 7);
+  CHECK(many(&ctx, long_tokens, 0, 32, 7) == 0);
 
   // Should have 4 decode calls (100/32 = 4 chunks)
   CHECK(llamaStubConfig().decode_call_count == 4);
@@ -66,7 +66,7 @@ TEST_CASE("Decoder seq_id: array overload with seq_id") {
   llamaStubConfig().decode_result = 0;
 
   // Use array overload with explicit seq_id
-  decode_tokens(&ctx, tokens, 3, 0, 32, 3);
+  CHECK(many(&ctx, tokens, 3, 0, 32, 3) == 0);
 
   CHECK(llamaStubConfig().last_batch_seq_id == 3);
 }
@@ -79,7 +79,7 @@ TEST_CASE("Decoder seq_id: vector overload with seq_id") {
   llamaStubConfig().decode_result = 0;
 
   // Use vector overload with explicit seq_id
-  decode_tokens(&ctx, tokens, 0, 32, 9);
+  CHECK(many(&ctx, tokens, 0, 32, 9) == 0);
 
   CHECK(llamaStubConfig().last_batch_seq_id == 9);
 }
@@ -92,7 +92,7 @@ TEST_CASE("Decoder seq_id: backward compatibility - old API works") {
   llamaStubConfig().decode_result = 0;
 
   // Old API call (no seq_id) should still work
-  decode_tokens(&ctx, tokens, 0, 32);
+  CHECK(many(&ctx, tokens, 0, 32) == 0);
 
   CHECK(llamaStubConfig().decode_call_count == 1);
   CHECK(llamaStubConfig().last_batch_seq_id == 0);  // Defaults to 0
@@ -106,7 +106,7 @@ TEST_CASE("Decoder seq_id: seq_id = 0 explicit is same as default") {
   llamaStubConfig().decode_result = 0;
 
   // Explicit seq_id = 0
-  decode_tokens(&ctx, tokens, 0, 32, 0);
+  CHECK(many(&ctx, tokens, 0, 32, 0) == 0);
 
   CHECK(llamaStubConfig().last_batch_seq_id == 0);
   CHECK(llamaStubConfig().all_batches_used_seq_id == 0);
@@ -119,9 +119,49 @@ TEST_CASE("Decoder seq_id: error handling preserves seq_id tracking") {
   std::vector<llama_token> tokens = {1, 2, 3};
   llamaStubConfig().decode_result = -1;  // Force failure
 
-  // Should throw but seq_id should still be captured
-  CHECK_THROWS(decode_tokens(&ctx, tokens, 0, 32, 42));
+  // Should return error but seq_id should still be captured
+  CHECK(many(&ctx, tokens, 0, 32, 42) != 0);
 
   // The batch was built before the decode failed
   CHECK(llamaStubConfig().last_batch_seq_id == 42);
+}
+
+// ============================================================================
+// decode::each negative n validation (Fix 4)
+// ============================================================================
+
+TEST_CASE("Decoder each: n = -1 throws") {
+  resetStubConfig();
+
+  llama_context ctx{};
+  Scratch scratch;
+  CHECK_THROWS(each(&ctx, nullptr, -1, scratch));
+}
+
+TEST_CASE("Decoder each: n = 0 returns 0 (no-op)") {
+  resetStubConfig();
+
+  llama_context ctx{};
+  Scratch scratch;
+  CHECK(each(&ctx, nullptr, 0, scratch) == 0);
+}
+
+// ============================================================================
+// decode::scatter negative n validation (Fix 4)
+// ============================================================================
+
+TEST_CASE("Decoder scatter: n = -1 throws") {
+  resetStubConfig();
+
+  llama_context ctx{};
+  Scratch scratch;
+  CHECK_THROWS(scatter(&ctx, nullptr, -1, scratch));
+}
+
+TEST_CASE("Decoder scatter: n = 0 returns 0 (no-op)") {
+  resetStubConfig();
+
+  llama_context ctx{};
+  Scratch scratch;
+  CHECK(scatter(&ctx, nullptr, 0, scratch) == 0);
 }

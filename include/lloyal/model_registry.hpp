@@ -49,6 +49,13 @@ struct ModelKey {
  * Computes combined hash of path, GPU layers, and mmap flag for use in
  * std::unordered_map. Uses XOR with golden ratio constant for good distribution.
  */
+// Compiler-specific sanitizer suppression (GCC/Clang only; no-op on MSVC)
+#if defined(__GNUC__) || defined(__clang__)
+  #define LLOYAL_NO_SANITIZE_OVERFLOW __attribute__((no_sanitize("unsigned-integer-overflow")))
+#else
+  #define LLOYAL_NO_SANITIZE_OVERFLOW
+#endif
+
 struct ModelKeyHash {
   /**
    * @brief Compute hash for ModelKey
@@ -58,6 +65,7 @@ struct ModelKeyHash {
    * @param k Key to hash
    * @return Combined hash value
    */
+  LLOYAL_NO_SANITIZE_OVERFLOW
   size_t operator()(const ModelKey &k) const {
     std::hash<std::string> Hs;
     std::hash<int> Hi;
@@ -67,33 +75,64 @@ struct ModelKeyHash {
   }
 };
 
+#undef LLOYAL_NO_SANITIZE_OVERFLOW
+
 /**
- * Thread-safe registry for sharing llama_model instances
+ * @brief Thread-safe weak-pointer cache for sharing llama_model instances
  *
- * IMPORTANT: This is a CLASS with static members, not a namespace.
- * Converting to header-only requires inline static members (C++17).
+ * Avoids redundant model loads when multiple contexts use the same GGUF file.
+ * The cache stores weak_ptrs keyed by (path, n_gpu_layers, use_mmap).
+ *
+ * **Ownership model:**
+ * - acquire() returns a shared_ptr to the model
+ * - The cache holds a weak_ptr — the model stays loaded as long as at
+ *   least one caller holds a shared_ptr
+ * - When the last shared_ptr is released, the custom deleter calls
+ *   llama_model_free() and the cache entry expires automatically
+ * - A subsequent acquire() for the same key reloads from disk
+ *
+ * @warning acquire() holds an internal mutex for the entire duration of
+ *          llama_model_load_from_file() on a cache miss. This can block
+ *          other threads for seconds on large models.
+ *
+ * @warning **Do not call acquire() from global or static constructors.**
+ *          The internal cache (`inline static std::unordered_map`) relies
+ *          on dynamic initialization. If a global/static object in another
+ *          translation unit calls acquire() during its own construction,
+ *          the cache may not yet be initialized (SIOF). Call acquire()
+ *          only after main() has started.
+ *
+ * @example
+ * @code
+ *   llama_model_params params = llama_model_default_params();
+ *   params.n_gpu_layers = -1;
+ *
+ *   auto model = ModelRegistry::acquire("/path/to/model.gguf", params);
+ *   // ... create context, run inference ...
+ *   model.reset();  // Last holder — model freed, cache entry expires
+ * @endcode
  */
 class ModelRegistry {
 public:
   /**
-   * Acquire a model from cache or load if not present
+   * @brief Acquire a model from cache, or load from disk on cache miss
    *
-   * @param fsPath Filesystem path to model file (file:// prefix normalized)
+   * Thread-safe. On a cache hit, promotes the existing weak_ptr to a
+   * shared_ptr (zero-cost). On a cache miss, loads the model from disk
+   * while holding the mutex.
+   *
+   * @param fsPath Filesystem path to model file (file:// prefix auto-stripped)
    * @param params Model load parameters (GPU layers, mmap, etc.)
-   * @return shared_ptr to model, or nullptr if load failed
+   * @return shared_ptr to model (caller shares ownership), or nullptr on load failure
    */
   static std::shared_ptr<llama_model> acquire(const std::string &fsPath,
                                               const llama_model_params &params);
 
 private:
-  /**
-   * Global cache mutex - inline static for header-only
-   */
+  /// Guards all access to cache_ (held during load on miss)
   inline static std::mutex mu_;
 
-  /**
-   * Model cache - inline static for header-only
-   */
+  /// weak_ptr cache: entries expire when all shared_ptrs are released
   inline static std::unordered_map<ModelKey, std::weak_ptr<llama_model>,
                                    ModelKeyHash>
       cache_;
@@ -117,8 +156,12 @@ private:
 namespace lloyal::detail {
 
 /**
- * Custom deleter for llama_model shared_ptr
- * Logs model free for debugging
+ * @brief Custom deleter for llama_model shared_ptr
+ *
+ * Called automatically when the last shared_ptr to a model is released.
+ * Logs the free for debugging, then calls llama_model_free().
+ *
+ * @param model Raw pointer to free (must not be null)
  */
 inline void freeModel(llama_model *model) {
   LLOYAL_LOG_DEBUG(

@@ -96,9 +96,7 @@ inline std::string detokenize(const llama_vocab *vocab, llama_token token,
   }
 
   // Two-pass algorithm (vendored from llama.cpp/common/common.cpp)
-  std::string piece;
-  piece.resize(
-      piece.capacity()); // Use string's internal cache (15 bytes + '\0')
+  std::string piece(64, '\0');
 
   const int n_chars =
       llama_token_to_piece(vocab, token, &piece[0], piece.size(), 0, special);
