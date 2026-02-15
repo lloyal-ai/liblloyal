@@ -1596,7 +1596,7 @@ TEST_CASE("branch integration: retainOnly keeps winner decoding") {
   llama_free(ctx);
 }
 
-TEST_CASE("branch integration: prune parent with child alive (multi-tag KV survival)") {
+TEST_CASE("branch integration: multi-tag KV survival — child intact after parent eviction") {
   REQUIRE_MODEL();
   LlamaBackendGuard guard;
 
@@ -1618,7 +1618,8 @@ TEST_CASE("branch integration: prune parent with child alive (multi-tag KV survi
   auto prompt = tokenizer::tokenize(vocab, "Test KV survival", true, false);
   REQUIRE(!prompt.empty());
 
-  // Create parent, decode, fork child
+  // Create parent, decode prompt, fork child
+  // After fork: parent_seq and child_seq both tag the same KV cells (multi-tag)
   BranchHandle parent = create(ctx, model.get(), store, 0, params, 64);
   REQUIRE(parent != INVALID_HANDLE);
   decode_and_capture_batch(parent, prompt.data(), prompt.size(), store);
@@ -1626,31 +1627,27 @@ TEST_CASE("branch integration: prune parent with child alive (multi-tag KV survi
   BranchHandle child = fork(parent, store);
   REQUIRE(child != INVALID_HANDLE);
 
-  // Get child's seq_id for KV check
+  BranchState* pstate = store.get(parent);
   BranchState* cstate = store.get(child);
+  REQUIRE(pstate != nullptr);
   REQUIRE(cstate != nullptr);
+  llama_seq_id parent_seq = pstate->seq_id;
   llama_seq_id child_seq = cstate->seq_id;
 
-  // Detach child from parent first (prune throws if children exist)
-  // We need to remove child from parent's children list to allow parent prune.
-  // The cleanest way: prune child first (or use pruneSubtree).
-  // But we want to test that child's KV survives parent prune.
-  // So we need a different approach — just pruneSubtree(parent) won't work
-  // since it kills the child too.
-  //
-  // Actually, the multi-tag KV survival test is about llama.cpp's seq_cp:
-  // After fork, parent_seq and child_seq both tag the same KV cells.
-  // Pruning parent (kv::remove_range on parent_seq) should NOT affect
-  // child_seq's view of those cells.
-  //
-  // With RESTRICT semantics, we can't prune parent while child exists.
-  // This is by design — the test validates seq_cp independence instead.
+  // Both seqs tag the same KV cells
+  CHECK(kv::pos_max(ctx, parent_seq) >= 0);
+  CHECK(kv::pos_max(ctx, child_seq) >= 0);
 
-  // Verify child's KV is intact
-  llama_pos child_pos = kv::pos_max(ctx, child_seq);
-  CHECK(child_pos >= 0);
+  // === Strip parent's tags — partial eviction of multi-tag cells ===
+  kv::remove_range(ctx, parent_seq, 0, -1);
 
-  // Decode more on child — proves KV is functional
+  // Parent's tags gone
+  CHECK(kv::pos_max(ctx, parent_seq) < 0);
+
+  // Child's tags survive — a cell is freed only when ALL tags are removed
+  CHECK(kv::pos_max(ctx, child_seq) >= 0);
+
+  // Child still decodes — KV is functional, not just tagged
   auto cont = tokenizer::tokenize(vocab, " more", false, false);
   REQUIRE(!cont.empty());
   CHECK_NOTHROW(decode_and_capture_one(child, cont[0], store));
@@ -1658,10 +1655,15 @@ TEST_CASE("branch integration: prune parent with child alive (multi-tag KV survi
 
   llama_token tok = sample(child, store);
   CHECK(tok >= 0);
+  MESSAGE("Child decodes after parent eviction, token: " << tok);
 
-  MESSAGE("Child still decodes after fork, token: " << tok);
-
+  // === Prune everything — now ALL tags removed from shared cells ===
   pruneSubtree(parent, store);
+
+  // Cells freed — no tags remain
+  CHECK(kv::pos_max(ctx, child_seq) < 0);
+  CHECK(kv::pos_max(ctx, parent_seq) < 0);
+
   llama_free(ctx);
 }
 
