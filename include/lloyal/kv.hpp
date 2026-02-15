@@ -305,7 +305,8 @@ inline void retain(State& s, llama_seq_id keep) {
   }
 #endif
   s.vacant.clear();
-  for (llama_seq_id i = 0; i < s.n_seq_max; ++i) {
+  // Reverse order matches init() — LIFO means lowest seq_id acquired first
+  for (llama_seq_id i = s.n_seq_max; i-- > 0; ) {
     if (i == keep) {
       s.leased[static_cast<size_t>(i)] = 1;
     } else {
