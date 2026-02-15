@@ -2059,6 +2059,12 @@ public:
     branch::accept_token(handle_, token, *store_);
   }
 
+  /// @brief Check if a token is end-of-generation for this branch's model
+  bool is_eog(llama_token token) const {
+    const BranchState* st = store_ ? store_->get(handle_) : nullptr;
+    return st && st->model ? tokenizer::is_eog(st->model, token) : false;
+  }
+
   // ===== ACCESSORS =====
 
   /// @brief Current decode position (token count)

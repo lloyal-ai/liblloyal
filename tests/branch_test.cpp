@@ -777,6 +777,29 @@ TEST_CASE("branch: RAII Branch self-move-assign is safe") {
   CHECK(b.handle() == h);
 }
 
+TEST_CASE("branch: RAII Branch is_eog detects stop tokens") {
+  llamaStubConfig().eog_tokens = {2, 151645};  // EOS + ChatML EOT
+
+  TestStore ts(4);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+
+  Branch b = Branch::create(ts.ctx, fake_model, ts.store, 0, params, 512);
+  REQUIRE(b.valid());
+
+  CHECK(b.is_eog(2));        // EOS
+  CHECK(b.is_eog(151645));   // ChatML EOT
+  CHECK_FALSE(b.is_eog(42)); // regular token
+  CHECK_FALSE(b.is_eog(0));  // BOS is not EOG
+
+  llamaStubConfig().eog_tokens.clear();
+}
+
+TEST_CASE("branch: RAII Branch is_eog returns false when invalid") {
+  Branch b;  // default-constructed, no store
+  CHECK_FALSE(b.is_eog(2));
+}
+
 // ============================================================================
 // BranchStore Batched Decode Tests (span-based API)
 // ============================================================================

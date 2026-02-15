@@ -1665,6 +1665,53 @@ TEST_CASE("branch integration: prune parent with child alive (multi-tag KV survi
   llama_free(ctx);
 }
 
+TEST_CASE("branch integration: is_eog detects end-of-generation from model") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 256;
+  cparams.n_batch = 64;
+  cparams.n_seq_max = 2;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+
+  BranchStore store(4);
+  store.init_tenancy(ctx);
+  TestParams params;
+  params.temperature = 0.0f;
+  params.top_k = 0;
+  params.top_p = 1.0f;
+  params.min_p = 0.0f;
+
+  Branch b = Branch::create(ctx, model.get(), store, 0, params, 64);
+  REQUIRE(b.valid());
+
+  const llama_vocab* vocab = llama_model_get_vocab(model.get());
+  auto prompt = tokenizer::tokenize(vocab, "The capital of France is", true, false);
+  b.decode_and_capture_batch(prompt.data(), prompt.size());
+
+  // Generate until EOS or max tokens — is_eog must fire before max
+  bool hit_eog = false;
+  for (int t = 0; t < 64; t++) {
+    auto tok = b.sample();
+    if (b.is_eog(tok)) {
+      hit_eog = true;
+      break;
+    }
+    b.accept(tok);
+    b.decode_and_capture_one(tok);
+  }
+
+  CHECK(hit_eog);
+
+  store.drain();
+  llama_free(ctx);
+}
+
 TEST_CASE("branch integration: drain then llama_free ordering") {
   REQUIRE_MODEL();
   LlamaBackendGuard guard;

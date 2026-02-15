@@ -74,19 +74,21 @@ store.decode_scatter({
     {visual.handle(),   tokenize("Imagine two particles...")},        // 7 tokens
 });
 
-// Generate 64 tokens — all 4 in lockstep, 1 GPU call per step
+// Generate — all 4 in lockstep, 1 GPU call per step
 std::vector<Branch*> branches = {&analogy, &formal, &socratic, &visual};
-for (int t = 0; t < 64; t++) {
+while (!branches.empty()) {
     std::vector<decode::EachItem> items;
     for (auto* b : branches) {
         auto tok = b->sample();
+        if (b->is_eog(tok)) { b->prune(); continue; }
         b->accept(tok);
         items.push_back({b->handle(), tok});
     }
-    store.decode_each(items);  // 4 branches, 1 llama_decode()
+    std::erase_if(branches, [](auto* b) { return !b->valid(); });
+    if (!items.empty()) store.decode_each(items);
 }
 
-// Winner takes all — one seq_keep pass, 3 branches vaporized
+// Winner takes all — one seq_keep pass, losers vaporized
 auto* winner = *std::min_element(branches.begin(), branches.end(),
     [](auto* a, auto* b) { return a->perplexity() < b->perplexity(); });
 store.retainOnly(winner->handle());
