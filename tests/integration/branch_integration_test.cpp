@@ -1684,31 +1684,20 @@ TEST_CASE("branch integration: is_eog detects end-of-generation from model") {
   BranchStore store(4);
   store.init_tenancy(ctx);
   TestParams params;
-  params.temperature = 0.0f;
-  params.top_k = 0;
-  params.top_p = 1.0f;
-  params.min_p = 0.0f;
 
   Branch b = Branch::create(ctx, model.get(), store, 0, params, 64);
   REQUIRE(b.valid());
 
   const llama_vocab* vocab = llama_model_get_vocab(model.get());
-  auto prompt = tokenizer::tokenize(vocab, "The capital of France is", true, false);
-  b.decode_and_capture_batch(prompt.data(), prompt.size());
 
-  // Generate until EOS or max tokens — is_eog must fire before max
-  bool hit_eog = false;
-  for (int t = 0; t < 64; t++) {
-    auto tok = b.sample();
-    if (b.is_eog(tok)) {
-      hit_eog = true;
-      break;
-    }
-    b.accept(tok);
-    b.decode_and_capture_one(tok);
-  }
+  // Model's EOS token must be recognized as EOG
+  llama_token eos = llama_vocab_eos(vocab);
+  CHECK(b.is_eog(eos));
 
-  CHECK(hit_eog);
+  // A regular token must NOT be EOG
+  auto tokens = tokenizer::tokenize(vocab, "hello", false, false);
+  REQUIRE(!tokens.empty());
+  CHECK_FALSE(b.is_eog(tokens[0]));
 
   store.drain();
   llama_free(ctx);
