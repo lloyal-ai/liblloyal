@@ -1,7 +1,6 @@
 # liblloyal
 
 [![Tests](https://github.com/lloyal-ai/liblloyal/actions/workflows/tests.yml/badge.svg)](https://github.com/lloyal-ai/liblloyal/actions/workflows/tests.yml)
-[![Docs](https://github.com/lloyal-ai/liblloyal/actions/workflows/docs.yml/badge.svg)](https://lloyal-ai.github.io/liblloyal/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![C++](https://img.shields.io/badge/C++-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
 [![llama.cpp](https://img.shields.io/badge/llama.cpp-b6870-green.svg)](https://github.com/ggml-org/llama.cpp/releases/tag/b6870)
@@ -56,25 +55,43 @@ using namespace lloyal::branch;
 BranchStore store;
 store.init_tenancy(ctx);
 
-// Create root, fork candidates
+// Shared prompt: "Explain quantum entanglement"
 auto root = Branch::create(ctx, model, store, prompt_len, params);
 root.capture_logits();
 
-std::vector<Branch> candidates;
-for (int i = 0; i < n; i++)
-    candidates.push_back(root.fork());
+// Fork 4 branches — each will get a different reasoning prefix
+auto analogy  = root.fork();
+auto formal   = root.fork();
+auto socratic = root.fork();
+auto visual   = root.fork();
 
-// Generate — each branch samples independently
-for (auto& c : candidates) {
-    auto tok = c.sample();
-    c.accept(tok);
-    c.decode_and_capture_one(tok);
+// Scatter-prefill: inject divergent prefixes in one batched dispatch
+// 4 branches × variable lengths → auto bin-packed into minimal GPU calls
+store.decode_scatter({
+    {analogy.handle(),  tokenize("Think of it like two coins...")},   // 12 tokens
+    {formal.handle(),   tokenize("In quantum mechanics, the...")},    // 8 tokens
+    {socratic.handle(), tokenize("What happens when you measure...")},// 10 tokens
+    {visual.handle(),   tokenize("Imagine two particles...")},        // 7 tokens
+});
+
+// Generate — all 4 in lockstep, 1 GPU call per step
+std::vector<Branch*> branches = {&analogy, &formal, &socratic, &visual};
+while (!branches.empty()) {
+    std::vector<decode::EachItem> items;
+    for (auto* b : branches) {
+        auto tok = b->sample();
+        if (b->is_eog(tok)) { b->prune(); continue; }
+        b->accept(tok);
+        items.push_back({b->handle(), tok});
+    }
+    std::erase_if(branches, [](auto* b) { return !b->valid(); });
+    if (!items.empty()) store.decode_each(items);
 }
 
-// Promote winner, nuke the rest in one seq_keep pass
-auto& winner = *std::min_element(candidates.begin(), candidates.end(),
-    [](auto& a, auto& b) { return a.perplexity() < b.perplexity(); });
-store.retainOnly(winner.handle());
+// Winner takes all — one seq_keep pass, losers vaporized
+auto* winner = *std::min_element(branches.begin(), branches.end(),
+    [](auto* a, auto* b) { return a->perplexity() < b->perplexity(); });
+store.retainOnly(winner->handle());
 ```
 
 **What `fork()` clones:** KV cache sequence, sampler chain (penalties, PRNG, filters), grammar (GBNF parser state), metrics (model + sampling perplexity), logits snapshot, logit bias.
@@ -139,49 +156,92 @@ auto model2 = lloyal::ModelRegistry::acquire(path, params);  // cache hit
 
 ## From Simple to Complex
 
-**Single-sequence streaming:**
+**Single-sequence streaming** — the baseline everyone has:
 
 ```cpp
-lloyal::decoder::decode_tokens(ctx, prompt_tokens, 0);
+lloyal::decode::many(ctx, prompt_tokens.data(), prompt_tokens.size(), 0, n_batch);
 while (!done) {
     auto token = lloyal::sampler::sample_with_params(ctx, vocab, params);
-    lloyal::decoder::decode_one(ctx, token, n_past++);
+    lloyal::decode::one(ctx, token, n_past++);
 }
 ```
 
-**Long-context compression:**
-
-```cpp
-auto sinks = std::vector<llama_token>(tokens.begin(), tokens.begin() + 4);
-auto tail = std::vector<llama_token>(tokens.end() - 252, tokens.end());
-lloyal::kv::clear_and_reseed(ctx, sinks, tail, n_batch);
-```
-
-**Tree search turn lifecycle:**
+**Best-of-N** — fork once, diverge everywhere, keep the best:
 
 ```cpp
 using namespace lloyal::branch;
 
 BranchStore store;
 store.init_tenancy(ctx);
+
 auto root = Branch::create(ctx, model, store, prompt_len, params);
 root.capture_logits();
 
-// Search: fork → sample → evaluate → surgical prune
-for (int step = 0; step < max_steps; step++) {
-    auto leaf = root.fork();
-    auto tok = leaf.sample();
-    if (is_bad(tok)) {
-        leaf.prune();   // RESTRICT: surgical, one seq evicted
-        continue;
-    }
-    leaf.accept(tok);
-    leaf.decode_and_capture_one(tok);
+// Fork 8 candidates — KV prefix shared, each gets unique PRNG
+std::vector<Branch> candidates;
+for (int i = 0; i < 8; i++) {
+    candidates.push_back(root.fork());
+    reseed_chain(candidates.back().handle(), store, 1000 + i);
 }
 
-// Promote: nuclear, one seq_keep pass
+// Generate 64 tokens — all 8 branches batched into single GPU calls
+for (int t = 0; t < 64; t++) {
+    std::vector<decode::EachItem> items;
+    for (auto& c : candidates) {
+        auto tok = c.sample();
+        c.accept(tok);
+        items.push_back({c.handle(), tok});
+    }
+    store.decode_each(items);  // 8 branches, 1 llama_decode()
+}
+
+// Winner takes all — one seq_keep pass, 7 branches vaporized
+auto& winner = *std::min_element(candidates.begin(), candidates.end(),
+    [](auto& a, auto& b) { return a.perplexity() < b.perplexity(); });
 store.retainOnly(winner.handle());
-// Winner is the new trunk. Tree is gone. Next turn starts fresh.
+// store.available() == n_seq_max - 1 — all leases recovered
+```
+
+**Tree search with continuous tree batching** — the full show:
+
+```cpp
+BranchStore store;
+store.init_tenancy(ctx);
+
+auto root = Branch::create(ctx, model, store, prompt_len, params);
+root.capture_logits();
+
+for (int turn = 0; turn < max_turns; turn++) {
+    // Expand: fork children, each samples a different continuation
+    std::vector<Branch> leaves;
+    int width = std::min((int)store.available(), max_width);
+    for (int i = 0; i < width; i++) {
+        auto leaf = root.fork();
+        reseed_chain(leaf.handle(), store, turn * 1000 + i);
+        leaves.push_back(std::move(leaf));
+    }
+
+    // Evaluate: generate depth tokens per leaf, batched across all branches
+    for (int d = 0; d < depth; d++) {
+        std::vector<decode::EachItem> items;
+        for (auto& leaf : leaves) {
+            auto tok = leaf.sample();
+            leaf.accept(tok);
+            items.push_back({leaf.handle(), tok});
+        }
+        store.decode_each(items);  // width branches × 1 GPU dispatch
+    }
+
+    // Score + surgical prune: RESTRICT evicts one lease per loser
+    std::sort(leaves.begin(), leaves.end(),
+        [](auto& a, auto& b) { return a.perplexity() < b.perplexity(); });
+    for (size_t i = 1; i < leaves.size(); i++)
+        leaves[i].prune();
+
+    // Promote: nuclear — winner becomes the new trunk
+    store.retainOnly(leaves[0].handle());
+    root = std::move(leaves[0]);
+}
 ```
 
 ## Architecture
