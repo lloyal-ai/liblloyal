@@ -71,6 +71,10 @@ uint32_t llama_n_ctx(const llama_context * /*ctx*/) {
   return 512;
 }
 
+uint32_t llama_n_seq_max(const llama_context * /*ctx*/) {
+  return g_stub_config.n_seq_max;
+}
+
 llama_context_params llama_context_default_params() {
   llama_context_params params;
   params.n_ctx = 512;

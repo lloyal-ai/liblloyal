@@ -8,7 +8,7 @@
  * When using branch.hpp without boundaries:
  * - Pass nullptr for boundary_tracker parameter
  * - fork() will skip boundary_tracker cloning
- * - Boundary-aware features (MCTS per-boundary expansion) unavailable
+ * - Boundary-aware features (per-boundary expansion in tree search) unavailable
  */
 
 #include <memory>

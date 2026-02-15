@@ -5,36 +5,38 @@
 
 /**
  * @file kv.hpp
- * @brief KV Cache Management
+ * @brief KV Cache Physics
  *
- * Core primitives for KV cache operations in LLM applications:
- * - Multi-sequence management: independent recurrent states per seq_id
- * - Cache lifecycle: clear, remove, copy, keep operations
- * - State persistence: save/load with fragmentation fallback
- * - Cache reconstruction: clear_and_reseed for context compression strategies
- * - File I/O: session save/resume for app lifecycle management
+ * Two layers of KV cache management:
  *
- * These primitives compose into diverse inference patterns including:
- * - Context window management (streaming, compression, eviction)
- * - Session persistence (save/resume across app restarts)
- * - Multi-sequence orchestration (parallel logical states)
- * - Specialized search and sampling strategies
+ * **Tenancy** — the seq_id vacancy manager (the real logic in this file).
+ * Tracks which sequences are leased (owned by a branch) and which are vacant,
+ * enforcing the invariant that vacant seq_ids are always clean (no KV tags).
+ * See @ref tenancy for the full API.
  *
- * Memory management for llama.cpp primitives:
- * - llama_memory_* for cache lifecycle and multi-sequence ops
- * - llama_state_* for serialization with fragmentation fallback
- * - Adds null-safety, error handling, and defensive programming
+ * **Primitives** — thin wrappers over llama.cpp's llama_memory_* and
+ * llama_state_* APIs. These add null-safety, error handling, debug logging,
+ * and fragmentation fallbacks, but contain no domain logic:
+ * - Sequence ops: remove_range, pos_max, seq_cp, seq_keep
+ * - State snapshots: state_size, state_save, state_load
+ * - Global state: global_state_size, global_state_save, global_state_load
+ * - Cache clearing: clear_all, clear_metadata
+ * - Context compression: clear_and_reseed
+ * - File I/O: write_file, read_file
  */
 
 #include "common.hpp"
 #include "decode.hpp"
+#include <cassert>
 #include <cstdint>
 #include <llama/llama.h>
+#include <type_traits>
 #include <vector>
 
 namespace lloyal::kv {
 
 // ===== KV SEQUENCE OPERATIONS =====
+// Thin wrappers — tenancy is built on top of these.
 
 /**
  * @brief Remove token range from KV cache sequence
@@ -146,6 +148,204 @@ inline void seq_keep(llama_context *ctx, llama_seq_id seq) {
 
   LLOYAL_LOG_DEBUG("[kv::seq_keep] Kept only seq %d", seq);
 }
+
+// ===== KV TENANCY =====
+
+/**
+ * @defgroup tenancy KV Tenancy
+ * @brief Vacancy manager for seq_ids — the scarce KV cache resource
+ *
+ * A llama context has a fixed pool of seq_ids (typically 1–256). Each seq_id
+ * represents an independent recurrent state in the KV cache. Tenancy tracks
+ * which sequences are **leased** (owned by a branch) and which are **vacant**
+ * (available for allocation), providing symmetric acquire/release lifecycle.
+ *
+ * @par Key invariant
+ * A seq_id in the vacant pool is always **clean** — it has no KV cache tags.
+ * evict() strips tags before releasing; fork()'s debug assert verifies this
+ * on acquisition.
+ *
+ * @par LIFO reuse
+ * Vacant seq_ids are stored as a LIFO stack. This is a locality heuristic
+ * (recently freed seqs may still be warm in cache), not a correctness
+ * requirement.
+ *
+ * @{
+ */
+
+static_assert(std::is_signed_v<llama_seq_id>,
+              "llama_seq_id must be signed for NO_LEASE sentinel");
+
+/**
+ * @brief Sentinel value indicating a branch has no KV residency
+ *
+ * -1 is chosen because 0 is a valid seq_id. Used as the default seq_id
+ * on freshly allocated (but not yet leased) branch slots.
+ */
+constexpr llama_seq_id NO_LEASE = static_cast<llama_seq_id>(-1);
+
+namespace tenancy {
+
+/**
+ * @brief Tenancy state — tracks seq_id vacancy and leases
+ *
+ * Owned by BranchStore. Initialized via init(), becomes inert after
+ * the owning BranchStore calls drain().
+ */
+struct State {
+  llama_context* ctx = nullptr;       ///< Context for KV operations (nullptr after drain)
+  llama_seq_id n_seq_max = 0;        ///< Total seq_id capacity (from llama_n_seq_max)
+  std::vector<llama_seq_id> vacant;  ///< Available seq_ids (LIFO stack)
+  std::vector<uint8_t> leased;      ///< Bitmap: leased[seq] = 1 if issued
+};
+
+/**
+ * @brief Initialize tenancy with all seq_ids vacant
+ *
+ * Fills the vacant stack in reverse order so that seq 0 is acquired first
+ * (LIFO pop from back). Safe for n_seq_max == 0 (produces empty state).
+ *
+ * @param ctx   Llama context for KV operations
+ * @param n_seq_max Total number of seq_ids (from llama_n_seq_max)
+ * @return Initialized tenancy state with all seq_ids vacant
+ */
+inline State init(llama_context* ctx, llama_seq_id n_seq_max) {
+  State s;
+  s.ctx = ctx;
+  s.n_seq_max = n_seq_max;
+  s.leased.resize(static_cast<size_t>(n_seq_max), 0);
+  s.vacant.reserve(static_cast<size_t>(n_seq_max));
+  for (llama_seq_id i = n_seq_max; i-- > 0; ) {
+    s.vacant.push_back(i);
+  }
+  return s;
+}
+
+/**
+ * @brief Acquire a seq_id from the vacant pool
+ *
+ * Pops one seq_id from the LIFO stack and marks it as leased.
+ * The caller is responsible for eventually calling release() or evict()
+ * to return the lease.
+ *
+ * @param s Tenancy state
+ * @return Acquired seq_id, or NO_LEASE (-1) if the pool is exhausted
+ */
+inline llama_seq_id acquire(State& s) {
+  if (s.vacant.empty()) return NO_LEASE;
+  llama_seq_id seq = s.vacant.back();
+  s.vacant.pop_back();
+  s.leased[static_cast<size_t>(seq)] = 1;
+  return seq;
+}
+
+/**
+ * @brief Release a seq_id back to vacant — bookkeeping only, no KV calls
+ *
+ * Used when a seq was acquired but never written to (e.g. slot allocation
+ * failure rollback). The seq must already be clean (no KV tags).
+ *
+ * @param s   Tenancy state
+ * @param seq Seq_id to release (must be currently leased)
+ *
+ * @pre seq is in range [0, n_seq_max) and is currently leased
+ */
+inline void release(State& s, llama_seq_id seq) {
+  assert(seq >= 0 && seq < s.n_seq_max && "release: seq out of range");
+  assert(s.leased[static_cast<size_t>(seq)] && "release: seq not leased");
+  s.leased[static_cast<size_t>(seq)] = 0;
+  s.vacant.push_back(seq);
+}
+
+/**
+ * @brief Evict a seq_id — strip all KV tags then release
+ *
+ * Used when the seq had actual KV residency (tokens were decoded into it).
+ * Calls remove_range() to strip all tags **before** returning the seq to
+ * the vacant pool, preserving the "vacant ⇒ clean" invariant.
+ *
+ * @param s   Tenancy state
+ * @param seq Seq_id to evict (must be currently leased)
+ *
+ * @pre seq is in range [0, n_seq_max) and is currently leased
+ *
+ * @warning Must be called while ctx is still alive (before llama_free).
+ *          BranchStore::drain() ensures this ordering.
+ */
+inline void evict(State& s, llama_seq_id seq) {
+  assert(seq >= 0 && seq < s.n_seq_max && "evict: seq out of range");
+  assert(s.leased[static_cast<size_t>(seq)] && "evict: seq not leased");
+  remove_range(s.ctx, seq, 0, -1);
+  release(s, seq);
+}
+
+/**
+ * @brief Nuclear retain — keep one seq, rebuild vacancy from scratch
+ *
+ * Calls seq_keep() for a single KV pass that strips all tags except the
+ * keeper, then rebuilds the lease bitmap and vacant pool. O(n_seq_max).
+ *
+ * Used by BranchStore::retainOnly() to promote a winner after search.
+ *
+ * @param s    Tenancy state
+ * @param keep Seq_id to retain (must be currently leased)
+ *
+ * @pre keep is in range [0, n_seq_max) and is currently leased
+ *
+ * @note In debug builds, verifies that seq_keep actually stripped all
+ *       non-keep seqs (catches backend bugs via pos_max assertions).
+ */
+inline void retain(State& s, llama_seq_id keep) {
+  assert(keep >= 0 && keep < s.n_seq_max && "retain: keep seq out of range");
+  assert(s.leased[static_cast<size_t>(keep)] && "retain: keep seq not leased");
+  seq_keep(s.ctx, keep);
+#ifndef NDEBUG
+  for (llama_seq_id i = 0; i < s.n_seq_max; ++i) {
+    if (i != keep) assert(pos_max(s.ctx, i) < 0 && "retain: seq_keep left dirty tags");
+  }
+#endif
+  s.vacant.clear();
+  for (llama_seq_id i = 0; i < s.n_seq_max; ++i) {
+    if (i == keep) {
+      s.leased[static_cast<size_t>(i)] = 1;
+    } else {
+      s.leased[static_cast<size_t>(i)] = 0;
+      s.vacant.push_back(i);
+    }
+  }
+}
+
+/**
+ * @brief Evict every leased seq_id
+ *
+ * Iterates all seq_ids and evicts any that are currently leased.
+ * Used by BranchStore::drain() before context teardown.
+ *
+ * @param s Tenancy state
+ *
+ * @warning Must be called while ctx is still alive.
+ */
+inline void evict_all(State& s) {
+  for (llama_seq_id i = 0; i < s.n_seq_max; ++i) {
+    if (s.leased[static_cast<size_t>(i)]) {
+      evict(s, i);
+    }
+  }
+}
+
+/**
+ * @brief Number of vacant seq_ids available for acquisition
+ *
+ * @param s Tenancy state
+ * @return Count of seq_ids in the vacant pool
+ */
+inline size_t available(const State& s) {
+  return s.vacant.size();
+}
+
+}  // namespace tenancy
+
+/** @} */ // end of tenancy group
 
 // ===== STATE SNAPSHOT OPERATIONS =====
 
