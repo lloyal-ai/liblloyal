@@ -7,6 +7,8 @@
  * - Fork semantics
  * - State isolation
  * - RAII wrapper
+ * - Tenancy (seq_id vacancy management)
+ * - Topology (parent/children tracking)
  */
 
 #include <doctest/doctest.h>
@@ -33,98 +35,98 @@ struct TestSamplingParams {
   uint32_t seed = 42;
 };
 
+// Helper: create a tenancy-initialized store with fake ctx
+struct TestStore {
+  BranchStore store;
+  llama_context* ctx;
+
+  TestStore(size_t capacity = 8)
+    : store(capacity)
+    , ctx(reinterpret_cast<llama_context*>(0x1000))
+  {
+    store.init_tenancy(ctx);
+  }
+};
+
 // ============================================================================
 // Handle Table Tests
 // ============================================================================
 
 TEST_CASE("branch: BranchStore allocates handles with generation counters") {
-  BranchStore store(4);  // Small initial capacity
+  TestStore ts(4);
 
-  // Allocate first handle
-  BranchHandle h1 = store.allocate();
+  auto [h1, seq1] = ts.store.allocate();
   CHECK(h1 != INVALID_HANDLE);
+  CHECK(seq1 >= 0);
   CHECK(handle_index(h1) >= 1);  // Slot 0 reserved
   CHECK(handle_generation(h1) == 0);  // First use of slot
 
-  // Allocate second handle
-  BranchHandle h2 = store.allocate();
+  auto [h2, seq2] = ts.store.allocate();
   CHECK(h2 != INVALID_HANDLE);
   CHECK(h2 != h1);
+  CHECK(seq2 != seq1);  // Different seq_ids
 
-  // Both should be retrievable
-  CHECK(store.get(h1) != nullptr);
-  CHECK(store.get(h2) != nullptr);
+  CHECK(ts.store.get(h1) != nullptr);
+  CHECK(ts.store.get(h2) != nullptr);
 }
 
 TEST_CASE("branch: BranchStore rejects invalid handles") {
-  BranchStore store(4);
+  TestStore ts(4);
 
-  // Invalid handle
-  CHECK(store.get(INVALID_HANDLE) == nullptr);
+  CHECK(ts.store.get(INVALID_HANDLE) == nullptr);
 
-  // Handle with wrong generation
-  BranchHandle h = store.allocate();
+  auto [h, seq] = ts.store.allocate();
   uint16_t idx = handle_index(h);
   BranchHandle bad_gen = make_handle(idx, handle_generation(h) + 1);
-  CHECK(store.get(bad_gen) == nullptr);
+  CHECK(ts.store.get(bad_gen) == nullptr);
 
-  // Out of bounds index
   BranchHandle oob = make_handle(100, 0);
-  CHECK(store.get(oob) == nullptr);
+  CHECK(ts.store.get(oob) == nullptr);
 }
 
 TEST_CASE("branch: BranchStore generation counter prevents ABA") {
-  BranchStore store(4);
+  TestStore ts(4);
 
-  // Allocate and release
-  BranchHandle h1 = store.allocate();
+  auto [h1, seq1] = ts.store.allocate();
   uint16_t idx1 = handle_index(h1);
   uint16_t gen1 = handle_generation(h1);
-  store.release(h1);
+  ts.store.release(h1);
 
-  // Re-allocate (should reuse slot with incremented generation)
-  BranchHandle h2 = store.allocate();
+  auto [h2, seq2] = ts.store.allocate();
 
-  // If same slot was reused, generation should be different
   if (handle_index(h2) == idx1) {
     CHECK(handle_generation(h2) == gen1 + 1);
   }
 
-  // Old handle should be invalid
-  CHECK(store.get(h1) == nullptr);
-
-  // New handle should be valid
-  CHECK(store.get(h2) != nullptr);
+  CHECK(ts.store.get(h1) == nullptr);
+  CHECK(ts.store.get(h2) != nullptr);
 }
 
 TEST_CASE("branch: BranchStore grows when full") {
-  BranchStore store(2);  // Very small: slot 0 reserved, 1 available
+  TestStore ts(2);  // Very small: slot 0 reserved, 1 available
 
-  // Fill up
-  BranchHandle h1 = store.allocate();
+  auto [h1, s1] = ts.store.allocate();
   CHECK(h1 != INVALID_HANDLE);
 
-  // Should grow and succeed
-  BranchHandle h2 = store.allocate();
+  auto [h2, s2] = ts.store.allocate();
   CHECK(h2 != INVALID_HANDLE);
 
-  BranchHandle h3 = store.allocate();
+  auto [h3, s3] = ts.store.allocate();
   CHECK(h3 != INVALID_HANDLE);
 
-  // All should be valid
-  CHECK(store.get(h1) != nullptr);
-  CHECK(store.get(h2) != nullptr);
-  CHECK(store.get(h3) != nullptr);
+  CHECK(ts.store.get(h1) != nullptr);
+  CHECK(ts.store.get(h2) != nullptr);
+  CHECK(ts.store.get(h3) != nullptr);
 }
 
 TEST_CASE("branch: double release is safe") {
-  BranchStore store(4);
+  TestStore ts(4);
 
-  BranchHandle h = store.allocate();
-  store.release(h);
-  store.release(h);  // Should not crash
+  auto [h, seq] = ts.store.allocate();
+  ts.store.release(h);
+  ts.store.release(h);  // Should not crash
 
-  CHECK(store.get(h) == nullptr);
+  CHECK(ts.store.get(h) == nullptr);
 }
 
 // ============================================================================
@@ -148,43 +150,36 @@ TEST_CASE("branch: handle encoding/decoding round-trips") {
 // ============================================================================
 
 TEST_CASE("branch: create initializes state") {
-  // Note: With stubs, create will work but ctx/model are fake pointers
-  // We test the store/handle mechanics, not llama.cpp interaction
-
-  BranchStore store(4);
+  TestStore ts(4);
   TestSamplingParams params;
 
-  // Create with fake ctx/model
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
 
-  BranchHandle h = create(fake_ctx, fake_model, 0, 100, params, 512, nullptr, nullptr, &store);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 100, params, 512);
   CHECK(h != INVALID_HANDLE);
 
-  BranchState* state = store.get(h);
+  BranchState* state = ts.store.get(h);
   REQUIRE(state != nullptr);
-  CHECK(state->ctx == fake_ctx);
+  CHECK(state->ctx == ts.ctx);
   CHECK(state->model == fake_model);
-  CHECK(state->seq_id == 0);
+  CHECK(state->seq_id != lloyal::kv::NO_LEASE);
   CHECK(state->position == 100);
   CHECK(state->n_batch == 512);
 
-  // Destroy should work
-  destroy(h, &store);
-  CHECK(store.get(h) == nullptr);
+  prune(h, ts.store);
+  CHECK(ts.store.get(h) == nullptr);
 }
 
 TEST_CASE("branch: create with null ctx/model returns invalid") {
-  BranchStore store(4);
+  TestStore ts(4);
   TestSamplingParams params;
 
-  CHECK(create(nullptr, nullptr, 0, 0, params, 512, nullptr, nullptr, &store) == INVALID_HANDLE);
+  CHECK(create(nullptr, nullptr, ts.store, 0, params, 512) == INVALID_HANDLE);
 
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
-  CHECK(create(nullptr, fake_model, 0, 0, params, 512, nullptr, nullptr, &store) == INVALID_HANDLE);
+  CHECK(create(nullptr, fake_model, ts.store, 0, params, 512) == INVALID_HANDLE);
 
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
-  CHECK(create(fake_ctx, nullptr, 0, 0, params, 512, nullptr, nullptr, &store) == INVALID_HANDLE);
+  CHECK(create(ts.ctx, nullptr, ts.store, 0, params, 512) == INVALID_HANDLE);
 }
 
 // ============================================================================
@@ -192,44 +187,49 @@ TEST_CASE("branch: create with null ctx/model returns invalid") {
 // ============================================================================
 
 TEST_CASE("branch: fork creates independent copy") {
-  BranchStore store(8);
+  TestStore ts(8);
   TestSamplingParams params;
 
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
 
-  BranchHandle parent = create(fake_ctx, fake_model, 0, 50, params, 512, nullptr, nullptr, &store);
+  BranchHandle parent = create(ts.ctx, fake_model, ts.store, 50, params, 512);
   REQUIRE(parent != INVALID_HANDLE);
 
-  // Fork to new sequence
-  BranchHandle child = fork(parent, 1, &store);
+  BranchHandle child = fork(parent, ts.store);
   REQUIRE(child != INVALID_HANDLE);
   CHECK(child != parent);
 
-  // Both should be valid
-  BranchState* parent_state = store.get(parent);
-  BranchState* child_state = store.get(child);
+  BranchState* parent_state = ts.store.get(parent);
+  BranchState* child_state = ts.store.get(child);
   REQUIRE(parent_state != nullptr);
   REQUIRE(child_state != nullptr);
 
-  // Child should have new seq_id but same position
-  CHECK(parent_state->seq_id == 0);
-  CHECK(child_state->seq_id == 1);
+  // Child should have different seq_id but same position
+  CHECK(parent_state->seq_id != child_state->seq_id);
   CHECK(parent_state->position == child_state->position);
 
-  // Destroying parent shouldn't affect child
-  destroy(parent, &store);
-  CHECK(store.get(parent) == nullptr);
-  CHECK(store.get(child) != nullptr);
+  // Topology: child's parent is parent, parent has child in children
+  CHECK(child_state->parent == parent);
+  CHECK(parent_state->children.size() == 1);
+  CHECK(parent_state->children[0] == child);
 
-  destroy(child, &store);
+  // Pruning child should not affect parent
+  prune(child, ts.store);
+  CHECK(ts.store.get(parent) != nullptr);
+  CHECK(ts.store.get(child) == nullptr);
+
+  // Parent's children should be empty after child pruned
+  parent_state = ts.store.get(parent);
+  CHECK(parent_state->children.empty());
+
+  prune(parent, ts.store);
 }
 
 TEST_CASE("branch: fork invalid handle returns invalid") {
-  BranchStore store(4);
+  TestStore ts(4);
 
-  CHECK(fork(INVALID_HANDLE, 1, &store) == INVALID_HANDLE);
-  CHECK(fork(make_handle(99, 99), 1, &store) == INVALID_HANDLE);
+  CHECK(fork(INVALID_HANDLE, ts.store) == INVALID_HANDLE);
+  CHECK(fork(make_handle(99, 99), ts.store) == INVALID_HANDLE);
 }
 
 // ============================================================================
@@ -237,28 +237,25 @@ TEST_CASE("branch: fork invalid handle returns invalid") {
 // ============================================================================
 
 TEST_CASE("branch: state accessors return correct values") {
-  BranchStore store(4);
+  TestStore ts(4);
   TestSamplingParams params;
 
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
 
-  BranchHandle h = create(fake_ctx, fake_model, 5, 200, params, 512, nullptr, nullptr, &store);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 200, params, 512);
   REQUIRE(h != INVALID_HANDLE);
 
-  CHECK(get_seq_id(h, &store) == 5);
-  CHECK(get_position(h, &store) == 200);
+  CHECK(get_position(h, ts.store) == 200);
 
-  destroy(h, &store);
+  prune(h, ts.store);
 }
 
 TEST_CASE("branch: state accessors with invalid handle return defaults") {
-  BranchStore store(4);
+  TestStore ts(4);
 
-  CHECK(get_seq_id(INVALID_HANDLE, &store) == -1);
-  CHECK(get_position(INVALID_HANDLE, &store) == -1);
-  CHECK(std::isinf(get_perplexity(INVALID_HANDLE, &store)));
-  CHECK(get_n_vocab(INVALID_HANDLE, &store) == 0);
+  CHECK(get_position(INVALID_HANDLE, ts.store) == -1);
+  CHECK(std::isinf(get_perplexity(INVALID_HANDLE, ts.store)));
+  CHECK(get_n_vocab(INVALID_HANDLE, ts.store) == 0);
 }
 
 // ============================================================================
@@ -266,64 +263,58 @@ TEST_CASE("branch: state accessors with invalid handle return defaults") {
 // ============================================================================
 
 TEST_CASE("branch: RAII Branch auto-frees on destruction") {
-  BranchStore store(4);
+  TestStore ts(4);
   TestSamplingParams params;
 
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
 
   BranchHandle raw_handle;
   {
-    Branch b = Branch::create(fake_ctx, fake_model, 0, 100, params, 512, nullptr, nullptr, &store);
+    Branch b = Branch::create(ts.ctx, fake_model, ts.store, 100, params, 512);
     CHECK(b.valid());
     raw_handle = b.handle();
-    CHECK(store.get(raw_handle) != nullptr);
+    CHECK(ts.store.get(raw_handle) != nullptr);
   }
   // Branch destroyed, should be freed
-  CHECK(store.get(raw_handle) == nullptr);
+  CHECK(ts.store.get(raw_handle) == nullptr);
 }
 
 TEST_CASE("branch: RAII Branch move semantics") {
-  BranchStore store(4);
+  TestStore ts(4);
   TestSamplingParams params;
 
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
 
-  Branch b1 = Branch::create(fake_ctx, fake_model, 0, 100, params, 512, nullptr, nullptr, &store);
+  Branch b1 = Branch::create(ts.ctx, fake_model, ts.store, 100, params, 512);
   BranchHandle h = b1.handle();
 
   // Move construct
   Branch b2 = std::move(b1);
-  CHECK(!b1.valid());  // Moved-from is invalid
+  CHECK(!b1.valid());
   CHECK(b2.valid());
   CHECK(b2.handle() == h);
-  CHECK(store.get(h) != nullptr);
+  CHECK(ts.store.get(h) != nullptr);
 
   // Move assign
   Branch b3;
   b3 = std::move(b2);
   CHECK(!b2.valid());
   CHECK(b3.valid());
-  CHECK(store.get(h) != nullptr);
+  CHECK(ts.store.get(h) != nullptr);
 }
 
 TEST_CASE("branch: RAII Branch fork returns new Branch") {
-  BranchStore store(8);
+  TestStore ts(8);
   TestSamplingParams params;
 
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
 
-  Branch parent = Branch::create(fake_ctx, fake_model, 0, 100, params, 512, nullptr, nullptr, &store);
+  Branch parent = Branch::create(ts.ctx, fake_model, ts.store, 100, params, 512);
   REQUIRE(parent.valid());
 
-  Branch child = parent.fork(1);
+  Branch child = parent.fork();
   REQUIRE(child.valid());
   CHECK(child.handle() != parent.handle());
-
-  CHECK(parent.seq_id() == 0);
-  CHECK(child.seq_id() == 1);
   CHECK(parent.position() == child.position());
 }
 
@@ -332,46 +323,18 @@ TEST_CASE("branch: RAII Branch fork returns new Branch") {
 // ============================================================================
 
 TEST_CASE("branch: get_logits returns nullptr before decode_and_capture") {
-  BranchStore store(4);
+  TestStore ts(4);
   TestSamplingParams params;
 
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
 
-  BranchHandle h = create(fake_ctx, fake_model, 0, 0, params, 512, nullptr, nullptr, &store);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 512);
   REQUIRE(h != INVALID_HANDLE);
 
-  // Logits snapshot is empty before any decode
-  const float* logits = get_logits(h, &store);
-  // With stubs, n_vocab is 0, so snapshot is empty
-  // This test verifies the path doesn't crash
+  const float* logits = get_logits(h, ts.store);
   (void)logits;  // Suppress unused warning
 
-  destroy(h, &store);
-}
-
-// ============================================================================
-// Global Store Tests
-// ============================================================================
-
-TEST_CASE("branch: global store works for simple usage") {
-  TestSamplingParams params;
-
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x3000);
-  auto* fake_model = reinterpret_cast<llama_model*>(0x4000);
-
-  // Use global store (nullptr for store parameter)
-  BranchHandle h = create(fake_ctx, fake_model, 0, 0, params, 512, nullptr, nullptr);
-  REQUIRE(h != INVALID_HANDLE);
-
-  CHECK(get_seq_id(h, nullptr) == 0);
-
-  BranchHandle h2 = fork(h, 1, nullptr);
-  REQUIRE(h2 != INVALID_HANDLE);
-  CHECK(get_seq_id(h2, nullptr) == 1);
-
-  destroy(h, nullptr);
-  destroy(h2, nullptr);
+  prune(h, ts.store);
 }
 
 // ============================================================================
@@ -379,201 +342,165 @@ TEST_CASE("branch: global store works for simple usage") {
 // ============================================================================
 
 TEST_CASE("branch: BranchStore edge case - capacity 1") {
-  // This tests the size_t underflow bug in the constructor:
-  // for (size_t i = capacity - 1; i >= 0; --i) would underflow when capacity=1
-  // and i becomes 0, then i-- wraps to SIZE_MAX
-  BranchStore store(1);  // Edge case: minimum capacity
+  TestStore ts(1);
 
-  // Should still be able to allocate (store should grow)
-  BranchHandle h = store.allocate();
+  auto [h, seq] = ts.store.allocate();
   CHECK(h != INVALID_HANDLE);
-  store.release(h);
+  ts.store.release(h);
 }
 
 TEST_CASE("branch: BranchStore edge case - capacity 0") {
-  // Edge case: zero capacity should still work
-  BranchStore store(0);
+  TestStore ts(0);
 
-  BranchHandle h = store.allocate();
+  auto [h, seq] = ts.store.allocate();
   CHECK(h != INVALID_HANDLE);
-  store.release(h);
+  ts.store.release(h);
 }
 
 TEST_CASE("branch: sample() returns -1 before logits captured") {
-  // This tests the has_logits invariant:
-  // sample() should fail gracefully if decode_and_capture wasn't called
-  BranchStore store(4);
+  TestStore ts(4);
   TestSamplingParams params;
 
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
 
-  BranchHandle h = create(fake_ctx, fake_model, 0, 0, params, 512, nullptr, nullptr, &store);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 512);
   REQUIRE(h != INVALID_HANDLE);
 
-  // sample() without decode_and_capture should return -1
-  llama_token token = sample(h, &store);
+  llama_token token = sample(h, ts.store);
   CHECK(token == -1);
 
-  // Verify has_logits is false
-  BranchState* state = store.get(h);
+  BranchState* state = ts.store.get(h);
   REQUIRE(state != nullptr);
   CHECK(state->has_logits == false);
 
-  destroy(h, &store);
+  prune(h, ts.store);
 }
 
 TEST_CASE("branch: get_legal_priors returns empty before logits captured") {
-  BranchStore store(4);
+  TestStore ts(4);
   TestSamplingParams params;
 
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
 
-  BranchHandle h = create(fake_ctx, fake_model, 0, 0, params, 512, nullptr, nullptr, &store);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 512);
   REQUIRE(h != INVALID_HANDLE);
 
-  // Should return empty without logits
-  auto priors = get_legal_priors(h, &store);
+  auto priors = get_legal_priors(h, ts.store);
   CHECK(priors.empty());
 
-  destroy(h, &store);
+  prune(h, ts.store);
 }
 
 TEST_CASE("branch: get_legal_logsumexp returns -inf before logits captured") {
-  BranchStore store(4);
+  TestStore ts(4);
   TestSamplingParams params;
 
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
 
-  BranchHandle h = create(fake_ctx, fake_model, 0, 0, params, 512, nullptr, nullptr, &store);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 512);
   REQUIRE(h != INVALID_HANDLE);
 
-  // Returns -inf when no logits are captured (unambiguous sentinel)
-  float logsumexp = get_legal_logsumexp(h, &store);
+  float logsumexp = get_legal_logsumexp(h, ts.store);
   CHECK(std::isinf(logsumexp));
-  CHECK(logsumexp < 0);  // Specifically -INFINITY
+  CHECK(logsumexp < 0);
 
-  destroy(h, &store);
+  prune(h, ts.store);
 }
 
 TEST_CASE("branch: candidates_buffer is pre-allocated on create") {
-  BranchStore store(4);
+  TestStore ts(4);
   TestSamplingParams params;
 
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
 
-  BranchHandle h = create(fake_ctx, fake_model, 0, 0, params, 512, nullptr, nullptr, &store);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 512);
   REQUIRE(h != INVALID_HANDLE);
 
-  BranchState* state = store.get(h);
+  BranchState* state = ts.store.get(h);
   REQUIRE(state != nullptr);
-
-  // candidates_buffer should be pre-allocated to n_vocab size
   CHECK(state->candidates_buffer.size() == static_cast<size_t>(state->n_vocab));
 
-  destroy(h, &store);
+  prune(h, ts.store);
 }
 
 TEST_CASE("branch: candidates_buffer is pre-allocated on fork") {
-  BranchStore store(8);
+  TestStore ts(8);
   TestSamplingParams params;
 
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
 
-  BranchHandle parent = create(fake_ctx, fake_model, 0, 0, params, 512, nullptr, nullptr, &store);
+  BranchHandle parent = create(ts.ctx, fake_model, ts.store, 0, params, 512);
   REQUIRE(parent != INVALID_HANDLE);
 
-  BranchHandle child = fork(parent, 1, &store);
+  BranchHandle child = fork(parent, ts.store);
   REQUIRE(child != INVALID_HANDLE);
 
-  BranchState* child_state = store.get(child);
+  BranchState* child_state = ts.store.get(child);
   REQUIRE(child_state != nullptr);
-
-  // Child's candidates_buffer should also be pre-allocated
   CHECK(child_state->candidates_buffer.size() == static_cast<size_t>(child_state->n_vocab));
 
-  destroy(parent, &store);
-  destroy(child, &store);
+  pruneSubtree(parent, ts.store);
 }
 
 TEST_CASE("branch: release resets has_logits flag") {
-  BranchStore store(4);
-  TestSamplingParams params;
+  TestStore ts(4);
 
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
-  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
-
-  BranchHandle h1 = create(fake_ctx, fake_model, 0, 0, params, 512, nullptr, nullptr, &store);
+  auto [h1, seq1] = ts.store.allocate();
   REQUIRE(h1 != INVALID_HANDLE);
 
-  // Manually set has_logits to simulate decode_and_capture
-  BranchState* state = store.get(h1);
+  BranchState* state = ts.store.get(h1);
   REQUIRE(state != nullptr);
   state->has_logits = true;
 
-  // Release and reallocate (should reuse the slot)
-  store.release(h1);
-  BranchHandle h2 = store.allocate();
+  ts.store.release(h1);
+  auto [h2, seq2] = ts.store.allocate();
 
-  BranchState* new_state = store.get(h2);
+  BranchState* new_state = ts.store.get(h2);
   REQUIRE(new_state != nullptr);
-
-  // has_logits should be reset to false for the new allocation
   CHECK(new_state->has_logits == false);
 
-  store.release(h2);
+  ts.store.release(h2);
 }
 
 TEST_CASE("branch: stress test allocate/release cycles") {
-  // This would catch memory leaks or corruption under repeated use
-  BranchStore store(4);
+  TestStore ts(4);
 
   for (int cycle = 0; cycle < 100; ++cycle) {
     std::vector<BranchHandle> handles;
 
-    // Allocate many handles
-    for (int i = 0; i < 20; ++i) {
-      BranchHandle h = store.allocate();
-      CHECK(h != INVALID_HANDLE);
+    // Allocate up to available leases
+    for (int i = 0; i < 7; ++i) {  // n_seq_max default = 8
+      auto [h, seq] = ts.store.allocate();
+      if (h == INVALID_HANDLE) break;
       handles.push_back(h);
     }
 
-    // Release all
     for (auto h : handles) {
-      store.release(h);
+      ts.store.release(h);
     }
 
-    // All should be invalid now
     for (auto h : handles) {
-      CHECK(store.get(h) == nullptr);
+      CHECK(ts.store.get(h) == nullptr);
     }
   }
 }
 
 TEST_CASE("branch: freelist ordering after grow") {
-  // Verify freelist is correctly populated after growing
-  BranchStore store(2);  // Starts with 1 usable slot (slot 0 reserved)
+  TestStore ts(2);
 
-  // Allocate to force growth
   std::vector<BranchHandle> handles;
-  for (int i = 0; i < 10; ++i) {
-    BranchHandle h = store.allocate();
-    REQUIRE(h != INVALID_HANDLE);
+  for (int i = 0; i < 7; ++i) {  // limited by n_seq_max=8
+    auto [h, seq] = ts.store.allocate();
+    if (h == INVALID_HANDLE) break;
     handles.push_back(h);
   }
 
-  // All handles should be valid
   for (auto h : handles) {
-    CHECK(store.get(h) != nullptr);
+    CHECK(ts.store.get(h) != nullptr);
   }
 
-  // Release all
   for (auto h : handles) {
-    store.release(h);
+    ts.store.release(h);
   }
 }
 
@@ -582,117 +509,84 @@ TEST_CASE("branch: freelist ordering after grow") {
 // ============================================================================
 
 TEST_CASE("branch: generation counter increments on release") {
-  BranchStore store(4);
+  TestStore ts(4);
 
-  BranchHandle h1 = store.allocate();
+  auto [h1, seq1] = ts.store.allocate();
   uint16_t gen1 = handle_generation(h1);
   uint16_t idx1 = handle_index(h1);
 
-  store.release(h1);
+  ts.store.release(h1);
 
-  // Reallocate - should get same slot with incremented generation
-  BranchHandle h2 = store.allocate();
+  auto [h2, seq2] = ts.store.allocate();
 
-  // If same slot reused, generation should be gen1 + 1
   if (handle_index(h2) == idx1) {
     CHECK(handle_generation(h2) == static_cast<uint16_t>(gen1 + 1));
   }
 
-  store.release(h2);
+  ts.store.release(h2);
 }
 
 TEST_CASE("branch: generation counter overflow wraps safely") {
-  // This test verifies behavior when generation counter wraps from 0xFFFF -> 0
-  // After wrap, old handles should still be detected as invalid
+  TestStore ts(4);
 
-  BranchStore store(4);
-
-  // Allocate a slot
-  BranchHandle h = store.allocate();
+  auto [h, seq] = ts.store.allocate();
   uint16_t idx = handle_index(h);
 
-  // Manually force generation near overflow point
-  BranchState* state = store.get(h);
+  BranchState* state = ts.store.get(h);
   REQUIRE(state != nullptr);
-  state->generation = 0xFFFE;  // Set to near-max
+  state->generation = 0xFFFE;
 
-  // Create a handle with this generation
   BranchHandle near_max_handle = make_handle(idx, 0xFFFE);
-  CHECK(store.get(near_max_handle) != nullptr);
+  CHECK(ts.store.get(near_max_handle) != nullptr);
 
-  // Release and reallocate - generation becomes 0xFFFF
-  store.release(near_max_handle);
-  BranchHandle h_ffff = store.allocate();
+  ts.store.release(near_max_handle);
+  auto [h_ffff, seq2] = ts.store.allocate();
 
   if (handle_index(h_ffff) == idx) {
     CHECK(handle_generation(h_ffff) == 0xFFFF);
+    CHECK(ts.store.get(near_max_handle) == nullptr);
 
-    // Old handle should be invalid
-    CHECK(store.get(near_max_handle) == nullptr);
-
-    // Release again - generation wraps to 0
-    store.release(h_ffff);
-    BranchHandle h_wrapped = store.allocate();
+    ts.store.release(h_ffff);
+    auto [h_wrapped, seq3] = ts.store.allocate();
 
     if (handle_index(h_wrapped) == idx) {
-      // Generation wrapped to 0
       CHECK(handle_generation(h_wrapped) == 0);
+      CHECK(ts.store.get(near_max_handle) == nullptr);
+      CHECK(ts.store.get(h_ffff) == nullptr);
 
-      // Both old handles should be invalid
-      CHECK(store.get(near_max_handle) == nullptr);
-      CHECK(store.get(h_ffff) == nullptr);
-
-      store.release(h_wrapped);
+      ts.store.release(h_wrapped);
     }
   }
 }
 
 TEST_CASE("branch: store cannot exceed max capacity") {
-  // BranchStore caps at 65536 slots (INDEX_MASK + 1)
-  // We can't practically allocate 65536 slots in a unit test,
-  // but we can verify the growth logic caps correctly
-
-  BranchStore store(2);
-
-  // Verify the cap constant is correct
+  TestStore ts(2);
   CHECK(INDEX_MASK == 0xFFFF);
-
-  // After hitting max, allocate should return INVALID_HANDLE
-  // (This is already tested by grow logic returning INVALID_HANDLE
-  // when old_size >= new_size after hitting cap)
 }
 
 TEST_CASE("branch: handle encoding preserves full range") {
-  // Verify handle encoding works for edge values
-  CHECK(make_handle(0, 0) == INVALID_HANDLE);  // 0 is invalid
+  CHECK(make_handle(0, 0) == INVALID_HANDLE);
 
-  // Max index
   BranchHandle max_idx = make_handle(0xFFFF, 0);
   CHECK(handle_index(max_idx) == 0xFFFF);
   CHECK(handle_generation(max_idx) == 0);
 
-  // Max generation
   BranchHandle max_gen = make_handle(0, 0xFFFF);
   CHECK(handle_index(max_gen) == 0);
   CHECK(handle_generation(max_gen) == 0xFFFF);
 
-  // Both max
   BranchHandle max_both = make_handle(0xFFFF, 0xFFFF);
   CHECK(handle_index(max_both) == 0xFFFF);
   CHECK(handle_generation(max_both) == 0xFFFF);
 }
 
 TEST_CASE("branch: slot 0 reserved generation never valid") {
-  BranchStore store(4);
+  TestStore ts(4);
 
-  // Slot 0 is reserved with generation 0xFFFF
-  // No valid handle should ever reference it
-
-  // Try to access slot 0 with various generations
-  CHECK(store.get(make_handle(0, 0)) == nullptr);
-  CHECK(store.get(make_handle(0, 1)) == nullptr);
-  CHECK(store.get(make_handle(0, 0xFFFF)) == nullptr);
-  CHECK(store.get(make_handle(0, 0xFFFE)) == nullptr);
+  CHECK(ts.store.get(make_handle(0, 0)) == nullptr);
+  CHECK(ts.store.get(make_handle(0, 1)) == nullptr);
+  CHECK(ts.store.get(make_handle(0, 0xFFFF)) == nullptr);
+  CHECK(ts.store.get(make_handle(0, 0xFFFE)) == nullptr);
 }
 
 // ============================================================================
@@ -700,205 +594,129 @@ TEST_CASE("branch: slot 0 reserved generation never valid") {
 // ============================================================================
 
 TEST_CASE("branch: get_legal_priors handles empty legal set") {
-  // When all tokens are masked by grammar, legal_priors is empty
-  // This should return empty vector, not crash on division by zero
-  BranchStore store(4);
+  TestStore ts(4);
   TestSamplingParams params;
 
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
 
-  BranchHandle h = create(fake_ctx, fake_model, 0, 0, params, 512, nullptr, nullptr, &store);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 512);
   REQUIRE(h != INVALID_HANDLE);
 
-  // Without logits, should return empty (not crash)
-  auto priors = get_legal_priors(h, &store);
+  auto priors = get_legal_priors(h, ts.store);
   CHECK(priors.empty());
 
-  destroy(h, &store);
+  prune(h, ts.store);
 }
 
 TEST_CASE("branch: get_legal_logsumexp returns -inf when no legal tokens") {
-  // When no tokens are legal (or no logits captured), returns -INFINITY
-  // as an unambiguous sentinel (0.0f is a valid logsumexp value)
-  BranchStore store(4);
+  TestStore ts(4);
   TestSamplingParams params;
 
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
 
-  BranchHandle h = create(fake_ctx, fake_model, 0, 0, params, 512, nullptr, nullptr, &store);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 512);
   REQUIRE(h != INVALID_HANDLE);
 
-  // Without logits captured, returns -inf (unambiguous sentinel)
-  float logsumexp = get_legal_logsumexp(h, &store);
+  float logsumexp = get_legal_logsumexp(h, ts.store);
   CHECK(std::isinf(logsumexp));
-  CHECK(logsumexp < 0);  // -INFINITY, not +INFINITY
+  CHECK(logsumexp < 0);
   CHECK(!std::isnan(logsumexp));
 
-  destroy(h, &store);
+  prune(h, ts.store);
 }
 
 TEST_CASE("branch: get_token_prior handles invalid token") {
-  BranchStore store(4);
+  TestStore ts(4);
   TestSamplingParams params;
 
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
 
-  BranchHandle h = create(fake_ctx, fake_model, 0, 0, params, 512, nullptr, nullptr, &store);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 512);
   REQUIRE(h != INVALID_HANDLE);
 
-  // Negative token
-  float prior = get_token_prior(h, -1, 0.0f, &store);
+  float prior = get_token_prior(h, -1, 0.0f, ts.store);
   CHECK(prior == 0.0f);
 
-  // Out of range token (n_vocab is 0 with stubs)
-  prior = get_token_prior(h, 1000000, 0.0f, &store);
+  prior = get_token_prior(h, 1000000, 0.0f, ts.store);
   CHECK(prior == 0.0f);
 
-  destroy(h, &store);
+  prune(h, ts.store);
 }
 
 TEST_CASE("branch: get_perplexity returns infinity for fresh branch") {
-  BranchStore store(4);
+  TestStore ts(4);
   TestSamplingParams params;
 
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
 
-  BranchHandle h = create(fake_ctx, fake_model, 0, 0, params, 512, nullptr, nullptr, &store);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 512);
   REQUIRE(h != INVALID_HANDLE);
 
-  // Fresh branch with no tokens should have infinite perplexity
-  float ppl = get_perplexity(h, &store);
+  float ppl = get_perplexity(h, ts.store);
   CHECK(std::isinf(ppl));
   CHECK(!std::isnan(ppl));
 
-  destroy(h, &store);
+  prune(h, ts.store);
 }
 
 // ============================================================================
 // Null Pointer & Input Validation Tests
 // ============================================================================
 
-TEST_CASE("branch: all APIs handle null store gracefully") {
-  // These use the global store when nullptr is passed
-  // Verify they don't crash
-
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
-  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
-  TestSamplingParams params;
-
-  BranchHandle h = create(fake_ctx, fake_model, 0, 0, params, 512, nullptr, nullptr);
-  REQUIRE(h != INVALID_HANDLE);
-
-  // All these should work with nullptr store (uses global)
-  CHECK(get_seq_id(h, nullptr) == 0);
-  CHECK(get_position(h, nullptr) == 0);
-  CHECK(get_n_vocab(h, nullptr) >= 0);
-  CHECK(get_logits(h, nullptr) == nullptr);  // No logits yet
-
-  destroy(h, nullptr);
-}
-
 TEST_CASE("branch: operations on invalid handle don't crash") {
-  BranchStore store(4);
+  TestStore ts(4);
 
-  // All operations should handle invalid handles gracefully
-  CHECK(get_seq_id(INVALID_HANDLE, &store) == -1);
-  CHECK(get_position(INVALID_HANDLE, &store) == -1);
-  CHECK(get_n_vocab(INVALID_HANDLE, &store) == 0);
-  CHECK(get_logits(INVALID_HANDLE, &store) == nullptr);
-  CHECK(std::isinf(get_perplexity(INVALID_HANDLE, &store)));
+  CHECK(get_position(INVALID_HANDLE, ts.store) == -1);
+  CHECK(get_n_vocab(INVALID_HANDLE, ts.store) == 0);
+  CHECK(get_logits(INVALID_HANDLE, ts.store) == nullptr);
+  CHECK(std::isinf(get_perplexity(INVALID_HANDLE, ts.store)));
 
-  // These should be no-ops, not crashes
-  destroy(INVALID_HANDLE, &store);
-  prune(INVALID_HANDLE, &store);
-  accept_token(INVALID_HANDLE, 0, &store);
+  // prune on invalid is a no-op
+  prune(INVALID_HANDLE, ts.store);
+  accept_token(INVALID_HANDLE, 0, ts.store);
 
-  // These should throw on invalid handle
-  CHECK_THROWS(decode_batch(INVALID_HANDLE, nullptr, 0, &store));
-  CHECK_THROWS(decode_and_capture_batch(INVALID_HANDLE, nullptr, 0, &store));
-  CHECK(sample(INVALID_HANDLE, &store) == -1);
-  CHECK(fork(INVALID_HANDLE, 1, &store) == INVALID_HANDLE);
+  CHECK_THROWS(decode_batch(INVALID_HANDLE, nullptr, 0, ts.store));
+  CHECK_THROWS(decode_and_capture_batch(INVALID_HANDLE, nullptr, 0, ts.store));
+  CHECK(sample(INVALID_HANDLE, ts.store) == -1);
+  CHECK(fork(INVALID_HANDLE, ts.store) == INVALID_HANDLE);
 }
 
 TEST_CASE("branch: operations on stale handle don't crash") {
-  BranchStore store(4);
+  TestStore ts(4);
   TestSamplingParams params;
 
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
 
-  BranchHandle h = create(fake_ctx, fake_model, 0, 0, params, 512, nullptr, nullptr, &store);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 512);
   REQUIRE(h != INVALID_HANDLE);
 
-  // Destroy the handle
-  destroy(h, &store);
+  prune(h, ts.store);
 
-  // Now h is stale - all operations should fail gracefully
-  CHECK(store.get(h) == nullptr);
-  CHECK(get_seq_id(h, &store) == -1);
-  CHECK(fork(h, 1, &store) == INVALID_HANDLE);
-  CHECK(sample(h, &store) == -1);
+  CHECK(ts.store.get(h) == nullptr);
+  CHECK(get_position(h, ts.store) == -1);
+  CHECK(fork(h, ts.store) == INVALID_HANDLE);
+  CHECK(sample(h, ts.store) == -1);
 
-  // Double destroy should be safe
-  destroy(h, &store);
+  // Double prune should be safe
+  prune(h, ts.store);
 }
 
 TEST_CASE("branch: decode with zero tokens throws") {
-  BranchStore store(4);
+  TestStore ts(4);
   TestSamplingParams params;
 
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
 
-  BranchHandle h = create(fake_ctx, fake_model, 0, 0, params, 512, nullptr, nullptr, &store);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 512);
   REQUIRE(h != INVALID_HANDLE);
 
-  // Decode with empty array throws (defensive check in decoder)
   llama_token empty[] = {};
-  CHECK_THROWS(decode_batch(h, empty, 0, &store));
-  CHECK_THROWS(decode_and_capture_batch(h, empty, 0, &store));
+  CHECK_THROWS(decode_batch(h, empty, 0, ts.store));
+  CHECK_THROWS(decode_and_capture_batch(h, empty, 0, ts.store));
 
-  // Position should be unchanged
-  CHECK(get_position(h, &store) == 0);
+  CHECK(get_position(h, ts.store) == 0);
 
-  destroy(h, &store);
-}
-
-TEST_CASE("branch: decode with nullptr tokens and n > 0 is handled") {
-  BranchStore store(4);
-  TestSamplingParams params;
-
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
-  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
-
-  BranchHandle h = create(fake_ctx, fake_model, 0, 0, params, 512, nullptr, nullptr, &store);
-  REQUIRE(h != INVALID_HANDLE);
-
-  // Note: This would be UB in production, but our stubs make it safe to test
-  // In production, this should either be prevented by API or checked
-  // For now we just document the behavior
-
-  destroy(h, &store);
-}
-
-// ============================================================================
-// Resource Exhaustion Tests
-// ============================================================================
-
-TEST_CASE("branch: handle exhaustion returns INVALID_HANDLE") {
-  // Create a store that will hit capacity limits
-  // The store caps at INDEX_MASK + 1 = 65536 slots
-  // We can't practically allocate that many, but we can verify
-  // the logic by checking the constants
-
-  CHECK(INDEX_MASK == 0xFFFF);
-
-  // With a small store that can't grow further, allocate should fail
-  // This is already tested by "store cannot exceed max capacity"
+  prune(h, ts.store);
 }
 
 // ============================================================================
@@ -906,69 +724,55 @@ TEST_CASE("branch: handle exhaustion returns INVALID_HANDLE") {
 // ============================================================================
 
 TEST_CASE("branch: RAII Branch prune() invalidates handle") {
-  BranchStore store(4);
+  TestStore ts(4);
   TestSamplingParams params;
 
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
 
-  Branch b = Branch::create(fake_ctx, fake_model, 0, 0, params, 512, nullptr, nullptr, &store);
+  Branch b = Branch::create(ts.ctx, fake_model, ts.store, 0, params, 512);
   REQUIRE(b.valid());
 
   BranchHandle h = b.handle();
-  CHECK(store.get(h) != nullptr);
+  CHECK(ts.store.get(h) != nullptr);
 
-  // Explicit prune
   b.prune();
 
-  // Handle should now be invalid
   CHECK(!b.valid());
-  CHECK(store.get(h) == nullptr);
-
-  // Destructor should be safe (no double-free)
+  CHECK(ts.store.get(h) == nullptr);
 }
 
 TEST_CASE("branch: RAII Branch move leaves source invalid") {
-  BranchStore store(4);
+  TestStore ts(4);
   TestSamplingParams params;
 
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
 
-  Branch b1 = Branch::create(fake_ctx, fake_model, 0, 0, params, 512, nullptr, nullptr, &store);
+  Branch b1 = Branch::create(ts.ctx, fake_model, ts.store, 0, params, 512);
   BranchHandle h = b1.handle();
 
-  // Move to b2
   Branch b2 = std::move(b1);
 
-  // b1 should be invalidated
   CHECK(!b1.valid());
   CHECK(b1.handle() == INVALID_HANDLE);
 
-  // b2 should own the resource
   CHECK(b2.valid());
   CHECK(b2.handle() == h);
-  CHECK(store.get(h) != nullptr);
+  CHECK(ts.store.get(h) != nullptr);
 
-  // Operations on moved-from b1 should be safe
-  CHECK(b1.seq_id() == -1);
   CHECK(b1.position() == -1);
 }
 
 TEST_CASE("branch: RAII Branch self-move-assign is safe") {
-  BranchStore store(4);
+  TestStore ts(4);
   TestSamplingParams params;
 
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
 
-  Branch b = Branch::create(fake_ctx, fake_model, 0, 0, params, 512, nullptr, nullptr, &store);
+  Branch b = Branch::create(ts.ctx, fake_model, ts.store, 0, params, 512);
   BranchHandle h = b.handle();
 
-  // Self-assignment (should be no-op)
   b = std::move(b);
 
-  // Should still be valid
   CHECK(b.valid());
   CHECK(b.handle() == h);
 }
@@ -978,63 +782,59 @@ TEST_CASE("branch: RAII Branch self-move-assign is safe") {
 // ============================================================================
 
 TEST_CASE("branch: decode_each with empty span is no-op") {
-  BranchStore store(4);
+  TestStore ts(4);
 
   std::span<const DecodeEachItem> empty;
-  CHECK_NOTHROW(store.decode_each(empty));
+  CHECK_NOTHROW(ts.store.decode_each(empty));
 }
 
 TEST_CASE("branch: decode_each with invalid handle throws") {
-  BranchStore store(4);
+  TestStore ts(4);
 
   DecodeEachItem items[] = {{INVALID_HANDLE, 42}};
-  CHECK_THROWS(store.decode_each(items));
+  CHECK_THROWS(ts.store.decode_each(items));
 }
 
 TEST_CASE("branch: decode_scatter with empty span is no-op") {
-  BranchStore store(4);
+  TestStore ts(4);
 
   std::span<const DecodeScatterItem> empty;
-  CHECK_NOTHROW(store.decode_scatter(empty));
+  CHECK_NOTHROW(ts.store.decode_scatter(empty));
 }
 
 TEST_CASE("branch: decode_scatter with invalid handle throws") {
-  BranchStore store(4);
+  TestStore ts(4);
 
   llama_token tokens[] = {1, 2, 3};
   DecodeScatterItem items[] = {{INVALID_HANDLE, tokens}};
-  CHECK_THROWS(store.decode_scatter(items));
+  CHECK_THROWS(ts.store.decode_scatter(items));
 }
 
 TEST_CASE("branch: decode_scatter with zero-length tokens span skips item") {
-  BranchStore store(4);
+  TestStore ts(4);
   TestSamplingParams params;
 
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
 
-  BranchHandle h = create(fake_ctx, fake_model, 0, 0, params, 512, nullptr, nullptr, &store);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 512);
   REQUIRE(h != INVALID_HANDLE);
 
-  // Empty span — no tokens to decode
   DecodeScatterItem items[] = {{h, std::span<const llama_token>{}}};
-  CHECK_NOTHROW(store.decode_scatter(items));
+  CHECK_NOTHROW(ts.store.decode_scatter(items));
 
-  // Position should be unchanged
-  CHECK(get_position(h, &store) == 0);
+  CHECK(get_position(h, ts.store) == 0);
 
-  destroy(h, &store);
+  prune(h, ts.store);
 }
 
 TEST_CASE("branch: decode_scatter all items zero-length is no-op") {
-  BranchStore store(8);
+  TestStore ts(8);
   TestSamplingParams params;
 
-  auto* fake_ctx = reinterpret_cast<llama_context*>(0x1000);
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
 
-  BranchHandle h1 = create(fake_ctx, fake_model, 0, 10, params, 512, nullptr, nullptr, &store);
-  BranchHandle h2 = create(fake_ctx, fake_model, 1, 20, params, 512, nullptr, nullptr, &store);
+  BranchHandle h1 = create(ts.ctx, fake_model, ts.store, 10, params, 512);
+  BranchHandle h2 = create(ts.ctx, fake_model, ts.store, 20, params, 512);
   REQUIRE(h1 != INVALID_HANDLE);
   REQUIRE(h2 != INVALID_HANDLE);
 
@@ -1042,12 +842,311 @@ TEST_CASE("branch: decode_scatter all items zero-length is no-op") {
     {h1, std::span<const llama_token>{}},
     {h2, std::span<const llama_token>{}}
   };
-  CHECK_NOTHROW(store.decode_scatter(items));
+  CHECK_NOTHROW(ts.store.decode_scatter(items));
 
-  // Positions unchanged
-  CHECK(get_position(h1, &store) == 10);
-  CHECK(get_position(h2, &store) == 20);
+  CHECK(get_position(h1, ts.store) == 10);
+  CHECK(get_position(h2, ts.store) == 20);
 
-  destroy(h1, &store);
-  destroy(h2, &store);
+  prune(h1, ts.store);
+  prune(h2, ts.store);
+}
+
+// ============================================================================
+// Tenancy Tests
+// ============================================================================
+
+TEST_CASE("tenancy: init fills vacancy correctly") {
+  auto* ctx = reinterpret_cast<llama_context*>(0x1000);
+  lloyal::kv::tenancy::State s = lloyal::kv::tenancy::init(ctx, 4);
+
+  CHECK(lloyal::kv::tenancy::available(s) == 4);
+
+  // Acquire all 4
+  for (int i = 0; i < 4; ++i) {
+    llama_seq_id seq = lloyal::kv::tenancy::acquire(s);
+    CHECK(seq >= 0);
+    CHECK(seq < 4);
+  }
+
+  // All exhausted
+  CHECK(lloyal::kv::tenancy::available(s) == 0);
+  CHECK(lloyal::kv::tenancy::acquire(s) == lloyal::kv::NO_LEASE);
+}
+
+TEST_CASE("tenancy: release returns lease without KV calls") {
+  auto* ctx = reinterpret_cast<llama_context*>(0x1000);
+  lloyal::kv::tenancy::State s = lloyal::kv::tenancy::init(ctx, 3);
+
+  llama_seq_id seq = lloyal::kv::tenancy::acquire(s);
+  CHECK(seq >= 0);
+  CHECK(lloyal::kv::tenancy::available(s) == 2);
+
+  lloyal::kv::tenancy::release(s, seq);
+  CHECK(lloyal::kv::tenancy::available(s) == 3);
+
+  // Re-acquire should succeed
+  llama_seq_id seq2 = lloyal::kv::tenancy::acquire(s);
+  CHECK(seq2 >= 0);
+}
+
+TEST_CASE("tenancy: evict returns lease and strips KV") {
+  auto* ctx = reinterpret_cast<llama_context*>(0x1000);
+  lloyal::kv::tenancy::State s = lloyal::kv::tenancy::init(ctx, 3);
+
+  llama_seq_id seq = lloyal::kv::tenancy::acquire(s);
+  CHECK(lloyal::kv::tenancy::available(s) == 2);
+
+  lloyal::kv::tenancy::evict(s, seq);
+  CHECK(lloyal::kv::tenancy::available(s) == 3);
+}
+
+TEST_CASE("tenancy: retain rebuilds vacancy") {
+  auto* ctx = reinterpret_cast<llama_context*>(0x1000);
+  lloyal::kv::tenancy::State s = lloyal::kv::tenancy::init(ctx, 5);
+
+  // Acquire 3 leases
+  llama_seq_id seq0 = lloyal::kv::tenancy::acquire(s);
+  llama_seq_id seq1 = lloyal::kv::tenancy::acquire(s);
+  llama_seq_id seq2 = lloyal::kv::tenancy::acquire(s);
+  CHECK(lloyal::kv::tenancy::available(s) == 2);
+
+  // Retain only seq1
+  lloyal::kv::tenancy::retain(s, seq1);
+
+  // Now only seq1 is leased, rest are vacant
+  CHECK(lloyal::kv::tenancy::available(s) == 4);  // n_seq_max - 1
+
+  // seq0 and seq2 should be acquirable again
+  llama_seq_id reacquired = lloyal::kv::tenancy::acquire(s);
+  CHECK(reacquired >= 0);
+  CHECK(reacquired != seq1);  // seq1 is still leased
+  (void)seq0;
+  (void)seq2;
+}
+
+TEST_CASE("tenancy: evict_all clears everything") {
+  auto* ctx = reinterpret_cast<llama_context*>(0x1000);
+  lloyal::kv::tenancy::State s = lloyal::kv::tenancy::init(ctx, 4);
+
+  lloyal::kv::tenancy::acquire(s);
+  lloyal::kv::tenancy::acquire(s);
+  lloyal::kv::tenancy::acquire(s);
+  CHECK(lloyal::kv::tenancy::available(s) == 1);
+
+  lloyal::kv::tenancy::evict_all(s);
+  CHECK(lloyal::kv::tenancy::available(s) == 4);
+}
+
+TEST_CASE("tenancy: BranchStore available tracks leases") {
+  TestStore ts(8);
+
+  size_t initial = ts.store.available();
+  CHECK(initial == 8);  // n_seq_max from stub config
+
+  auto [h1, s1] = ts.store.allocate();
+  CHECK(ts.store.available() == initial - 1);
+
+  auto [h2, s2] = ts.store.allocate();
+  CHECK(ts.store.available() == initial - 2);
+
+  ts.store.release(h1);
+  CHECK(ts.store.available() == initial - 1);
+
+  ts.store.release(h2);
+  CHECK(ts.store.available() == initial);
+}
+
+TEST_CASE("tenancy: allocate returns INVALID when leases exhausted") {
+  // Use stub config with small n_seq_max
+  llamaStubConfig().n_seq_max = 2;
+  TestStore ts(8);
+  llamaStubConfig().n_seq_max = 8;  // Reset for other tests
+
+  auto [h1, s1] = ts.store.allocate();
+  CHECK(h1 != INVALID_HANDLE);
+
+  auto [h2, s2] = ts.store.allocate();
+  CHECK(h2 != INVALID_HANDLE);
+
+  // Third should fail — no leases left
+  auto [h3, s3] = ts.store.allocate();
+  CHECK(h3 == INVALID_HANDLE);
+  CHECK(s3 < 0);
+
+  ts.store.release(h1);
+  ts.store.release(h2);
+}
+
+// ============================================================================
+// Topology Tests
+// ============================================================================
+
+TEST_CASE("topology: fork records parent/child edges") {
+  TestStore ts(8);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+
+  BranchHandle root = create(ts.ctx, fake_model, ts.store, 0, params, 512);
+  REQUIRE(root != INVALID_HANDLE);
+
+  BranchHandle child1 = fork(root, ts.store);
+  BranchHandle child2 = fork(root, ts.store);
+  REQUIRE(child1 != INVALID_HANDLE);
+  REQUIRE(child2 != INVALID_HANDLE);
+
+  // Parent queries
+  CHECK(ts.store.parent(root) == INVALID_HANDLE);  // root has no parent
+  CHECK(ts.store.parent(child1) == root);
+  CHECK(ts.store.parent(child2) == root);
+
+  // Children query
+  const auto& children = ts.store.children(root);
+  CHECK(children.size() == 2);
+
+  // Leaf queries
+  CHECK(!ts.store.isLeaf(root));
+  CHECK(ts.store.isLeaf(child1));
+  CHECK(ts.store.isLeaf(child2));
+
+  // Active queries
+  CHECK(ts.store.isActive(root));
+  CHECK(ts.store.isActive(child1));
+
+  pruneSubtree(root, ts.store);
+}
+
+TEST_CASE("topology: prune RESTRICT throws if children exist") {
+  TestStore ts(8);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+
+  BranchHandle parent = create(ts.ctx, fake_model, ts.store, 0, params, 512);
+  BranchHandle child = fork(parent, ts.store);
+  REQUIRE(child != INVALID_HANDLE);
+
+  // prune(parent) should throw — it has a child
+  CHECK_THROWS(prune(parent, ts.store));
+
+  // Parent should still be alive
+  CHECK(ts.store.get(parent) != nullptr);
+
+  // Prune child first, then parent succeeds
+  prune(child, ts.store);
+  CHECK_NOTHROW(prune(parent, ts.store));
+}
+
+TEST_CASE("topology: pruneSubtree CASCADE depth-3") {
+  TestStore ts(16);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+
+  BranchHandle root = create(ts.ctx, fake_model, ts.store, 0, params, 512);
+  BranchHandle a = fork(root, ts.store);
+  BranchHandle b = fork(a, ts.store);
+  BranchHandle c = fork(b, ts.store);
+
+  size_t before = ts.store.available();
+
+  pruneSubtree(root, ts.store);
+
+  // All 4 should be freed
+  CHECK(ts.store.get(root) == nullptr);
+  CHECK(ts.store.get(a) == nullptr);
+  CHECK(ts.store.get(b) == nullptr);
+  CHECK(ts.store.get(c) == nullptr);
+
+  // All 4 leases returned
+  CHECK(ts.store.available() == before + 4);
+}
+
+TEST_CASE("topology: prune removes child from parent's children vector") {
+  TestStore ts(8);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+
+  BranchHandle parent = create(ts.ctx, fake_model, ts.store, 0, params, 512);
+  BranchHandle child1 = fork(parent, ts.store);
+  BranchHandle child2 = fork(parent, ts.store);
+
+  CHECK(ts.store.children(parent).size() == 2);
+
+  prune(child1, ts.store);
+  CHECK(ts.store.children(parent).size() == 1);
+  CHECK(ts.store.children(parent)[0] == child2);
+
+  prune(child2, ts.store);
+  CHECK(ts.store.children(parent).empty());
+  CHECK(ts.store.isLeaf(parent));
+
+  prune(parent, ts.store);
+}
+
+// ============================================================================
+// retainOnly Tests
+// ============================================================================
+
+TEST_CASE("retainOnly: keeps winner, frees all others") {
+  TestStore ts(8);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+
+  BranchHandle root = create(ts.ctx, fake_model, ts.store, 0, params, 512);
+  BranchHandle a = fork(root, ts.store);
+  BranchHandle b = fork(root, ts.store);
+  BranchHandle c = fork(root, ts.store);
+
+  ts.store.retainOnly(a);
+
+  // Winner survives
+  CHECK(ts.store.get(a) != nullptr);
+
+  // Losers are freed
+  CHECK(ts.store.get(root) == nullptr);
+  CHECK(ts.store.get(b) == nullptr);
+  CHECK(ts.store.get(c) == nullptr);
+
+  // Winner topology is reset
+  BranchState* winner = ts.store.get(a);
+  CHECK(winner->parent == INVALID_HANDLE);
+  CHECK(winner->children.empty());
+
+  // available = n_seq_max - 1
+  CHECK(ts.store.available() == 7);
+
+  prune(a, ts.store);
+}
+
+TEST_CASE("retainOnly: invalid winner throws") {
+  TestStore ts(4);
+
+  CHECK_THROWS(ts.store.retainOnly(INVALID_HANDLE));
+}
+
+// ============================================================================
+// Drain Tests
+// ============================================================================
+
+TEST_CASE("drain: frees all resources") {
+  TestStore ts(8);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+
+  BranchHandle h1 = create(ts.ctx, fake_model, ts.store, 0, params, 512);
+  BranchHandle h2 = create(ts.ctx, fake_model, ts.store, 0, params, 512);
+
+  ts.store.drain();
+
+  CHECK(ts.store.get(h1) == nullptr);
+  CHECK(ts.store.get(h2) == nullptr);
+
+  // After drain, allocate should fail (tenancy ctx is null)
+  auto [h3, s3] = ts.store.allocate();
+  CHECK(h3 == INVALID_HANDLE);
+}
+
+TEST_CASE("drain: idempotent") {
+  TestStore ts(4);
+
+  ts.store.drain();
+  ts.store.drain();  // Should not crash
 }

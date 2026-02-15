@@ -448,7 +448,7 @@ inline llama_token sample_with_params(llama_context *ctx,
 // ===== PERSISTENT SAMPLER CHAIN PRIMITIVES =====
 //
 // These functions manage persistent sampler chains for use cases like
-// branch-based MCTS where the same chain is reused across multiple samples.
+// branch-based tree search where the same chain is reused across multiple samples.
 // Unlike sample_with_params() which creates/destroys a chain per call,
 // these allow chain reuse for better performance.
 
@@ -518,7 +518,7 @@ inline llama_sampler* create_chain(const P& params) {
  * Clone a sampler chain
  *
  * Creates an independent copy of the chain with the same state.
- * Used when forking branches in MCTS.
+ * Used when forking branches in tree search.
  *
  * @param chain Source chain to clone
  * @return Owned clone - caller must free with free_chain()
@@ -533,7 +533,7 @@ inline llama_sampler* clone_chain(llama_sampler* chain) {
 /**
  * Reseed the dist sampler in a chain
  *
- * Used in MCTS to ensure forked branches generate unique sequences.
+ * Used in tree search to ensure forked branches generate unique sequences.
  * Removes the existing dist sampler (last in chain) and adds a new one.
  *
  * @param chain Chain to reseed

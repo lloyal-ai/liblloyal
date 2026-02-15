@@ -22,9 +22,9 @@
  *
  * KV cache constraint:
  * - Each live branch occupies one llama_seq_id in the KV cache
- * - Max simultaneous branches = llama_context_params.n_seq_max (<= LLAMA_MAX_SEQ = 256)
- * - Slot table (65535) > n_seq_max — the store manages slots, not seq_ids
- * - Caller must allocate and recycle seq_ids to stay within n_seq_max
+ * - Max simultaneous branches = llama_n_seq_max(ctx) (<= 256)
+ * - Slot table (65535) > n_seq_max — slots are abundant, leases are scarce
+ * - kv::tenancy manages seq_id lifecycle (allocate/evict/retain/drain)
  *
  * Fork semantics:
  * - fork() clones: KV, grammar, sampler chain, metrics, logits, logit_bias
@@ -34,21 +34,22 @@
  * These primitives compose into inference patterns including:
  * - Best-of-N sampling (fork N candidates, select by perplexity)
  * - Speculative decoding (draft/verify with branch fork/prune)
- * - MCTS/LATS tree search (expand/backup/select with grammar priors)
+ * - Tree search (expand/backup/select with grammar priors)
  * - Beam search (top-k branches at each step)
  *
  * @example Basic usage (best-of-N)
  * @code
- *   auto root = branch::create(ctx, model, 0, prompt_len, params);
- *   branch::capture_logits(root);
+ *   store.init_tenancy(ctx);
+ *   auto root = branch::create(ctx, model, store, prompt_len, params);
+ *   branch::capture_logits(root, store);
  *
- *   auto child = branch::fork(root, new_seq_id);
- *   auto token = branch::sample(child);
- *   branch::accept_token(child, token);
- *   branch::decode_and_capture_one(child, token);
+ *   auto child = branch::fork(root, store);
+ *   auto token = branch::sample(child, store);
+ *   branch::accept_token(child, token, store);
+ *   branch::decode_and_capture_one(child, token, store);
  *
- *   branch::prune(child);   // Remove KV + free resources
- *   branch::destroy(root);  // Free resources only
+ *   branch::prune(child, store);          // RESTRICT leaf prune
+ *   store.retainOnly(root);               // Keep winner, nuke rest
  * @endcode
  */
 
@@ -62,6 +63,7 @@
 #include "sampler.hpp"
 
 #include <llama/llama.h>
+#include <algorithm>  // std::remove
 #include <cassert>    // assert
 #include <cmath>      // std::exp, std::log, std::isinf, std::isfinite
 #include <cstdint>
@@ -92,6 +94,7 @@ namespace lloyal::branch {
 using BranchHandle = uint32_t;
 
 constexpr BranchHandle INVALID_HANDLE = 0;  ///< Null handle sentinel
+constexpr llama_seq_id NO_LEASE = kv::NO_LEASE;  ///< Branch has no KV residency
 constexpr int DEFAULT_N_BATCH = 512;        ///< Default batch size for decode operations
 constexpr uint32_t GEN_SHIFT = 16;          ///< Bit shift for generation field
 constexpr uint32_t INDEX_MASK = 0xFFFF;     ///< Mask for slot index field
@@ -150,7 +153,7 @@ struct BranchState {
   llama_context* ctx = nullptr;       ///< Llama context (not owned, must outlive branch)
   const llama_model* model = nullptr; ///< Llama model (not owned, must outlive branch)
 
-  llama_seq_id seq_id = 0;   ///< KV cache sequence identifier
+  llama_seq_id seq_id = NO_LEASE;  ///< KV cache sequence identifier (NO_LEASE when inactive)
   llama_pos position = 0;    ///< Current decode position in the sequence
 
   llama_sampler* sampler_chain = nullptr;  ///< Sampling chain: penalties + PRNG + filters (owned)
@@ -178,7 +181,7 @@ struct BranchState {
   /// - candidates_buffer: n_vocab * sizeof(llama_token_data) (~1.5–2MB)
   /// - last_candidates: typically ~40 entries with top_k=40 (~480 bytes)
   ///
-  /// @todo Move to per-thread or SessionContext scratch arena for deep MCTS trees.
+  /// @todo Move to per-thread or SessionContext scratch arena for deep search trees.
   std::vector<llama_token_data> candidates_buffer;
 
   int n_batch = DEFAULT_N_BATCH;  ///< Batch size for decode operations
@@ -186,6 +189,10 @@ struct BranchState {
 
   uint16_t generation = 0;  ///< Slot generation counter (for ABA prevention)
   bool in_use = false;      ///< True when slot is allocated to an active branch
+
+  // Topology — maintained by fork/prune/pruneSubtree
+  BranchHandle parent = INVALID_HANDLE;     ///< Parent branch (INVALID_HANDLE if root)
+  std::vector<BranchHandle> children;       ///< Child branches forked from this one
 };
 
 // ===== BATCHED DECODE ITEM TYPES =====
@@ -245,14 +252,11 @@ struct DecodeScatterItem {
  * | branch::decode_and_capture_one() | 1 | No       | Single branch |
  *
  * @warning **n_seq_max constraint:** Each live branch consumes one KV cache
- *          sequence ID (llama_seq_id). The llama_context must be created with
- *          `llama_context_params.n_seq_max` >= max simultaneous branches.
- *          The hard ceiling is `LLAMA_MAX_SEQ` (256). BranchStore only manages
- *          slots — it has no awareness of seq_ids or n_seq_max. The caller is
- *          responsible for allocating and recycling seq_ids (e.g. via a
- *          freelist) to stay within the context's limit. No runtime validation
- *          is performed; exceeding n_seq_max causes undefined behavior in
- *          the KV cache.
+ *          sequence ID (llama_seq_id) managed by kv::tenancy. Call
+ *          init_tenancy(ctx) after context creation to set the ceiling.
+ *          The hard limit is `llama_n_seq_max(ctx)` (typically 256).
+ *          allocate() acquires both a slot and a lease atomically;
+ *          release()/drain() return both resources symmetrically.
  *
  * @warning Thread safety: External synchronization required (caller's mutex).
  *          Typically SessionContext holds _decodeMutex for decode operations.
@@ -284,8 +288,12 @@ public:
     }
   }
 
-  /// @brief Destructor — frees all active branch resources
+  /// @brief Destructor — frees CPU resources. drain() must be called first
+  /// while the llama_context is still alive.
   ~BranchStore() {
+    if (tenancy_.ctx != nullptr) {
+      LLOYAL_LOG_DEBUG("[BranchStore] WARNING: not drained before destruction");
+    }
     for (size_t i = 1; i < slots_.size(); ++i) {
       if (slots_[i].in_use) {
         free_branch_resources(slots_[i]);
@@ -293,90 +301,166 @@ public:
     }
   }
 
+  /// Result of allocate(): a slot handle + its leased seq_id.
+  struct Allocation { BranchHandle handle; llama_seq_id seq_id; };
+
   /**
-   * @brief Allocate a new branch slot from the freelist
+   * @brief Allocate a branch slot + KV lease atomically
    *
-   * Auto-grows the store by doubling if the freelist is empty.
+   * Acquires a seq_id from tenancy, then a slot from the freelist.
+   * If either fails, both are rolled back cleanly.
    *
-   * @return Valid BranchHandle, or INVALID_HANDLE if store is at max capacity (65535)
+   * @return {handle, seq_id}, or {INVALID_HANDLE, -1} if exhausted
    */
-  BranchHandle allocate() {
-    if (freelist_.empty()) {
-      // Grow the store
-      size_t old_size = slots_.size();
-      size_t new_size = old_size * 2;
-      if (new_size > INDEX_MASK) {
-        new_size = INDEX_MASK + 1;  // Max 65536 slots
-      }
-      if (old_size >= new_size) {
-        LLOYAL_LOG_DEBUG("[branch::allocate] Store full, cannot allocate");
-        return INVALID_HANDLE;
-      }
-
-      slots_.resize(new_size);
-      // NOTE: Use i-- > old_size pattern to avoid size_t underflow
-      for (size_t i = new_size; i-- > old_size; ) {
-        freelist_.push_back(static_cast<uint16_t>(i));
-      }
+  Allocation allocate() {
+    if (tenancy_.ctx == nullptr) return {INVALID_HANDLE, NO_LEASE};  // drained
+    llama_seq_id seq = kv::tenancy::acquire(tenancy_);
+    if (seq < 0) return {INVALID_HANDLE, NO_LEASE};
+    BranchHandle handle = allocate_slot();
+    if (handle == INVALID_HANDLE) {
+      // Seq was never used — bookkeeping-only return, no KV calls
+      kv::tenancy::release(tenancy_, seq);
+      return {INVALID_HANDLE, NO_LEASE};
     }
-
-    uint16_t index = freelist_.back();
-    freelist_.pop_back();
-
-    BranchState& slot = slots_[index];
-    slot.in_use = true;
-    // Generation already incremented on free, or 0 for fresh slot
-
-    return make_handle(index, slot.generation);
+    // Stamp seq_id on slot so release() can evict properly
+    BranchState* st = get(handle);
+    st->seq_id = seq;
+    return {handle, seq};
   }
 
   /**
-   * @brief Release a branch slot back to the freelist
+   * @brief Release a branch slot + evict its KV lease
    *
-   * Frees owned resources (sampler, grammar, metrics) and increments the
-   * generation counter to invalidate any stale handles to this slot.
+   * Removes parent→child edge, evicts the seq_id (stripping KV tags),
+   * frees CPU resources, and returns the slot to the freelist.
    *
    * @param handle Branch handle to release (INVALID_HANDLE is a safe no-op)
    */
   void release(BranchHandle handle) {
     if (handle == INVALID_HANDLE) return;
-
-    uint16_t index = handle_index(handle);
-    uint16_t gen = handle_generation(handle);
-
-    if (index >= slots_.size()) return;
-
-    BranchState& slot = slots_[index];
-    if (!slot.in_use || slot.generation != gen) {
-      LLOYAL_LOG_DEBUG("[branch::release] Invalid handle: stale or double-free");
-      return;
+    BranchState* st = get(handle);
+    if (!st) return;
+    // Eager edge cleanup: remove from parent's children
+    if (st->parent != INVALID_HANDLE) {
+      BranchState* p = get(st->parent);
+      if (p) {
+        auto& c = p->children;
+        c.erase(std::remove(c.begin(), c.end(), handle), c.end());
+      }
     }
+    // Evict lease (KV strip + bookkeeping)
+    if (st->seq_id != NO_LEASE)
+      kv::tenancy::evict(tenancy_, st->seq_id);
+    free_branch_resources(*st);
+    reset_slot(*st);
+    freelist_.push_back(handle_index(handle));
+  }
 
-    // Free owned resources
-    free_branch_resources(slot);
+  // ===== TENANCY LIFECYCLE =====
 
-    // Mark slot as free and increment generation (wrap is intentional)
-    slot.in_use = false;
-    slot.generation = static_cast<uint16_t>(slot.generation + 1);  // Prevent ABA
-    slot.ctx = nullptr;
-    slot.model = nullptr;
-    slot.seq_id = 0;
-    slot.position = 0;
-    slot.sampler_chain = nullptr;
-    slot.grammar = nullptr;
-    slot.metrics = 0;
-    slot.has_dist_sampler = false;
-    slot.last_token = -1;
-    slot.last_candidates.clear();
-    slot.logits_snapshot.clear();
-    slot.has_logits = false;
-    slot.logit_bias.clear();
-    slot.steer_fn = nullptr;
-    slot.candidates_buffer.clear();  // Clear contents, capacity preserved for reuse
-    slot.n_batch = DEFAULT_N_BATCH;
-    slot.n_vocab = 0;
+  /**
+   * @brief Initialize KV tenancy after context creation
+   * @param ctx Llama context (must outlive BranchStore or call drain() first)
+   */
+  void init_tenancy(llama_context* ctx) {
+    tenancy_ = kv::tenancy::init(ctx, llama_n_seq_max(ctx));
+  }
 
-    freelist_.push_back(index);
+  /**
+   * @brief Explicit teardown — evict all leases while context is alive
+   *
+   * Must be called before llama_free(ctx). Idempotent.
+   * Terminal — BranchStore is not reusable after drain(). freelist_ is not
+   * repopulated; call init_tenancy() on a fresh store if you need a new cycle.
+   * After drain(), allocate() returns {INVALID_HANDLE, NO_LEASE}.
+   */
+  void drain() {
+    if (tenancy_.ctx == nullptr) return;  // idempotent
+    kv::tenancy::evict_all(tenancy_);
+    for (size_t i = 1; i < slots_.size(); ++i) {
+      if (slots_[i].in_use) {
+        free_branch_resources(slots_[i]);
+        reset_slot(slots_[i]);
+      }
+    }
+    tenancy_.ctx = nullptr;  // marks as drained
+  }
+
+  /**
+   * @brief Keep only the winner — nuclear KV + CPU cleanup
+   *
+   * Calls seq_keep(winner_seq) for a single KV pass, then releases
+   * all other slots (CPU only — KV already stripped by seq_keep).
+   *
+   * @param winner Handle to the branch to retain (must be valid + leased)
+   * @throws std::runtime_error if winner is invalid or has no lease
+   */
+  void retainOnly(BranchHandle winner) {
+    BranchState* w = get(winner);
+    if (!w) throw std::runtime_error("retainOnly: invalid winner handle");
+    if (w->seq_id == NO_LEASE) throw std::runtime_error("retainOnly: winner has no lease");
+    kv::tenancy::retain(tenancy_, w->seq_id);  // nuclear KV pass
+    // Collect losers first — don't mutate while iterating
+    std::vector<BranchHandle> losers;
+    for (size_t i = 1; i < slots_.size(); ++i) {
+      if (!slots_[i].in_use) continue;
+      BranchHandle h = make_handle(static_cast<uint16_t>(i), slots_[i].generation);
+      if (h == winner) continue;
+      losers.push_back(h);
+    }
+    for (auto h : losers)
+      release_slot_only(h);  // CPU only, KV already stripped
+    w->parent = INVALID_HANDLE;
+    w->children.clear();
+  }
+
+  // ===== TOPOLOGY QUERIES =====
+
+  /**
+   * @brief Number of vacant seq_ids available for acquisition
+   * @return Count of seq_ids in the tenancy vacant pool
+   */
+  size_t available() const { return kv::tenancy::available(tenancy_); }
+
+  /**
+   * @brief Get a branch's parent handle
+   * @param h Branch handle
+   * @return Parent handle, or INVALID_HANDLE if root or handle is invalid
+   */
+  BranchHandle parent(BranchHandle h) const {
+    const BranchState* st = get(h);
+    return st ? st->parent : INVALID_HANDLE;
+  }
+
+  /**
+   * @brief Get a branch's child handles
+   * @param h Branch handle
+   * @return Reference to child handle vector (empty if leaf or invalid)
+   */
+  const std::vector<BranchHandle>& children(BranchHandle h) const {
+    static const std::vector<BranchHandle> empty;
+    const BranchState* st = get(h);
+    return st ? st->children : empty;
+  }
+
+  /**
+   * @brief Test whether a branch is a leaf (no children)
+   * @param h Branch handle
+   * @return true if branch has no children or handle is invalid
+   */
+  bool isLeaf(BranchHandle h) const {
+    const BranchState* st = get(h);
+    return st ? st->children.empty() : true;
+  }
+
+  /**
+   * @brief Test whether a branch holds a KV lease
+   * @param h Branch handle
+   * @return true if seq_id != NO_LEASE, false if inactive or handle is invalid
+   */
+  bool isActive(BranchHandle h) const {
+    const BranchState* st = get(h);
+    return st ? (st->seq_id != NO_LEASE) : false;
   }
 
   /**
@@ -642,125 +726,160 @@ private:
     }
   }
 
+  /// Reset slot to default state. Increments generation for ABA prevention.
+  void reset_slot(BranchState& slot) {
+    slot.in_use = false;
+    slot.generation = static_cast<uint16_t>(slot.generation + 1);  // Prevent ABA
+    slot.ctx = nullptr;
+    slot.model = nullptr;
+    slot.seq_id = NO_LEASE;
+    slot.position = 0;
+    slot.sampler_chain = nullptr;
+    slot.grammar = nullptr;
+    slot.metrics = 0;
+    slot.has_dist_sampler = false;
+    slot.last_token = -1;
+    slot.last_candidates.clear();
+    slot.logits_snapshot.clear();
+    slot.has_logits = false;
+    slot.logit_bias.clear();
+    slot.steer_fn = nullptr;
+    slot.candidates_buffer.clear();
+    slot.n_batch = DEFAULT_N_BATCH;
+    slot.n_vocab = 0;
+    slot.parent = INVALID_HANDLE;
+    slot.children.clear();
+  }
+
+  /// Allocate a slot from the freelist (no tenancy). Auto-grows by doubling.
+  BranchHandle allocate_slot() {
+    if (freelist_.empty()) {
+      size_t old_size = slots_.size();
+      size_t new_size = old_size * 2;
+      if (new_size > INDEX_MASK) {
+        new_size = INDEX_MASK + 1;
+      }
+      if (old_size >= new_size) {
+        LLOYAL_LOG_DEBUG("[branch::allocate_slot] Store full, cannot allocate");
+        return INVALID_HANDLE;
+      }
+      slots_.resize(new_size);
+      for (size_t i = new_size; i-- > old_size; ) {
+        freelist_.push_back(static_cast<uint16_t>(i));
+      }
+    }
+    uint16_t index = freelist_.back();
+    freelist_.pop_back();
+    BranchState& slot = slots_[index];
+    slot.in_use = true;
+    return make_handle(index, slot.generation);
+  }
+
+  /// Release slot (CPU resources only, no KV calls). Used by retainOnly()
+  /// after seq_keep has already stripped all KV tags.
+  void release_slot_only(BranchHandle handle) {
+    if (handle == INVALID_HANDLE) return;
+    BranchState* st = get(handle);
+    if (!st) return;
+    // Eager edge cleanup
+    if (st->parent != INVALID_HANDLE) {
+      BranchState* p = get(st->parent);
+      if (p) {
+        auto& c = p->children;
+        c.erase(std::remove(c.begin(), c.end(), handle), c.end());
+      }
+    }
+    free_branch_resources(*st);
+    reset_slot(*st);
+    freelist_.push_back(handle_index(handle));
+  }
+
   /// Slot array. Uses std::deque (not std::vector) for pointer stability —
   /// get() returns BranchState* that remain valid across allocate()/grow().
   std::deque<BranchState> slots_;
-  std::vector<uint16_t> freelist_;  ///< Available slot indices (LIFO)
+  std::vector<uint16_t> freelist_;  ///< Available slot indices (LIFO — locality heuristic)
+
+  /// KV lease manager. Initialized by init_tenancy(), drained by drain().
+  /// seq_id ownership invariant: only the BranchState that received a seq_id
+  /// from allocate() may hold it, and only while its handle+generation is live.
+  kv::tenancy::State tenancy_;
 
   /// Reusable scratch buffers for batched decode. Safe without locking because
   /// BranchStore requires external synchronization (caller's mutex).
   decode::Scratch scratch_;
 };
 
-// ===== GLOBAL STORE =====
-
-/// @cond INTERNAL
-namespace detail {
-inline BranchStore& global_store() {
-  static BranchStore instance;
-  return instance;
-}
-}  // namespace detail
-/// @endcond
-
-/**
- * @brief Shut down the global branch store (no-op)
- *
- * The global store uses a function-local static (Meyer's Singleton) with
- * thread-safe initialization. It cannot be deleted at runtime.
- *
- * To free llama resources before llama_backend_free(), call branch::prune()
- * on each branch individually. BranchStore itself only owns std::vector
- * memory — its implicit destructor does not call any llama functions.
- *
- * @note Retained for API compatibility. Safe to call, but does nothing.
- */
-inline void shutdown_global_store() {
-  // No-op: global store has static lifetime.
-}
 
 // ===== BRANCH API =====
 
 /**
  * @brief Create a new branch with sampler chain, optional grammar, and metrics
  *
- * Allocates a slot from the store, initializes the sampler chain from @p params,
- * optionally attaches a GBNF grammar and boundary tracker, and pre-allocates
- * logits/candidates buffers sized to the model's vocabulary.
+ * Allocates a slot + KV lease from the store, initializes the sampler chain
+ * from @p params, optionally attaches a GBNF grammar and boundary tracker,
+ * and pre-allocates logits/candidates buffers sized to the model's vocabulary.
  *
  * @tparam P Any type satisfying the SamplingParamsLike concept
  * @param ctx Llama context (not owned, must outlive branch)
  * @param model Llama model (not owned, used for vocab size and sampler init)
- * @param seq_id KV cache sequence ID for this branch. Must be < n_seq_max
- *               configured on the context. Caller manages seq_id allocation.
+ * @param s Branch store to allocate from
  * @param start_pos Starting decode position (typically prompt length after prefill)
  * @param params Sampling parameters (temperature, top_k, top_p, penalties, etc.)
  * @param n_batch Batch size for decode operations (default 512)
  * @param grammar_str GBNF grammar string, or nullptr for unconstrained generation
  * @param boundary_tracker Boundary detector (ownership transferred), or nullptr
- * @param store Branch store to allocate from (nullptr = global store)
  * @return Valid BranchHandle, or INVALID_HANDLE on failure
  *
- * @see destroy() to free without KV cleanup, prune() to free with KV cleanup
+ * @see prune() to free with KV cleanup, pruneSubtree() for CASCADE
  */
 template <SamplingParamsLike P>
 inline BranchHandle create(
     llama_context* ctx,
     const llama_model* model,
-    llama_seq_id seq_id,
+    BranchStore& s,
     llama_pos start_pos,
     const P& params,
     int n_batch = DEFAULT_N_BATCH,
     const char* grammar_str = nullptr,
-    boundaries::BoundaryTracker* boundary_tracker = nullptr,
-    BranchStore* store = nullptr) {
+    boundaries::BoundaryTracker* boundary_tracker = nullptr) {
   if (!ctx || !model) {
     LLOYAL_LOG_DEBUG("[branch::create] NULL ctx or model");
     return INVALID_HANDLE;
   }
 
-  BranchStore& s = store ? *store : detail::global_store();
-  BranchHandle handle = s.allocate();
+  auto [handle, seq_id] = s.allocate();
   if (handle == INVALID_HANDLE) {
     return INVALID_HANDLE;
   }
 
   BranchState* state = s.get(handle);
   if (!state) {
-    s.release(handle);  // Fix: release slot on failure
+    s.release(handle);
     return INVALID_HANDLE;
   }
 
   state->ctx = ctx;
   state->model = model;
-  state->seq_id = seq_id;
+  // seq_id already stamped by allocate()
   state->position = start_pos;
   state->n_batch = n_batch;
 
   const llama_vocab* vocab = llama_model_get_vocab(model);
   state->n_vocab = llama_vocab_n_tokens(vocab);
   state->logits_snapshot.resize(state->n_vocab);
-  state->has_logits = false;  // Must call capture_logits/decode_and_capture first
-  state->candidates_buffer.resize(state->n_vocab);  // Pre-allocate for sampling
+  state->has_logits = false;
+  state->candidates_buffer.resize(state->n_vocab);
 
-  // Create sampler chain via anti-corruption layer
-  // Handles temp <= 0 as greedy mode automatically
   state->sampler_chain = sampler::create_chain(params);
 
-  // Track chain type for safe reseeding (general branch property, not MCTS-specific)
-  // Greedy chains (temp <= 0) don't have dist sampler, reseeding would corrupt them
   float temperature = ::lloyal::detail::as_value(params.temperature, 0.8f);
   state->has_dist_sampler = (temperature > 0.0f);
 
-  // Create grammar sampler if grammar string provided
   if (grammar_str && grammar_str[0] != '\0') {
     state->grammar = grammar::init_sampler(model, grammar_str);
   }
 
-  // Take ownership of boundary tracker if provided
   state->boundary_tracker = boundary_tracker;
-
-  // Create unified metrics tracker (model + sampling)
   state->metrics = metrics::create_branch_metrics();
 
   LLOYAL_LOG_DEBUG("[branch::create] Created branch handle=%u seq=%d pos=%d",
@@ -769,27 +888,12 @@ inline BranchHandle create(
   return handle;
 }
 
-/**
- * @brief Destroy a branch, freeing resources but preserving KV cache
- *
- * Releases the sampler chain, grammar, metrics, and slot back to the store.
- * The KV cache entries for this branch's seq_id are NOT removed.
- * Use prune() instead if you also want to clear the KV cache.
- *
- * @param handle Branch to destroy (INVALID_HANDLE is a safe no-op)
- * @param store Branch store (nullptr = global store)
- *
- * @see prune() to remove KV cache entries and free resources
- */
-inline void destroy(BranchHandle handle, BranchStore* store = nullptr) {
-  BranchStore& s = store ? *store : detail::global_store();
-  s.release(handle);
-}
 
 /**
  * @brief Fork a branch into a new independent sequence
  *
- * Creates a deep copy of the source branch under a new KV cache sequence ID.
+ * Allocates a slot + KV lease, deep copies source state under the new seq_id.
+ * Records parent→child topology edge.
  *
  * Cloned state:
  * - KV cache (via kv::seq_cp)
@@ -803,33 +907,24 @@ inline void destroy(BranchHandle handle, BranchStore* store = nullptr) {
  * - steer_fn (may capture references — call set_steer() on the child if needed)
  *
  * @param source Handle of the branch to fork from
- * @param new_seq_id KV cache sequence ID for the child branch. Must be
- *                   < n_seq_max configured on the context.
- * @param store Branch store (nullptr = global store)
+ * @param s Branch store
  * @return Handle to the new child branch, or INVALID_HANDLE on failure
- *
- * @note Clears @p new_seq_id before copying to handle seq_id reuse safely.
  */
-inline BranchHandle fork(
-    BranchHandle source,
-    llama_seq_id new_seq_id,
-    BranchStore* store = nullptr) {
-  BranchStore& s = store ? *store : detail::global_store();
-
+inline BranchHandle fork(BranchHandle source, BranchStore& s) {
   BranchState* src = s.get(source);
   if (!src) {
     LLOYAL_LOG_DEBUG("[branch::fork] Invalid source handle");
     return INVALID_HANDLE;
   }
 
-  BranchHandle new_handle = s.allocate();
+  auto [new_handle, new_seq_id] = s.allocate();
   if (new_handle == INVALID_HANDLE) {
     return INVALID_HANDLE;
   }
 
   BranchState* dst = s.get(new_handle);
   if (!dst) {
-    s.release(new_handle);  // Fix: release slot on failure
+    s.release(new_handle);
     return INVALID_HANDLE;
   }
 
@@ -841,50 +936,46 @@ inline BranchHandle fork(
   dst->n_batch = src->n_batch;
   dst->n_vocab = src->n_vocab;
 
-  // Clear destination sequence first to handle seq_id reuse in MCTS
-  // Without this, stale KV residue from previous use could corrupt branch state
-  // (prune() clears on release, but this is defensive for seq_id recycling)
-  kv::remove_range(src->ctx, new_seq_id, 0, -1);
+#ifndef NDEBUG
+  assert(kv::pos_max(src->ctx, new_seq_id) < 0 && "tenancy: acquired seq must be clean");
+  assert(dst->parent == INVALID_HANDLE && dst->children.empty() && "fresh slot must have no topology");
+#endif
 
-  // Fork KV cache (use default p1=-1 to copy all positions)
+  // Fork KV cache
   kv::seq_cp(src->ctx, src->seq_id, new_seq_id);
 
-  // Clone sampler chain via anti-corruption layer
+  // Record topology
+  dst->parent = source;
+  src->children.push_back(new_handle);
+
+  // Clone sampler chain
   if (src->sampler_chain) {
     dst->sampler_chain = sampler::clone_chain(src->sampler_chain);
-    dst->has_dist_sampler = src->has_dist_sampler;  // Preserve chain type
+    dst->has_dist_sampler = src->has_dist_sampler;
   }
 
-  // Clone grammar
   if (src->grammar) {
     dst->grammar = grammar::clone_sampler(src->grammar);
   }
 
-  // Clone boundary tracker
   if (src->boundary_tracker) {
     dst->boundary_tracker = src->boundary_tracker->clone().release();
   }
 
-  // Clone unified metrics (model + sampling)
   if (src->metrics != 0) {
     dst->metrics = metrics::clone_branch_metrics(src->metrics);
   }
 
-  // Copy last token and candidates (shallow copy)
   dst->last_token = src->last_token;
   dst->last_candidates = src->last_candidates;
 
-  // Copy logits snapshot and validity flag
+  // logits_snapshot copy is intentional: fork's contract is "sample different
+  // tokens from the same logit distribution." Without the copy, the child can't
+  // sample without a redundant decode. Cost: n_vocab * 4 bytes (~512KB at 128k vocab).
   dst->logits_snapshot = src->logits_snapshot;
   dst->has_logits = src->has_logits;
-
-  // Clone logit bias (safe - just vector of structs)
   dst->logit_bias = src->logit_bias;
 
-  // DO NOT clone steer_fn (callbacks may capture references)
-  // dst->steer_fn remains default-constructed (empty)
-
-  // Pre-allocate candidates buffer (don't copy contents, just capacity)
   dst->candidates_buffer.resize(dst->n_vocab);
 
   LLOYAL_LOG_DEBUG("[branch::fork] Forked handle=%u -> handle=%u seq=%d->%d",
@@ -904,7 +995,7 @@ inline BranchHandle fork(
  * @param handle Branch to modify
  * @param biases Array of llama_logit_bias structs {token, bias}
  * @param n_biases Number of biases in the array
- * @param store Branch store (nullptr = global store)
+ * @param s Branch store
  * @throws std::runtime_error if handle is invalid
  *
  * @example
@@ -917,8 +1008,8 @@ inline void set_logit_bias(
     BranchHandle handle,
     const llama_logit_bias* biases,
     size_t n_biases,
-    BranchStore* store = nullptr) {
-  BranchStore& s = store ? *store : detail::global_store();
+    BranchStore& s) {
+
 
   BranchState* state = s.get(handle);
   if (!state) {
@@ -936,13 +1027,13 @@ inline void set_logit_bias(
  * @brief Clear all logit biases from a branch
  *
  * @param handle Branch to modify
- * @param store Branch store (nullptr = global store)
+ * @param s Branch store
  * @throws std::runtime_error if handle is invalid
  */
 inline void clear_logit_bias(
     BranchHandle handle,
-    BranchStore* store = nullptr) {
-  BranchStore& s = store ? *store : detail::global_store();
+    BranchStore& s) {
+
 
   BranchState* state = s.get(handle);
   if (!state) {
@@ -964,12 +1055,12 @@ inline void clear_logit_bias(
  *
  * @param handle Branch to modify
  * @param steer_fn Callback: void(llama_token_data_array&)
- * @param store Branch store (nullptr = global store)
+ * @param s Branch store
  * @throws std::runtime_error if handle is invalid
  *
  * @warning Callback may capture references — ensure their lifetime exceeds branch usage.
  *
- * @example MCTS action deduplication
+ * @example Action deduplication in tree search
  * @code
  *   branch::set_steer(child, [&explored](llama_token_data_array& cur_p) {
  *     for (size_t i = 0; i < cur_p.size; ++i) {
@@ -983,8 +1074,8 @@ inline void clear_logit_bias(
 inline void set_steer(
     BranchHandle handle,
     std::function<void(llama_token_data_array&)> steer_fn,
-    BranchStore* store = nullptr) {
-  BranchStore& s = store ? *store : detail::global_store();
+    BranchStore& s) {
+
 
   BranchState* state = s.get(handle);
   if (!state) {
@@ -1000,13 +1091,13 @@ inline void set_steer(
  * @brief Clear the steer callback from a branch
  *
  * @param handle Branch to modify
- * @param store Branch store (nullptr = global store)
+ * @param s Branch store
  * @throws std::runtime_error if handle is invalid
  */
 inline void clear_steer(
     BranchHandle handle,
-    BranchStore* store = nullptr) {
-  BranchStore& s = store ? *store : detail::global_store();
+    BranchStore& s) {
+
 
   BranchState* state = s.get(handle);
   if (!state) {
@@ -1019,27 +1110,42 @@ inline void clear_steer(
 }
 
 /**
- * @brief Remove branch from KV cache and free all resources
+ * @brief Prune a leaf branch (RESTRICT — throws if children exist)
  *
- * Clears the branch's KV cache entries (all positions for its seq_id),
- * then releases the slot and owned resources back to the store.
+ * Evicts the KV lease and frees all resources via BranchStore::release().
+ * If the branch has children, throws — use pruneSubtree() for CASCADE.
  *
  * @param handle Branch to prune (INVALID_HANDLE is a safe no-op)
- * @param store Branch store (nullptr = global store)
- *
- * @see destroy() to free resources without clearing KV cache
+ * @param s Branch store
+ * @throws std::runtime_error if branch has children
  */
-inline void prune(BranchHandle handle, BranchStore* store = nullptr) {
-  BranchStore& s = store ? *store : detail::global_store();
-
+inline void prune(BranchHandle handle, BranchStore& s) {
   BranchState* state = s.get(handle);
   if (!state) return;
-
-  // Remove from KV cache
-  kv::remove_range(state->ctx, state->seq_id, 0, -1);
-
-  // Free the branch
+  if (!state->children.empty())
+    throw std::runtime_error("prune: RESTRICT — branch has children. Use pruneSubtree() for CASCADE.");
   s.release(handle);
+}
+
+/**
+ * @brief Prune a branch and all descendants (CASCADE — iterative post-order)
+ *
+ * Traverses the subtree rooted at h, collecting all descendants, then prunes
+ * leaves-first so RESTRICT on prune() always passes.
+ *
+ * @param h Root of subtree to prune
+ * @param s Branch store
+ */
+inline void pruneSubtree(BranchHandle h, BranchStore& s) {
+  std::vector<BranchHandle> stack{h}, post_order;
+  while (!stack.empty()) {
+    BranchHandle cur = stack.back(); stack.pop_back();
+    post_order.push_back(cur);
+    BranchState* st = s.get(cur);
+    if (st) for (auto child : st->children) stack.push_back(child);
+  }
+  for (auto it = post_order.rbegin(); it != post_order.rend(); ++it)
+    prune(*it, s);
 }
 
 /**
@@ -1052,7 +1158,7 @@ inline void prune(BranchHandle handle, BranchStore* store = nullptr) {
  * @param handle Branch to decode into
  * @param tokens Array of token IDs
  * @param n_tokens Number of tokens in the array
- * @param store Branch store (nullptr = global store)
+ * @param s Branch store
  * @throws std::runtime_error if handle is invalid or decode fails
  *
  * @note For single-token decode, prefer decode_one() (zero heap allocation).
@@ -1061,8 +1167,8 @@ inline void decode_batch(
     BranchHandle handle,
     const llama_token* tokens,
     size_t n_tokens,
-    BranchStore* store = nullptr) {
-  BranchStore& s = store ? *store : detail::global_store();
+    BranchStore& s) {
+
 
   BranchState* state = s.get(handle);
   if (!state) {
@@ -1087,14 +1193,14 @@ inline void decode_batch(
  *
  * @param handle Branch to decode into
  * @param token Token ID to decode
- * @param store Branch store (nullptr = global store)
+ * @param s Branch store
  * @throws std::runtime_error if handle is invalid or decode fails
  */
 inline void decode_one(
     BranchHandle handle,
     llama_token token,
-    BranchStore* store = nullptr) {
-  BranchStore& s = store ? *store : detail::global_store();
+    BranchStore& s) {
+
 
   BranchState* state = s.get(handle);
   if (!state) {
@@ -1115,14 +1221,14 @@ inline void decode_one(
  * branch for sampling.
  *
  * @param handle Branch to capture logits for
- * @param store Branch store (nullptr = global store)
+ * @param s Branch store
  * @throws std::runtime_error if handle is invalid, vocab size is zero,
  *         or no logits are available (no prior decode with logits enabled)
  *
  * @note Sets has_logits = true, enabling sample() and get_logits().
  */
-inline void capture_logits(BranchHandle handle, BranchStore* store = nullptr) {
-  BranchStore& s = store ? *store : detail::global_store();
+inline void capture_logits(BranchHandle handle, BranchStore& s) {
+
 
   BranchState* state = s.get(handle);
   if (!state) {
@@ -1150,7 +1256,7 @@ inline void capture_logits(BranchHandle handle, BranchStore* store = nullptr) {
  * @param handle Branch to decode into
  * @param tokens Array of token IDs
  * @param n_tokens Number of tokens in the array
- * @param store Branch store (nullptr = global store)
+ * @param s Branch store
  * @throws std::runtime_error if handle is invalid, decode fails,
  *         or logits capture fails
  *
@@ -1160,8 +1266,8 @@ inline void decode_and_capture_batch(
     BranchHandle handle,
     const llama_token* tokens,
     size_t n_tokens,
-    BranchStore* store = nullptr) {
-  BranchStore& s = store ? *store : detail::global_store();
+    BranchStore& s) {
+
 
   BranchState* state = s.get(handle);
   if (!state) {
@@ -1197,15 +1303,15 @@ inline void decode_and_capture_batch(
  *
  * @param handle Branch to decode into
  * @param token Token ID to decode
- * @param store Branch store (nullptr = global store)
+ * @param s Branch store
  * @throws std::runtime_error if handle is invalid, decode fails,
  *         or logits capture fails
  */
 inline void decode_and_capture_one(
     BranchHandle handle,
     llama_token token,
-    BranchStore* store = nullptr) {
-  BranchStore& s = store ? *store : detail::global_store();
+    BranchStore& s) {
+
 
   BranchState* state = s.get(handle);
   if (!state) {
@@ -1236,11 +1342,11 @@ inline void decode_and_capture_one(
  * Only valid after capture_logits() or a decode_and_capture call.
  *
  * @param handle Branch to read logits from
- * @param store Branch store (nullptr = global store)
+ * @param s Branch store
  * @return Pointer to n_vocab floats, or nullptr if no logits captured
  */
-inline const float* get_logits(BranchHandle handle, BranchStore* store = nullptr) {
-  BranchStore& s = store ? *store : detail::global_store();
+inline const float* get_logits(BranchHandle handle, BranchStore& s) {
+
 
   const BranchState* state = s.get(handle);
   // Must check has_logits, not just empty() - buffer is pre-allocated in create()
@@ -1260,13 +1366,13 @@ inline const float* get_logits(BranchHandle handle, BranchStore* store = nullptr
  * Requires prior capture_logits() or decode_and_capture call.
  *
  * @param handle Branch to sample from
- * @param store Branch store (nullptr = global store)
+ * @param s Branch store
  * @return Sampled token ID, or -1 if no logits captured or sampling fails
  *
  * @note Call accept_token() after sampling to advance grammar and penalty state.
  */
-inline llama_token sample(BranchHandle handle, BranchStore* store = nullptr) {
-  BranchStore& s = store ? *store : detail::global_store();
+inline llama_token sample(BranchHandle handle, BranchStore& s) {
+
 
   BranchState* state = s.get(handle);
   if (!state || !state->sampler_chain) {
@@ -1351,15 +1457,15 @@ inline llama_token sample(BranchHandle handle, BranchStore* store = nullptr) {
  *
  * @param handle Branch that produced the token
  * @param token Token ID returned by sample()
- * @param store Branch store (nullptr = global store)
+ * @param s Branch store
  *
  * @note Safe to call with invalid handle (silent no-op).
  */
 inline void accept_token(
     BranchHandle handle,
     llama_token token,
-    BranchStore* store = nullptr) {
-  BranchStore& s = store ? *store : detail::global_store();
+    BranchStore& s) {
+
 
   BranchState* state = s.get(handle);
   if (!state) return;
@@ -1417,7 +1523,7 @@ inline void accept_token(
  * @param handle Branch with grammar to apply
  * @param logits Logits buffer to modify in place (n_vocab floats)
  * @param n_vocab Number of entries in the logits buffer
- * @param store Branch store (nullptr = global store)
+ * @param s Branch store
  *
  * @note No-op if handle is invalid or branch has no grammar attached.
  */
@@ -1425,8 +1531,8 @@ inline void apply_grammar(
     BranchHandle handle,
     float* logits,
     int n_vocab,
-    BranchStore* store = nullptr) {
-  BranchStore& s = store ? *store : detail::global_store();
+    BranchStore& s) {
+
 
   BranchState* state = s.get(handle);
   if (!state || !state->grammar) return;
@@ -1468,18 +1574,18 @@ inline void apply_grammar(
  * Returns (token, probability) pairs for tokens that pass grammar constraints.
  * Probabilities are softmax-normalized over the legal set only (sum to 1.0).
  *
- * Essential for PUCT in MCTS: policy priors must only cover legal moves.
+ * Essential for policy priors in tree search: priors must only cover legal moves.
  *
  * @param handle Branch with captured logits and optional grammar
- * @param store Branch store (nullptr = global store)
+ * @param s Branch store
  * @return Vector of (token_id, probability) pairs, empty if no logits or no legal tokens
  *
  * @note If no grammar is attached, all tokens with finite logits are included.
  */
 inline std::vector<std::pair<llama_token, float>> get_legal_priors(
     BranchHandle handle,
-    BranchStore* store = nullptr) {
-  BranchStore& s = store ? *store : detail::global_store();
+    BranchStore& s) {
+
 
   BranchState* state = s.get(handle);
   if (!state || !state->has_logits) {
@@ -1549,13 +1655,13 @@ inline std::vector<std::pair<llama_token, float>> get_legal_priors(
  * Numerically stable (max-subtraction trick).
  *
  * @param handle Branch with captured logits and optional grammar
- * @param store Branch store (nullptr = global store)
+ * @param s Branch store
  * @return Log-sum-exp value, or -INFINITY if no legal tokens or invalid state
  *
  * @see get_token_prior_assume_legal() for O(1) per-token prior using this value
  */
-inline float get_legal_logsumexp(BranchHandle handle, BranchStore* store = nullptr) {
-  BranchStore& s = store ? *store : detail::global_store();
+inline float get_legal_logsumexp(BranchHandle handle, BranchStore& s) {
+
 
   BranchState* state = s.get(handle);
   if (!state || !state->has_logits) {
@@ -1611,14 +1717,14 @@ inline float get_legal_logsumexp(BranchHandle handle, BranchStore* store = nullp
  *
  * @param handle Branch with optional grammar
  * @param token Token ID to check
- * @param store Branch store (nullptr = global store)
+ * @param s Branch store
  * @return true if token is legal (or no grammar attached), false if illegal
  */
 inline bool is_token_legal(
     BranchHandle handle,
     llama_token token,
-    BranchStore* store = nullptr) {
-  BranchStore& s = store ? *store : detail::global_store();
+    BranchStore& s) {
+
 
   BranchState* state = s.get(handle);
   if (!state || token < 0 || token >= state->n_vocab) {
@@ -1653,13 +1759,13 @@ inline bool is_token_legal(
 /**
  * @brief Compute prior probability for a token known to be grammar-legal
  *
- * O(1) operation — use in MCTS inner loops where sample() already enforced grammar.
+ * O(1) operation — use in search inner loops where sample() already enforced grammar.
  * Does NOT validate grammar legality; caller must ensure token is legal.
  *
  * @param handle Branch with captured logits
  * @param token Token ID (must be legal under grammar)
  * @param logsumexp Pre-computed value from get_legal_logsumexp()
- * @param store Branch store (nullptr = global store)
+ * @param s Branch store
  * @return Probability in [0, 1], or 0 if state is invalid
  *
  * @see get_token_prior() for a safe version that checks grammar legality
@@ -1668,8 +1774,8 @@ inline float get_token_prior_assume_legal(
     BranchHandle handle,
     llama_token token,
     float logsumexp,
-    BranchStore* store = nullptr) {
-  BranchStore& s = store ? *store : detail::global_store();
+    BranchStore& s) {
+
 
   BranchState* state = s.get(handle);
   if (!state || !state->has_logits || token < 0 || token >= state->n_vocab) {
@@ -1689,45 +1795,34 @@ inline float get_token_prior_assume_legal(
  * @param handle Branch with captured logits and optional grammar
  * @param token Token ID to compute prior for
  * @param logsumexp Pre-computed value from get_legal_logsumexp()
- * @param store Branch store (nullptr = global store)
+ * @param s Branch store
  * @return Probability in [0, 1], or 0 if token is illegal
  *
- * @note For MCTS inner loops, prefer get_token_prior_assume_legal() since
+ * @note For search inner loops, prefer get_token_prior_assume_legal() since
  *       sample() already enforces grammar constraints.
  */
 inline float get_token_prior(
     BranchHandle handle,
     llama_token token,
     float logsumexp,
-    BranchStore* store = nullptr) {
-  if (!is_token_legal(handle, token, store)) {
+    BranchStore& s) {
+  if (!is_token_legal(handle, token, s)) {
     return 0.0f;
   }
-  return get_token_prior_assume_legal(handle, token, logsumexp, store);
+  return get_token_prior_assume_legal(handle, token, logsumexp, s);
 }
 
 // ===== STATE ACCESSORS =====
 
-/**
- * @brief Get the branch's KV cache sequence ID
- * @param handle Branch handle
- * @param store Branch store (nullptr = global store)
- * @return Sequence ID, or -1 if handle is invalid
- */
-inline llama_seq_id get_seq_id(BranchHandle handle, BranchStore* store = nullptr) {
-  BranchStore& s = store ? *store : detail::global_store();
-  const BranchState* state = s.get(handle);
-  return state ? state->seq_id : -1;
-}
 
 /**
  * @brief Get the branch's current decode position
  * @param handle Branch handle
- * @param store Branch store (nullptr = global store)
+ * @param s Branch store
  * @return Token position, or -1 if handle is invalid
  */
-inline llama_pos get_position(BranchHandle handle, BranchStore* store = nullptr) {
-  BranchStore& s = store ? *store : detail::global_store();
+inline llama_pos get_position(BranchHandle handle, BranchStore& s) {
+
   const BranchState* state = s.get(handle);
   return state ? state->position : -1;
 }
@@ -1740,11 +1835,11 @@ inline llama_pos get_position(BranchHandle handle, BranchStore* store = nullptr)
  * get_sampling_perplexity().
  *
  * @param handle Branch handle
- * @param store Branch store (nullptr = global store)
+ * @param s Branch store
  * @return Model perplexity, or INFINITY if no tokens accepted
  */
-inline float get_perplexity(BranchHandle handle, BranchStore* store = nullptr) {
-  BranchStore& s = store ? *store : detail::global_store();
+inline float get_perplexity(BranchHandle handle, BranchStore& s) {
+
   const BranchState* state = s.get(handle);
   if (!state || state->metrics == 0) {
     return std::numeric_limits<float>::infinity();
@@ -1756,15 +1851,15 @@ inline float get_perplexity(BranchHandle handle, BranchStore* store = nullptr) {
  * @brief Get sampling-level perplexity (from filtered distribution)
  *
  * Returns perplexity from the distribution actually sampled from
- * (after top-k/p/temp/penalties). Useful for PUCT priors and
+ * (after top-k/p/temp/penalties). Useful for policy priors and
  * monitoring sampler chain impact.
  *
  * @param handle Branch handle
- * @param store Branch store (nullptr = global store)
+ * @param s Branch store
  * @return Sampling-level perplexity, or INFINITY if no tokens accepted
  */
-inline float get_sampling_perplexity(BranchHandle handle, BranchStore* store = nullptr) {
-  BranchStore& s = store ? *store : detail::global_store();
+inline float get_sampling_perplexity(BranchHandle handle, BranchStore& s) {
+
   const BranchState* state = s.get(handle);
   if (!state || state->metrics == 0) {
     return std::numeric_limits<float>::infinity();
@@ -1776,14 +1871,14 @@ inline float get_sampling_perplexity(BranchHandle handle, BranchStore* store = n
  * @brief Get the last sampled token's prior from the filtered distribution
  *
  * Returns P(token) from the post-filter sampling distribution.
- * This is the correct prior for PUCT since it matches what was actually sampled.
+ * This is the correct prior for UCT-family algorithms since it matches what was actually sampled.
  *
  * @param handle Branch handle
- * @param store Branch store (nullptr = global store)
+ * @param s Branch store
  * @return Probability of last sampled token in [0, 1], or 0 if unavailable
  */
-inline float get_last_sampling_prior(BranchHandle handle, BranchStore* store = nullptr) {
-  BranchStore& s = store ? *store : detail::global_store();
+inline float get_last_sampling_prior(BranchHandle handle, BranchStore& s) {
+
   const BranchState* state = s.get(handle);
 
   if (!state || state->last_candidates.empty() || state->last_token < 0) {
@@ -1816,100 +1911,58 @@ inline float get_last_sampling_prior(BranchHandle handle, BranchStore* store = n
 /**
  * @brief Get the branch's vocabulary size
  * @param handle Branch handle
- * @param store Branch store (nullptr = global store)
+ * @param s Branch store
  * @return Vocabulary size, or 0 if handle is invalid
  */
-inline int get_n_vocab(BranchHandle handle, BranchStore* store = nullptr) {
-  BranchStore& s = store ? *store : detail::global_store();
+inline int get_n_vocab(BranchHandle handle, BranchStore& s) {
+
   const BranchState* state = s.get(handle);
   return state ? state->n_vocab : 0;
 }
 
-// ===== RELEASE STRUCTURES =====
-
-/**
- * @brief Result of Branch::release_kv() — KV cache preserved, resources freed
- *
- * Use for "Commit+Reset" mode: keep the KV cache but restart sampling fresh
- * with a new sampler chain / grammar.
- */
-struct ReleasedKV {
-  llama_context* ctx;   ///< Context the KV cache lives in
-  llama_seq_id seq_id;  ///< Sequence ID with preserved KV entries
-  llama_pos position;   ///< Decode position (token count)
-};
-
-/**
- * @brief Result of Branch::release_full() — KV cache preserved, resource ownership transferred
- *
- * Use for "Commit+Continue" mode: keep both KV cache and sampling state.
- *
- * @warning Caller takes ownership and must free these resources:
- *          - sampler::free_chain(sampler_chain)
- *          - grammar::free_sampler(grammar) if non-null
- *          - metrics::free_branch_metrics(metrics) if non-zero
- */
-struct ReleasedFull {
-  llama_context* ctx;          ///< Context the KV cache lives in
-  const llama_model* model;    ///< Model reference (not owned)
-  llama_seq_id seq_id;         ///< Sequence ID with preserved KV entries
-  llama_pos position;          ///< Decode position (token count)
-  llama_sampler* sampler_chain;              ///< Caller must call sampler::free_chain()
-  llama_sampler* grammar;                    ///< Caller must call grammar::free_sampler() if non-null
-  metrics::BranchMetricsHandle metrics;      ///< Caller must call metrics::free_branch_metrics() if non-zero
-};
 
 // ===== RAII WRAPPER =====
 
 /**
  * @brief RAII wrapper around BranchHandle for automatic resource management
  *
- * Move-only value type. Destructor calls prune() (clears KV + frees resources).
- * Use release_kv() or release_full() to detach ownership before destruction.
+ * Move-only value type. Destructor calls pruneSubtree() (CASCADE).
+ * Use prune() for RESTRICT (leaf-only) cleanup.
  *
  * @example Basic usage
  * @code
- *   Branch root = Branch::create(ctx, model, 0, pos, params);
- *   Branch child = root.fork(1);
+ *   store.init_tenancy(ctx);
+ *   Branch root = Branch::create(ctx, model, store, pos, params);
+ *   Branch child = root.fork();
  *
  *   child.decode_and_capture_one(token);
  *   auto next = child.sample();
  *   child.accept(next);
  * @endcode
- *
- * @example Winner commit pattern
- * @code
- *   auto released = winner.release_kv();  // KV survives, resources freed
- *   // winner is now invalid, but KV at released.seq_id is preserved
- * @endcode
  */
 class Branch {
 public:
-  /// @brief Construct an invalid (empty) branch
   Branch() : store_(nullptr), handle_(INVALID_HANDLE) {}
 
-  /// @brief Construct from an existing store and handle (takes ownership)
   Branch(BranchStore* store, BranchHandle handle)
       : store_(store), handle_(handle) {}
 
-  /// @brief Destructor — prunes KV cache and frees all resources
+  /// Destructor — CASCADE prunes entire subtree
   ~Branch() {
     if (handle_ != INVALID_HANDLE && store_) {
-      branch::prune(handle_, store_);
+      branch::pruneSubtree(handle_, *store_);
     }
   }
 
-  /// @brief Move constructor (transfers ownership, source becomes invalid)
   Branch(Branch&& other) noexcept
       : store_(other.store_), handle_(other.handle_) {
     other.handle_ = INVALID_HANDLE;
   }
 
-  /// @brief Move assignment (prunes current branch, then transfers ownership)
   Branch& operator=(Branch&& other) noexcept {
     if (this != &other) {
       if (handle_ != INVALID_HANDLE && store_) {
-        branch::prune(handle_, store_);
+        branch::pruneSubtree(handle_, *store_);
       }
       store_ = other.store_;
       handle_ = other.handle_;
@@ -1918,172 +1971,124 @@ public:
     return *this;
   }
 
-  Branch(const Branch&) = delete;             ///< Non-copyable
-  Branch& operator=(const Branch&) = delete;  ///< Non-copyable
+  Branch(const Branch&) = delete;
+  Branch& operator=(const Branch&) = delete;
 
-  /**
-   * @brief Create a new branch (factory method)
-   * @see branch::create() for parameter documentation
-   */
+  /// Factory: allocates slot + lease from store
   template <SamplingParamsLike P>
   static Branch create(
       llama_context* ctx,
       const llama_model* model,
-      llama_seq_id seq_id,
+      BranchStore& store,
       llama_pos start_pos,
       const P& params,
       int n_batch = DEFAULT_N_BATCH,
       const char* grammar_str = nullptr,
-      boundaries::BoundaryTracker* boundary_tracker = nullptr,
-      BranchStore* store = nullptr) {
-    BranchStore* s = store ? store : &detail::global_store();
-    BranchHandle h = branch::create(ctx, model, seq_id, start_pos, params, n_batch, grammar_str, boundary_tracker, s);
-    return Branch(s, h);
+      boundaries::BoundaryTracker* boundary_tracker = nullptr) {
+    BranchHandle h = branch::create(ctx, model, store, start_pos, params, n_batch, grammar_str, boundary_tracker);
+    return Branch(&store, h);
   }
 
-  /**
-   * @brief Fork this branch into a new independent sequence
-   * @param new_seq_id KV cache sequence ID for the child
-   * @return New Branch owning the forked state
-   * @see branch::fork()
-   */
-  Branch fork(llama_seq_id new_seq_id) {
-    BranchHandle h = branch::fork(handle_, new_seq_id, store_);
+  /// Fork: allocates slot + lease, records topology edge
+  Branch fork() {
+    BranchHandle h = branch::fork(handle_, *store_);
     return Branch(store_, h);
   }
 
-  /// @brief Prune this branch (clear KV + free resources), invalidating the handle
+  /// RESTRICT prune (throws if children exist)
   void prune() {
-    branch::prune(handle_, store_);
+    branch::prune(handle_, *store_);
     handle_ = INVALID_HANDLE;
   }
 
-  /**
-   * @brief Release KV cache ownership without pruning (Commit+Reset mode)
-   *
-   * KV cache entries are PRESERVED. Branch resources (sampler, grammar,
-   * metrics) are FREED. The Branch object becomes invalid after this call.
-   *
-   * @return ReleasedKV with ctx, seq_id, and position for continued use
-   */
-  ReleasedKV release_kv() {
-    if (handle_ == INVALID_HANDLE || !store_) {
-      return ReleasedKV{nullptr, -1, -1};
-    }
-
-    BranchState* st = store_->get(handle_);
-    if (!st) {
-      return ReleasedKV{nullptr, -1, -1};
-    }
-
-    ReleasedKV out{st->ctx, st->seq_id, st->position};
-
-    // Free resources but NOT KV cache
-    branch::destroy(handle_, store_);
+  /// CASCADE prune — removes entire subtree
+  void pruneSubtree() {
+    branch::pruneSubtree(handle_, *store_);
     handle_ = INVALID_HANDLE;
-
-    return out;
-  }
-
-  /**
-   * @brief Release full ownership including resources (Commit+Continue mode)
-   *
-   * KV cache entries are PRESERVED. Resource ownership is TRANSFERRED to
-   * the caller (not freed). The Branch object becomes invalid after this call.
-   *
-   * @return ReleasedFull with all state — caller must free owned resources
-   * @warning Caller takes ownership of sampler_chain, grammar, and metrics.
-   */
-  ReleasedFull release_full() {
-    if (handle_ == INVALID_HANDLE || !store_) {
-      return ReleasedFull{nullptr, nullptr, -1, -1, nullptr, nullptr, 0};
-    }
-
-    BranchState* st = store_->get(handle_);
-    if (!st) {
-      return ReleasedFull{nullptr, nullptr, -1, -1, nullptr, nullptr, 0};
-    }
-
-    // Steal ownership using std::exchange - nullifies slot's pointers
-    // so destroy() won't free them
-    ReleasedFull out{
-      st->ctx,
-      st->model,
-      st->seq_id,
-      st->position,
-      std::exchange(st->sampler_chain, nullptr),
-      std::exchange(st->grammar, nullptr),
-      std::exchange(st->metrics, 0),
-    };
-
-    // Now safe to destroy - nothing left to free
-    branch::destroy(handle_, store_);
-    handle_ = INVALID_HANDLE;
-
-    return out;
   }
 
   /// @brief Capture current context logits into this branch's snapshot
-  /// @see branch::capture_logits()
+  /// @copydetails branch::capture_logits()
   void capture_logits() {
-    branch::capture_logits(handle_, store_);
+    branch::capture_logits(handle_, *store_);
   }
 
   /// @brief Decode multiple tokens into this branch's KV cache
-  /// @see branch::decode_batch()
+  /// @param tokens Array of token IDs
+  /// @param n Number of tokens
+  /// @copydetails branch::decode_batch()
   void decode_batch(const llama_token* tokens, size_t n) {
-    branch::decode_batch(handle_, tokens, n, store_);
+    branch::decode_batch(handle_, tokens, n, *store_);
   }
 
-  /// @brief Decode a single token (zero-allocation fast path)
-  /// @see branch::decode_one()
+  /// @brief Decode a single token (zero per-call allocation)
+  /// @param token Token ID to decode
   void decode_one(llama_token token) {
-    branch::decode_one(handle_, token, store_);
+    branch::decode_one(handle_, token, *store_);
   }
 
   /// @brief Decode multiple tokens and capture logits atomically
-  /// @see branch::decode_and_capture_batch()
+  /// @param tokens Array of token IDs
+  /// @param n Number of tokens
   void decode_and_capture_batch(const llama_token* tokens, size_t n) {
-    branch::decode_and_capture_batch(handle_, tokens, n, store_);
+    branch::decode_and_capture_batch(handle_, tokens, n, *store_);
   }
 
-  /// @brief Decode a single token and capture logits (zero-allocation fast path)
-  /// @see branch::decode_and_capture_one()
+  /// @brief Decode one token and capture logits (zero per-call allocation)
+  /// @param token Token ID to decode
   void decode_and_capture_one(llama_token token) {
-    branch::decode_and_capture_one(handle_, token, store_);
+    branch::decode_and_capture_one(handle_, token, *store_);
   }
 
-  /// @brief Get captured logits snapshot (n_vocab floats), or nullptr
-  /// @see branch::get_logits()
+  /// @brief Get the branch's captured logits snapshot
+  /// @return Pointer to n_vocab floats, or nullptr if no logits captured
   const float* logits() const {
-    return branch::get_logits(handle_, store_);
+    return branch::get_logits(handle_, *store_);
   }
 
-  /// @brief Sample a token using Grammar → Logit Bias → Steer → Sampler Chain
-  /// @see branch::sample()
+  /// @brief Sample a token from captured logits
+  /// @return Sampled token ID, or -1 if no logits captured
+  /// @see accept() to advance state after sampling
   llama_token sample() {
-    return branch::sample(handle_, store_);
+    return branch::sample(handle_, *store_);
   }
 
-  /// @brief Accept a sampled token, advancing grammar and sampler state
-  /// @see branch::accept_token()
+  /// @brief Accept a token — advance grammar, penalty window, and metrics
+  /// @param token Token to accept (from sample())
   void accept(llama_token token) {
-    branch::accept_token(handle_, token, store_);
+    branch::accept_token(handle_, token, *store_);
   }
 
-  // -- Accessors --
+  // ===== ACCESSORS =====
 
-  llama_seq_id seq_id() const { return branch::get_seq_id(handle_, store_); }  ///< @see branch::get_seq_id()
-  llama_pos position() const { return branch::get_position(handle_, store_); }  ///< @see branch::get_position()
-  float perplexity() const { return branch::get_perplexity(handle_, store_); }  ///< @see branch::get_perplexity()
-  int n_vocab() const { return branch::get_n_vocab(handle_, store_); }          ///< @see branch::get_n_vocab()
+  /// @brief Current decode position (token count)
+  llama_pos position() const { return branch::get_position(handle_, *store_); }
+  /// @brief Model-level perplexity (from raw logits, pre-filter)
+  float perplexity() const { return branch::get_perplexity(handle_, *store_); }
+  /// @brief Vocabulary size
+  int n_vocab() const { return branch::get_n_vocab(handle_, *store_); }
+  /// @brief True if this Branch holds a valid handle
+  bool valid() const { return handle_ != INVALID_HANDLE; }
+  /// @brief Underlying opaque handle (for interop with free functions)
+  BranchHandle handle() const { return handle_; }
 
-  bool valid() const { return handle_ != INVALID_HANDLE; }  ///< True if this branch holds a valid handle
-  BranchHandle handle() const { return handle_; }           ///< Get the underlying raw handle
+  // ===== TOPOLOGY =====
+
+  /// @brief Parent branch handle, or INVALID_HANDLE if root
+  BranchHandle parentHandle() const { return store_ ? store_->parent(handle_) : INVALID_HANDLE; }
+  /// @brief Child branch handles (empty if leaf)
+  const std::vector<BranchHandle>& childHandles() const {
+    static const std::vector<BranchHandle> empty;
+    return store_ ? store_->children(handle_) : empty;
+  }
+  /// @brief True if this branch has no children
+  bool isLeaf() const { return store_ ? store_->isLeaf(handle_) : true; }
+  /// @brief True if this branch holds a KV lease
+  bool isActive() const { return store_ ? store_->isActive(handle_) : false; }
 
 private:
-  BranchStore* store_;    ///< Store this branch was allocated from
-  BranchHandle handle_;   ///< Opaque handle to the branch slot
+  BranchStore* store_;
+  BranchHandle handle_;
 };
 
 }  // namespace lloyal::branch

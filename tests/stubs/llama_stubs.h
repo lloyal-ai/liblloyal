@@ -88,6 +88,7 @@ extern "C" {
     llama_context* llama_init_from_model(llama_model* model, llama_context_params params);
     void llama_free(llama_context* ctx);
     uint32_t llama_n_ctx(const llama_context* ctx);  // Get context size
+    uint32_t llama_n_seq_max(const llama_context* ctx);  // Get max sequences
 
     // Default parameters
     llama_model_params llama_model_default_params();
@@ -224,6 +225,7 @@ struct LlamaStubConfig {
 
     // Context operations
     bool context_init_succeeds = true;         // Controls if llama_init_from_model returns valid pointer
+    uint32_t n_seq_max = 8;                    // Max sequences for tenancy
 
     // KV cache operations
     llama_pos pos_max = -1;                    // Max position in KV cache (-1 = empty)

@@ -803,18 +803,19 @@ TEST_CASE("ChatIn Integration: warm multi-turn conversation with semantic recall
   REQUIRE(!separator.empty());
 
   WarmTestParams params;
-  lloyal::branch::BranchStore store;
+  lloyal::branch::BranchStore store(8);
+  store.init_tenancy(ctx);
   lloyal::branch::BranchHandle branch = lloyal::branch::INVALID_HANDLE;
 
   // Helper: generate until EOG
   auto generate = [&]() -> std::string {
     std::string text;
     for (;;) {
-      auto token = lloyal::branch::sample(branch, &store);
+      auto token = lloyal::branch::sample(branch, store);
       if (lloyal::tokenizer::is_eog(model.get(), token)) break;
       text += lloyal::tokenizer::detokenize(model.get(), token);
-      lloyal::branch::accept_token(branch, token, &store);
-      lloyal::branch::decode_and_capture_one(branch, token, &store);
+      lloyal::branch::accept_token(branch, token, store);
+      lloyal::branch::decode_and_capture_one(branch, token, store);
     }
     return text;
   };
@@ -836,7 +837,7 @@ TEST_CASE("ChatIn Integration: warm multi-turn conversation with semantic recall
     prefill.insert(prefill.end(), delta.begin(), delta.end());
 
     lloyal::branch::decode_and_capture_batch(branch, prefill.data(),
-                                              prefill.size(), &store);
+                                              prefill.size(), store);
   };
 
   // ===== Turn 1 (COLD): introduce name =====
@@ -849,12 +850,11 @@ TEST_CASE("ChatIn Integration: warm multi-turn conversation with semantic recall
     auto result = lloyal::chat_in::format(model.get(), inputs);
     auto tokens = lloyal::tokenizer::tokenize(vocab, result.prompt, true, true);
 
-    branch = lloyal::branch::create(ctx, model.get(), 0, 0, params, 512,
-                                     nullptr, nullptr, &store);
+    branch = lloyal::branch::create(ctx, model.get(), store, 0, params, 512);
     REQUIRE(branch != lloyal::branch::INVALID_HANDLE);
 
     lloyal::branch::decode_and_capture_batch(branch, tokens.data(),
-                                              tokens.size(), &store);
+                                              tokens.size(), store);
   }
 
   std::string turn1 = generate();
@@ -881,7 +881,7 @@ TEST_CASE("ChatIn Integration: warm multi-turn conversation with semantic recall
   bool food_recalled = turn4.find("pizza") != std::string::npos;
   CHECK(food_recalled);
 
-  lloyal::branch::destroy(branch, &store);
+  lloyal::branch::prune(branch, store);
 
   if (name_recalled && food_recalled) {
     MESSAGE("WARM MULTI-TURN VERIFIED: Context survives across 4 warm turns");
