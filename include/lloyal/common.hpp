@@ -7,7 +7,7 @@
  * liblloyal - Common definitions and logging
  *
  * Header-only library for llama.cpp-bound LLM operations
- * Version: 1.0.0 (bound to llama.cpp b6870)
+ * Version: 1.0.0 (bound to llama.cpp b8087)
  * License: Apache-2.0
  */
 

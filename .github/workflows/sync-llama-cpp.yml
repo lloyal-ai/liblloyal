@@ -31,7 +31,7 @@ jobs:
           echo "version=$CURRENT" >> $GITHUB_OUTPUT
           echo "Current llama.cpp version: $CURRENT"
 
-          # Extract numeric part for comparison (b6870 -> 6870)
+          # Extract numeric part for comparison (b8087 -> 8087)
           CURRENT_NUM=$(echo "$CURRENT" | sed 's/^b//')
           echo "num=$CURRENT_NUM" >> $GITHUB_OUTPUT
 

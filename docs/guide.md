@@ -995,7 +995,7 @@ liblloyal pins llama.cpp version for reproducible builds. To update:
 **Edit `.llama-cpp-version`:**
 ```bash
 # Current content (example)
-b6870
+b8087
 
 # Update to new version
 echo "b7000" > .llama-cpp-version

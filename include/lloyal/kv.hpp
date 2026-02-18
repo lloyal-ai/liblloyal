@@ -610,7 +610,7 @@ inline void log_build_info(llama_context *ctx) {
       "[kv::build_info] llama.cpp KV Sequence Operations Configuration");
   LLOYAL_LOG_DEBUG(
       "[kv::build_info] ============================================");
-  LLOYAL_LOG_DEBUG("[kv::build_info] Version: b6870");
+  LLOYAL_LOG_DEBUG("[kv::build_info] Version: b8087");
   LLOYAL_LOG_DEBUG("[kv::build_info] API naming: llama_memory_seq_*");
   LLOYAL_LOG_DEBUG(
       "[kv::build_info] Current MVP: n_seq_max=1 (single sequence only)");
