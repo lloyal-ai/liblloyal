@@ -127,6 +127,111 @@ inline BranchHandle make_handle(uint16_t index, uint16_t generation) {
   return (static_cast<uint32_t>(generation) << GEN_SHIFT) | index;
 }
 
+// ===== REGISTRY HANDLE TYPES =====
+
+/// Handle to a sampler chain in BranchStore's registry (0 = invalid/none)
+using SamplerChainHandle = int32_t;
+
+/// Handle to a grammar sampler in BranchStore's registry (0 = invalid/none)
+using GrammarHandle = int32_t;
+
+/// Handle to a metrics tracker in BranchStore's registry (0 = invalid/none)
+using MetricsHandle = int32_t;
+
+/**
+ * @brief RAII entry for a sampler chain in the registry
+ *
+ * Owns the llama_sampler* and tracks whether the chain ends with dist (stochastic)
+ * or greedy. Move-only to prevent double-free.
+ */
+struct SamplerChainEntry {
+  llama_sampler* chain = nullptr;
+  bool has_dist = false;   ///< True if chain ends with dist (temp > 0), false if greedy
+
+  SamplerChainEntry() = default;
+  ~SamplerChainEntry() { if (chain) sampler::free_chain(chain); }
+
+  SamplerChainEntry(SamplerChainEntry&& o) noexcept
+      : chain(o.chain), has_dist(o.has_dist) { o.chain = nullptr; }
+  SamplerChainEntry& operator=(SamplerChainEntry&& o) noexcept {
+    if (this != &o) {
+      if (chain) sampler::free_chain(chain);
+      chain = o.chain; has_dist = o.has_dist; o.chain = nullptr;
+    }
+    return *this;
+  }
+  SamplerChainEntry(const SamplerChainEntry&) = delete;
+  SamplerChainEntry& operator=(const SamplerChainEntry&) = delete;
+};
+
+/**
+ * @brief RAII entry for a grammar sampler in the registry
+ *
+ * Owns the llama_sampler* for GBNF grammar constraints. Move-only.
+ */
+struct GrammarEntry {
+  llama_sampler* sampler = nullptr;
+
+  GrammarEntry() = default;
+  ~GrammarEntry() { if (sampler) grammar::free_sampler(sampler); }
+
+  GrammarEntry(GrammarEntry&& o) noexcept : sampler(o.sampler) { o.sampler = nullptr; }
+  GrammarEntry& operator=(GrammarEntry&& o) noexcept {
+    if (this != &o) {
+      if (sampler) grammar::free_sampler(sampler);
+      sampler = o.sampler; o.sampler = nullptr;
+    }
+    return *this;
+  }
+  GrammarEntry(const GrammarEntry&) = delete;
+  GrammarEntry& operator=(const GrammarEntry&) = delete;
+};
+
+/**
+ * @brief Concrete sampling params snapshot for memoization
+ *
+ * Captures resolved parameter values at chain creation time. Used by
+ * set_sampler_params() to skip rebuilding the chain when params haven't changed.
+ * Satisfies SamplingParamsLike for re-creation.
+ */
+struct CachedSamplingParams {
+  float temperature = 0.8f;
+  int32_t top_k = 40;
+  float top_p = 0.95f;
+  float typical_p = 1.0f;
+  float min_p = 0.05f;
+  float penalty_repeat = 1.0f;
+  float penalty_freq = 0.0f;
+  float penalty_present = 0.0f;
+  int32_t penalty_last_n = 64;
+  uint32_t seed = 0;
+  bool operator==(const CachedSamplingParams&) const = default;
+};
+
+/**
+ * @brief Snapshot sampling params for memoization comparison
+ *
+ * Extracts resolved values from any SamplingParamsLike type using the same
+ * defaults as sampler::create_chain(), except seed defaults to 0 (not time)
+ * to avoid false cache misses from non-deterministic defaults.
+ */
+template <SamplingParamsLike P>
+inline CachedSamplingParams snapshot_params(const P& p) {
+  using ::lloyal::detail::as_value;
+  return CachedSamplingParams{
+    as_value(p.temperature, 0.8f),
+    as_value(p.top_k, static_cast<int32_t>(40)),
+    as_value(p.top_p, 0.95f),
+    as_value(p.typical_p, 1.0f),
+    as_value(p.min_p, 0.05f),
+    as_value(p.penalty_repeat, 1.0f),
+    as_value(p.penalty_freq, 0.0f),
+    as_value(p.penalty_present, 0.0f),
+    as_value(p.penalty_last_n, static_cast<int32_t>(64)),
+    as_value(p.seed, static_cast<uint32_t>(0)),
+  };
+}
+
 // ===== BRANCH STATE =====
 
 /**
@@ -136,10 +241,10 @@ inline BranchHandle make_handle(uint16_t index, uint16_t generation) {
  *
  * Forkable state (cloned by fork()):
  * - KV cache sequence (via llama_memory_seq_cp)
- * - Sampler chain (penalties, PRNG, top-k/p filters)
- * - Grammar constraints (GBNF parser state)
+ * - Sampler chain (handle into BranchStore registry)
+ * - Grammar constraints (handle into BranchStore registry)
  * - Boundary tracker (token boundary detection)
- * - Metrics (model + sampling perplexity)
+ * - Metrics (handle into BranchStore registry)
  * - Logits snapshot (captured distribution for deferred sampling)
  * - Logit bias (static token-level adjustments)
  *
@@ -156,17 +261,17 @@ struct BranchState {
   llama_seq_id seq_id = NO_LEASE;  ///< KV cache sequence identifier (NO_LEASE when inactive)
   llama_pos position = 0;    ///< Current decode position in the sequence
 
-  llama_sampler* sampler_chain = nullptr;  ///< Sampling chain: penalties + PRNG + filters (owned)
-  bool has_dist_sampler = false;           ///< True if chain ends with dist (temp > 0), false if greedy
+  SamplerChainHandle sampler_chain = 0;  ///< Handle into BranchStore's sampler registry
+  GrammarHandle grammar = 0;             ///< Handle into BranchStore's grammar registry
 
-  llama_sampler* grammar = nullptr;  ///< Grammar sampler for GBNF constraints (owned, optional)
+  CachedSamplingParams cached_params;    ///< Params used to create current chain (for memoization)
 
   boundaries::BoundaryTracker* boundary_tracker = nullptr;  ///< Token boundary detector (owned, optional)
 
   std::vector<llama_logit_bias> logit_bias;  ///< Static token biases, cloned on fork
   std::function<void(llama_token_data_array&)> steer_fn;  ///< Dynamic logit callback, NOT cloned on fork
 
-  metrics::BranchMetricsHandle metrics = 0;  ///< Unified perplexity tracker (owned via handle)
+  MetricsHandle metrics = 0;  ///< Handle into BranchStore's metrics registry
 
   llama_token last_token = -1;                   ///< Last token returned by sample()
   std::vector<llama_token_data> last_candidates; ///< Filtered candidates from last sample()
@@ -496,6 +601,215 @@ public:
     return const_cast<BranchStore*>(this)->get(handle);
   }
 
+  // ===== SAMPLER CHAIN REGISTRY =====
+
+  /**
+   * @brief Create a sampler chain and register it
+   * @param params Sampling parameters (any SamplingParamsLike type)
+   * @return Handle to the new sampler chain (never 0)
+   */
+  template <SamplingParamsLike P>
+  SamplerChainHandle create_sampler(const P& params) {
+    SamplerChainHandle h = next_sampler_handle_++;
+    SamplerChainEntry entry;
+    entry.chain = sampler::create_chain(params);
+    float temperature = ::lloyal::detail::as_value(params.temperature, 0.8f);
+    entry.has_dist = (temperature > 0.0f);
+    sampler_chains_.emplace(h, std::move(entry));
+    return h;
+  }
+
+  /**
+   * @brief Clone a sampler chain (for fork)
+   * @param h Source sampler chain handle
+   * @return New handle with cloned chain, or 0 if source is invalid
+   */
+  SamplerChainHandle clone_sampler(SamplerChainHandle h) {
+    if (h == 0) return 0;
+    auto it = sampler_chains_.find(h);
+    if (it == sampler_chains_.end()) return 0;
+    SamplerChainHandle nh = next_sampler_handle_++;
+    SamplerChainEntry entry;
+    entry.chain = sampler::clone_chain(it->second.chain);
+    entry.has_dist = it->second.has_dist;
+    sampler_chains_.emplace(nh, std::move(entry));
+    return nh;
+  }
+
+  /**
+   * @brief Free a sampler chain
+   * @param h Handle to free (0 is a safe no-op)
+   */
+  void free_sampler(SamplerChainHandle h) {
+    if (h != 0) sampler_chains_.erase(h);
+  }
+
+  /**
+   * @brief Dereference a sampler chain handle (non-owning)
+   * @param h Sampler chain handle
+   * @return Pointer to the chain, or nullptr if invalid
+   */
+  llama_sampler* get_sampler_chain(SamplerChainHandle h) const {
+    if (h == 0) return nullptr;
+    auto it = sampler_chains_.find(h);
+    return it != sampler_chains_.end() ? it->second.chain : nullptr;
+  }
+
+  /**
+   * @brief Check if a sampler chain ends with dist (stochastic) or greedy
+   * @param h Sampler chain handle
+   * @return true if chain has dist sampler, false if greedy or invalid
+   */
+  bool sampler_has_dist(SamplerChainHandle h) const {
+    if (h == 0) return false;
+    auto it = sampler_chains_.find(h);
+    return it != sampler_chains_.end() ? it->second.has_dist : false;
+  }
+
+  // ===== GRAMMAR REGISTRY =====
+
+  /**
+   * @brief Create a grammar sampler and register it
+   * @param model Llama model (for vocab)
+   * @param grammar_str GBNF grammar string
+   * @param root Root rule name (default "root")
+   * @return Handle to the new grammar (never 0)
+   */
+  GrammarHandle create_grammar(const llama_model* model,
+                               const char* grammar_str,
+                               const char* root = "root") {
+    GrammarHandle h = next_grammar_handle_++;
+    GrammarEntry entry;
+    entry.sampler = grammar::init_sampler(model, grammar_str, root);
+    grammars_.emplace(h, std::move(entry));
+    return h;
+  }
+
+  /**
+   * @brief Clone a grammar (for fork)
+   * @param h Source grammar handle
+   * @return New handle with cloned grammar, or 0 if source is invalid
+   */
+  GrammarHandle clone_grammar(GrammarHandle h) {
+    if (h == 0) return 0;
+    auto it = grammars_.find(h);
+    if (it == grammars_.end()) return 0;
+    GrammarHandle nh = next_grammar_handle_++;
+    GrammarEntry entry;
+    entry.sampler = grammar::clone_sampler(it->second.sampler);
+    grammars_.emplace(nh, std::move(entry));
+    return nh;
+  }
+
+  /**
+   * @brief Free a grammar
+   * @param h Handle to free (0 is a safe no-op)
+   */
+  void free_grammar(GrammarHandle h) {
+    if (h != 0) grammars_.erase(h);
+  }
+
+  /**
+   * @brief Dereference a grammar handle (non-owning)
+   * @param h Grammar handle
+   * @return Pointer to the grammar sampler, or nullptr if invalid
+   */
+  llama_sampler* get_grammar_sampler(GrammarHandle h) const {
+    if (h == 0) return nullptr;
+    auto it = grammars_.find(h);
+    return it != grammars_.end() ? it->second.sampler : nullptr;
+  }
+
+  // ===== METRICS REGISTRY =====
+
+  /**
+   * @brief Create a metrics tracker and register it
+   * @return Handle to the new tracker (never 0)
+   */
+  MetricsHandle create_metrics() {
+    MetricsHandle h = next_metrics_handle_++;
+    metrics_registry_[h] = metrics::BranchMetricsState{};
+    return h;
+  }
+
+  /**
+   * @brief Clone a metrics tracker (for fork)
+   * @param h Source metrics handle
+   * @return New handle with cloned state, or 0 if source is invalid
+   */
+  MetricsHandle clone_metrics(MetricsHandle h) {
+    if (h == 0) return 0;
+    auto it = metrics_registry_.find(h);
+    if (it == metrics_registry_.end()) return 0;
+    MetricsHandle nh = next_metrics_handle_++;
+    metrics_registry_[nh] = it->second;
+    return nh;
+  }
+
+  /**
+   * @brief Free a metrics tracker
+   * @param h Handle to free (0 is a safe no-op)
+   */
+  void free_metrics(MetricsHandle h) {
+    if (h != 0) metrics_registry_.erase(h);
+  }
+
+  /**
+   * @brief Add model-level surprisal to a metrics tracker
+   * @param h Metrics handle
+   * @param surprisal Surprisal in nats
+   */
+  void add_model_surprisal(MetricsHandle h, float surprisal) {
+    if (h == 0) return;
+    auto it = metrics_registry_.find(h);
+    if (it == metrics_registry_.end()) return;
+    if (!std::isfinite(surprisal)) return;
+    it->second.model.nll_sum_nats += std::max(0.0f, surprisal);
+    it->second.model.count++;
+  }
+
+  /**
+   * @brief Add sampling-level surprisal to a metrics tracker
+   * @param h Metrics handle
+   * @param surprisal Surprisal in nats
+   */
+  void add_sampling_surprisal(MetricsHandle h, float surprisal) {
+    if (h == 0) return;
+    auto it = metrics_registry_.find(h);
+    if (it == metrics_registry_.end()) return;
+    if (!std::isfinite(surprisal)) return;
+    it->second.sampling.nll_sum_nats += std::max(0.0f, surprisal);
+    it->second.sampling.count++;
+  }
+
+  /**
+   * @brief Get model-level perplexity from a metrics tracker
+   * @param h Metrics handle
+   * @return exp(average surprisal), INFINITY if no samples or invalid
+   */
+  float get_model_ppl(MetricsHandle h) const {
+    if (h == 0) return std::numeric_limits<float>::infinity();
+    auto it = metrics_registry_.find(h);
+    if (it == metrics_registry_.end() || it->second.model.count == 0)
+      return std::numeric_limits<float>::infinity();
+    return std::exp(it->second.model.nll_sum_nats /
+                    static_cast<float>(it->second.model.count));
+  }
+
+  /**
+   * @brief Get sampling-level perplexity from a metrics tracker
+   * @param h Metrics handle
+   * @return exp(average surprisal), INFINITY if no samples or invalid
+   */
+  float get_sampling_ppl(MetricsHandle h) const {
+    if (h == 0) return std::numeric_limits<float>::infinity();
+    auto it = metrics_registry_.find(h);
+    if (it == metrics_registry_.end() || it->second.sampling.count == 0)
+      return std::numeric_limits<float>::infinity();
+    return std::exp(it->second.sampling.nll_sum_nats /
+                    static_cast<float>(it->second.sampling.count));
+  }
+
   // ===== BATCHED DECODE =====
 
   /**
@@ -708,20 +1022,20 @@ public:
 private:
   /// @brief Free owned resources (sampler, grammar, boundary tracker, metrics)
   void free_branch_resources(BranchState& slot) {
-    if (slot.sampler_chain) {
-      sampler::free_chain(slot.sampler_chain);
-      slot.sampler_chain = nullptr;
+    if (slot.sampler_chain != 0) {
+      free_sampler(slot.sampler_chain);
+      slot.sampler_chain = 0;
     }
-    if (slot.grammar) {
-      grammar::free_sampler(slot.grammar);
-      slot.grammar = nullptr;
+    if (slot.grammar != 0) {
+      free_grammar(slot.grammar);
+      slot.grammar = 0;
     }
     if (slot.boundary_tracker) {
       delete slot.boundary_tracker;
       slot.boundary_tracker = nullptr;
     }
     if (slot.metrics != 0) {
-      metrics::free_branch_metrics(slot.metrics);
+      free_metrics(slot.metrics);
       slot.metrics = 0;
     }
   }
@@ -734,10 +1048,10 @@ private:
     slot.model = nullptr;
     slot.seq_id = NO_LEASE;
     slot.position = 0;
-    slot.sampler_chain = nullptr;
-    slot.grammar = nullptr;
+    slot.sampler_chain = 0;
+    slot.grammar = 0;
     slot.metrics = 0;
-    slot.has_dist_sampler = false;
+    slot.cached_params = CachedSamplingParams{};
     slot.last_token = -1;
     slot.last_candidates.clear();
     slot.logits_snapshot.clear();
@@ -807,6 +1121,17 @@ private:
   /// Reusable scratch buffers for batched decode. Safe without locking because
   /// BranchStore requires external synchronization (caller's mutex).
   decode::Scratch scratch_;
+
+  // ===== Handle registries (instance-scoped, not global static) =====
+
+  std::unordered_map<SamplerChainHandle, SamplerChainEntry> sampler_chains_;
+  SamplerChainHandle next_sampler_handle_ = 1;
+
+  std::unordered_map<GrammarHandle, GrammarEntry> grammars_;
+  GrammarHandle next_grammar_handle_ = 1;
+
+  std::unordered_map<MetricsHandle, metrics::BranchMetricsState> metrics_registry_;
+  MetricsHandle next_metrics_handle_ = 1;
 };
 
 
@@ -870,17 +1195,15 @@ inline BranchHandle create(
   state->has_logits = false;
   state->candidates_buffer.resize(state->n_vocab);
 
-  state->sampler_chain = sampler::create_chain(params);
-
-  float temperature = ::lloyal::detail::as_value(params.temperature, 0.8f);
-  state->has_dist_sampler = (temperature > 0.0f);
+  state->sampler_chain = s.create_sampler(params);
+  state->cached_params = snapshot_params(params);
 
   if (grammar_str && grammar_str[0] != '\0') {
-    state->grammar = grammar::init_sampler(model, grammar_str);
+    state->grammar = s.create_grammar(model, grammar_str);
   }
 
   state->boundary_tracker = boundary_tracker;
-  state->metrics = metrics::create_branch_metrics();
+  state->metrics = s.create_metrics();
 
   LLOYAL_LOG_DEBUG("[branch::create] Created branch handle=%u seq=%d pos=%d",
                    handle, seq_id, start_pos);
@@ -949,13 +1272,13 @@ inline BranchHandle fork(BranchHandle source, BranchStore& s) {
   src->children.push_back(new_handle);
 
   // Clone sampler chain
-  if (src->sampler_chain) {
-    dst->sampler_chain = sampler::clone_chain(src->sampler_chain);
-    dst->has_dist_sampler = src->has_dist_sampler;
+  if (src->sampler_chain != 0) {
+    dst->sampler_chain = s.clone_sampler(src->sampler_chain);
   }
+  dst->cached_params = src->cached_params;
 
-  if (src->grammar) {
-    dst->grammar = grammar::clone_sampler(src->grammar);
+  if (src->grammar != 0) {
+    dst->grammar = s.clone_grammar(src->grammar);
   }
 
   if (src->boundary_tracker) {
@@ -963,7 +1286,7 @@ inline BranchHandle fork(BranchHandle source, BranchStore& s) {
   }
 
   if (src->metrics != 0) {
-    dst->metrics = metrics::clone_branch_metrics(src->metrics);
+    dst->metrics = s.clone_metrics(src->metrics);
   }
 
   dst->last_token = src->last_token;
@@ -1107,6 +1430,83 @@ inline void clear_steer(
   state->steer_fn = nullptr;
 
   LLOYAL_LOG_DEBUG("[branch::clear_steer] Cleared steer callback on handle=%u", handle);
+}
+
+/**
+ * @brief Replace a branch's sampler chain with new parameters
+ *
+ * Memoized: if the new params match the cached snapshot, this is a no-op.
+ * Otherwise frees the old chain and creates a new one.
+ *
+ * Primary use case: Entropy-based Dynamic Temperature (EDT), where temperature
+ * changes per-token based on model uncertainty.
+ *
+ * @tparam P Any type satisfying the SamplingParamsLike concept
+ * @param handle Branch to modify
+ * @param params New sampling parameters
+ * @param s Branch store
+ * @throws std::runtime_error if handle is invalid
+ */
+template <SamplingParamsLike P>
+inline void set_sampler_params(BranchHandle handle, const P& params, BranchStore& s) {
+  BranchState* state = s.get(handle);
+  if (!state) {
+    throw std::runtime_error("set_sampler_params: invalid branch handle");
+  }
+
+  CachedSamplingParams new_params = snapshot_params(params);
+  if (new_params == state->cached_params && state->sampler_chain != 0) {
+    return;  // Memoized — no rebuild needed
+  }
+
+  // Free old chain
+  if (state->sampler_chain != 0) {
+    s.free_sampler(state->sampler_chain);
+  }
+
+  // Create new chain
+  state->sampler_chain = s.create_sampler(params);
+  state->cached_params = new_params;
+
+  LLOYAL_LOG_DEBUG("[branch::set_sampler_params] Rebuilt chain on handle=%u temp=%.3f",
+                   handle, new_params.temperature);
+}
+
+/**
+ * @brief Replace a branch's grammar constraint
+ *
+ * Frees the old grammar (if any) and attaches a new one. Pass nullptr or
+ * empty string to remove grammar constraints entirely.
+ *
+ * @param handle Branch to modify
+ * @param model Llama model (for vocab)
+ * @param grammar_str GBNF grammar string, or nullptr to remove
+ * @param s Branch store
+ * @throws std::runtime_error if handle is invalid
+ */
+inline void set_grammar(
+    BranchHandle handle,
+    const llama_model* model,
+    const char* grammar_str,
+    BranchStore& s) {
+  BranchState* state = s.get(handle);
+  if (!state) {
+    throw std::runtime_error("set_grammar: invalid branch handle");
+  }
+
+  // Free old grammar
+  if (state->grammar != 0) {
+    s.free_grammar(state->grammar);
+    state->grammar = 0;
+  }
+
+  // Create new grammar if provided
+  if (grammar_str && grammar_str[0] != '\0') {
+    state->grammar = s.create_grammar(model, grammar_str);
+  }
+
+  LLOYAL_LOG_DEBUG("[branch::set_grammar] %s grammar on handle=%u",
+                   state->grammar != 0 ? "Set" : "Cleared", handle);
 }
 
 /**
@@ -1375,7 +1775,8 @@ inline llama_token sample(BranchHandle handle, BranchStore& s) {
 
 
   BranchState* state = s.get(handle);
-  if (!state || !state->sampler_chain) {
+  llama_sampler* chain = state ? s.get_sampler_chain(state->sampler_chain) : nullptr;
+  if (!state || !chain) {
     return -1;
   }
 
@@ -1400,8 +1801,9 @@ inline llama_token sample(BranchHandle handle, BranchStore& s) {
       false};
 
   // Apply grammar first if present (via anti-corruption layer)
-  if (state->grammar) {
-    grammar::apply(state->grammar, &cur_p);
+  llama_sampler* gram = s.get_grammar_sampler(state->grammar);
+  if (gram) {
+    grammar::apply(gram, &cur_p);
   }
 
   // Apply logit bias if present — O(n_biases) via direct index
@@ -1425,7 +1827,7 @@ inline llama_token sample(BranchHandle handle, BranchStore& s) {
   }
 
   // Apply sampler chain (via anti-corruption layer)
-  sampler::apply(state->sampler_chain, &cur_p);
+  sampler::apply(chain, &cur_p);
 
   if (cur_p.selected == -1) {
     return -1;
@@ -1471,21 +1873,23 @@ inline void accept_token(
   if (!state) return;
 
   // Accept in grammar (via anti-corruption layer)
-  if (state->grammar) {
-    grammar::accept(state->grammar, token);
+  llama_sampler* gram = s.get_grammar_sampler(state->grammar);
+  if (gram) {
+    grammar::accept(gram, token);
   }
 
   // Accept in sampler chain for penalty tracking (via anti-corruption layer)
-  if (state->sampler_chain) {
-    sampler::accept(state->sampler_chain, token);
+  llama_sampler* chain = s.get_sampler_chain(state->sampler_chain);
+  if (chain) {
+    sampler::accept(chain, token);
   }
 
   // Update model-level perplexity (from raw logits)
   // Guard on has_logits to avoid computing surprisal from zero-filled buffer
   if (state->metrics != 0 && state->has_logits) {
-    float model_surprisal = metrics::model_surprisal(
+    float ms = metrics::model_surprisal(
         state->logits_snapshot.data(), state->n_vocab, token);
-    metrics::add_model_surprisal(state->metrics, model_surprisal);
+    s.add_model_surprisal(state->metrics, ms);
   }
 
   // Update sampling-level perplexity (from filtered candidates)
@@ -1503,13 +1907,13 @@ inline void accept_token(
     }
 
     // Compute sampling-level surprisal
-    float sampling_surprisal = metrics::sampling_surprisal(
+    float ss = metrics::sampling_surprisal(
         candidate_logits.data(),
         candidate_ids.data(),
         static_cast<int>(candidate_logits.size()),
         token
     );
-    metrics::add_sampling_surprisal(state->metrics, sampling_surprisal);
+    s.add_sampling_surprisal(state->metrics, ss);
   }
 }
 
@@ -1535,7 +1939,8 @@ inline void apply_grammar(
 
 
   BranchState* state = s.get(handle);
-  if (!state || !state->grammar) return;
+  llama_sampler* gram = state ? s.get_grammar_sampler(state->grammar) : nullptr;
+  if (!state || !gram) return;
 
   // Use pre-allocated candidates buffer if size matches, otherwise allocate
   std::vector<llama_token_data>* candidates_ptr;
@@ -1560,7 +1965,7 @@ inline void apply_grammar(
       -1,
       false};
 
-  grammar::apply(state->grammar, &cur_p);
+  grammar::apply(gram, &cur_p);
 
   // Copy masked logits back
   for (int i = 0; i < n_vocab; i++) {
@@ -1607,8 +2012,9 @@ inline std::vector<std::pair<llama_token, float>> get_legal_priors(
       false};
 
   // Apply grammar to mask illegal tokens
-  if (state->grammar) {
-    grammar::apply(state->grammar, &cur_p);
+  llama_sampler* gram = s.get_grammar_sampler(state->grammar);
+  if (gram) {
+    grammar::apply(gram, &cur_p);
   }
 
   // Collect legal candidates (logit is finite after grammar masking)
@@ -1683,8 +2089,9 @@ inline float get_legal_logsumexp(BranchHandle handle, BranchStore& s) {
       false};
 
   // Apply grammar to mask illegal tokens
-  if (state->grammar) {
-    grammar::apply(state->grammar, &cur_p);
+  llama_sampler* gram = s.get_grammar_sampler(state->grammar);
+  if (gram) {
+    grammar::apply(gram, &cur_p);
   }
 
   // Numerically stable logsumexp over legal tokens (finite logits only)
@@ -1732,7 +2139,8 @@ inline bool is_token_legal(
   }
 
   // No grammar = all tokens legal
-  if (!state->grammar) {
+  llama_sampler* gram = s.get_grammar_sampler(state->grammar);
+  if (!gram) {
     return true;
   }
 
@@ -1751,7 +2159,7 @@ inline bool is_token_legal(
   };
 
   // Apply grammar - will set logit to -INFINITY if illegal
-  grammar::apply(state->grammar, &cur_p);
+  grammar::apply(gram, &cur_p);
 
   return std::isfinite(single_candidate.logit);
 }
@@ -1844,7 +2252,7 @@ inline float get_perplexity(BranchHandle handle, BranchStore& s) {
   if (!state || state->metrics == 0) {
     return std::numeric_limits<float>::infinity();
   }
-  return metrics::get_model_ppl(state->metrics);
+  return s.get_model_ppl(state->metrics);
 }
 
 /**
@@ -1864,7 +2272,7 @@ inline float get_sampling_perplexity(BranchHandle handle, BranchStore& s) {
   if (!state || state->metrics == 0) {
     return std::numeric_limits<float>::infinity();
   }
-  return metrics::get_sampling_ppl(state->metrics);
+  return s.get_sampling_ppl(state->metrics);
 }
 
 /**
@@ -2063,6 +2471,20 @@ public:
   bool is_eog(llama_token token) const {
     const BranchState* st = store_ ? store_->get(handle_) : nullptr;
     return st && st->model ? tokenizer::is_eog(st->model, token) : false;
+  }
+
+  /// @brief Replace sampler chain with new parameters (memoized)
+  /// @see branch::set_sampler_params()
+  template <SamplingParamsLike P>
+  void setSamplerParams(const P& params) {
+    branch::set_sampler_params(handle_, params, *store_);
+  }
+
+  /// @brief Replace grammar constraint (nullptr/empty to remove)
+  /// @see branch::set_grammar()
+  void setGrammar(const char* grammar_str) {
+    const BranchState* st = store_ ? store_->get(handle_) : nullptr;
+    branch::set_grammar(handle_, st ? st->model : nullptr, grammar_str, *store_);
   }
 
   // ===== ACCESSORS =====

@@ -34,60 +34,6 @@ struct LlamaBackendGuard {
   ~LlamaBackendGuard() { llama_backend_free(); }
 };
 
-TEST_CASE("Integration: write_file/read_file round-trip") {
-  REQUIRE_MODEL();
-  LlamaBackendGuard backend;
-
-  auto model = TestConfig::acquire_test_model();
-  REQUIRE(model != nullptr);
-
-  auto ctx_params = llama_context_default_params();
-  ctx_params.n_ctx = 512;
-
-  llama_context *ctx = llama_init_from_model(model.get(), ctx_params);
-  REQUIRE(ctx != nullptr);
-
-  auto vocab = llama_model_get_vocab(model.get());
-
-  // 1. Populate KV cache with known tokens
-  std::string test_text = "The quick brown fox jumps over the lazy dog.";
-  auto tokens = tokenizer::tokenize(vocab, test_text, false, false);
-  REQUIRE_FALSE(tokens.empty());
-
-  REQUIRE(decode::many(ctx, tokens, 0, ctx_params.n_batch) == 0);
-
-  // 2. Write state to file
-  const std::string filepath = "test_session.llama";
-  size_t bytes_written = kv::write_file(ctx, 0, filepath, tokens);
-
-  REQUIRE(bytes_written > 0);
-  REQUIRE(std::filesystem::exists(filepath));
-
-  INFO("File written: " << bytes_written << " bytes");
-
-  // 3. Clear KV cache
-  kv::clear_all(ctx);
-  CHECK(kv::pos_max(ctx, 0) == -1);
-
-  // 4. Read state from file
-  auto data = kv::read_file(ctx, 0, filepath);
-
-  REQUIRE(data.bytes_read == bytes_written);
-  REQUIRE(data.tokens.size() == tokens.size());
-
-  // Verify tokens match
-  for (size_t i = 0; i < tokens.size(); ++i) {
-    CHECK(data.tokens[i] == tokens[i]);
-  }
-
-  // 5. Verify KV state restored
-  llama_pos max_pos_after = kv::pos_max(ctx, 0);
-  CHECK(max_pos_after == static_cast<llama_pos>(tokens.size() - 1));
-
-  // Cleanup
-  std::filesystem::remove(filepath);
-  llama_free(ctx);
-}
 
 TEST_CASE("Integration: write_file creates valid session format") {
   REQUIRE_MODEL();

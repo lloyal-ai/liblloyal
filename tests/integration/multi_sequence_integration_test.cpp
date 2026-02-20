@@ -137,14 +137,13 @@ TEST_CASE("Integration: clearing one sequence doesn't affect others") {
   llama_free(ctx);
 }
 
-TEST_CASE("Integration: backward compatibility - default seq_id=0") {
+TEST_CASE("Integration: backward compatibility - default and explicit seq_id=0") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
   auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
-  // Standard single-sequence context (n_seq_max defaults to 1)
   auto ctx_params = llama_context_default_params();
   ctx_params.n_ctx = 256;
   ctx_params.n_batch = 64;
@@ -156,39 +155,17 @@ TEST_CASE("Integration: backward compatibility - default seq_id=0") {
   auto tokens = tokenizer::tokenize(vocab, "Hello", false, false);
   REQUIRE_FALSE(tokens.empty());
 
-  // Old API (no seq_id parameter) should still work
+  // Default (no seq_id parameter) works
   REQUIRE(decode::many(ctx, tokens, 0, ctx_params.n_batch) == 0);
+  llama_pos pos_default = kv::pos_max(ctx, 0);
+  CHECK(pos_default >= 0);
 
-  // Check seq 0 has tokens
-  llama_pos pos = kv::pos_max(ctx, 0);
-  CHECK(pos >= 0);
+  kv::clear_all(ctx);
 
-  llama_free(ctx);
-}
-
-TEST_CASE("Integration: decode with explicit seq_id=0 matches default") {
-  REQUIRE_MODEL();
-  LlamaBackendGuard backend;
-
-  auto model = TestConfig::acquire_test_model();
-  REQUIRE(model != nullptr);
-
-  auto ctx_params = llama_context_default_params();
-  ctx_params.n_ctx = 256;
-  ctx_params.n_batch = 64;
-
-  llama_context *ctx = llama_init_from_model(model.get(), ctx_params);
-  REQUIRE(ctx != nullptr);
-
-  auto vocab = llama_model_get_vocab(model.get());
-  auto tokens = tokenizer::tokenize(vocab, "Test", false, false);
-  REQUIRE_FALSE(tokens.empty());
-
-  // Explicit seq_id=0 should work same as default
+  // Explicit seq_id=0 produces same result
   REQUIRE(decode::many(ctx, tokens, 0, ctx_params.n_batch, 0) == 0);
-
-  llama_pos pos = kv::pos_max(ctx, 0);
-  CHECK(pos >= 0);
+  llama_pos pos_explicit = kv::pos_max(ctx, 0);
+  CHECK(pos_explicit == pos_default);
 
   llama_free(ctx);
 }

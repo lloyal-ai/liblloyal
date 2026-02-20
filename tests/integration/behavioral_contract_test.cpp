@@ -219,48 +219,6 @@ TEST_CASE("Behavioral: KV cache serialization round-trip preserves state") {
   llama_free(ctx);
 }
 
-TEST_CASE("Behavioral: Greedy sampling is deterministic") {
-  REQUIRE_MODEL();
-  LlamaBackendGuard backend;
-
-  auto model = TestConfig::acquire_test_model();
-  REQUIRE(model != nullptr);
-
-  auto ctx_params = llama_context_default_params();
-  ctx_params.n_ctx = 512;
-
-  llama_context *ctx = llama_init_from_model(model.get(), ctx_params);
-  REQUIRE(ctx != nullptr);
-
-  auto vocab = llama_model_get_vocab(model.get());
-
-  // Decode a token to generate logits
-  llama_batch batch = llama_batch_init(1, 0, 1);
-  batch.n_tokens = 1;
-  batch.token[0] = 1; // BOS
-  batch.pos[0] = 0;
-  batch.seq_id[0][0] = 0;
-  batch.n_seq_id[0] = 1;
-  batch.logits[0] = 1; // Request logits for sampling
-
-  REQUIRE(llama_decode(ctx, batch) == 0);
-
-  // Sample token (greedy)
-  llama_token sampled1 = sampler::greedy(ctx, vocab);
-
-  // Sample again (should be identical - no randomness)
-  llama_token sampled2 = sampler::greedy(ctx, vocab);
-
-  CHECK(sampled1 == sampled2);
-
-  // Verify sampled token is valid
-  int vocab_size = llama_vocab_n_tokens(vocab);
-  CHECK(sampled1 >= 0);
-  CHECK(sampled1 < vocab_size);
-
-  llama_batch_free(batch);
-  llama_free(ctx);
-}
 
 TEST_CASE("Behavioral: Detokenization produces consistent text") {
   REQUIRE_MODEL();

@@ -56,8 +56,8 @@ BranchStore store;
 store.init_tenancy(ctx);
 
 // Shared prompt: "Explain quantum entanglement"
-auto root = Branch::create(ctx, model, store, prompt_len, params);
-root.capture_logits();
+auto root = Branch::create(ctx, model, store, 0, params);
+root.decode_and_capture_batch(prompt_tokens.data(), prompt_tokens.size());
 
 // Fork 4 branches — each will get a different reasoning prefix
 auto analogy  = root.fork();
@@ -94,9 +94,33 @@ auto* winner = *std::min_element(branches.begin(), branches.end(),
 store.retainOnly(winner->handle());
 ```
 
-**What `fork()` clones:** KV cache sequence, sampler chain (penalties, PRNG, filters), grammar (GBNF parser state), metrics (model + sampling perplexity), logits snapshot, logit bias.
+**What `fork()` clones:** KV cache sequence, sampler chain handle (penalties, PRNG, filters), grammar handle (GBNF parser state), metrics handle (model + sampling perplexity), logits snapshot, logit bias, cached sampler params.
 
 **What `fork()` does NOT clone:** steer callback (captures references, unsafe to copy).
+
+## Hot-Swap Sampler & Grammar
+
+Sampler chains, grammars, and metrics live in handle-based registries on BranchStore — instance-scoped, no global state. `set_sampler_params()` rebuilds the sampler chain with memoization (no-op if params unchanged). `set_grammar()` hot-swaps the grammar constraint.
+
+```cpp
+// EDT (Entropy-based Dynamic Temperature): adapt temperature per token
+for (int i = 0; i < max_tokens; i++) {
+    float entropy = metrics::model_entropy(root.logits(), root.n_vocab());
+    float temp = T0 * std::pow(N, THETA / std::max(entropy, 0.1f));
+    root.setSamplerParams(MyParams{.temperature = temp});  // memoized — no-op if temp unchanged
+    auto tok = root.sample();
+    if (root.is_eog(tok)) break;
+    root.accept(tok);
+    root.decode_and_capture_one(tok);
+}
+
+// Hot-swap grammar mid-generation
+root.setGrammar(json_gbnf);     // constrain to JSON
+auto tok = root.sample();       // grammar-legal token
+root.setGrammar(nullptr);       // remove constraint
+```
+
+Handles are freed automatically on `prune()` — no manual cleanup. `fork()` deep-clones all registry entries.
 
 ## KV Tenancy
 
@@ -135,8 +159,8 @@ The building blocks that compose into the above:
 - **Tokenization** — Two-pass safe buffer sizing, special token handling
 - **Decoding** — Continuous tree batching, cross-sequence dispatch packing
 - **KV Cache** — Tenancy (vacancy manager), sequence ops, state snapshots, long-context compression
-- **Sampling** — Grammar-constrained, persistent chains, 52 parameters
-- **Metrics** — Dual-level entropy/surprisal, rolling perplexity, cloneable state
+- **Sampling** — Grammar-constrained, persistent chains, hot-swap with memoization
+- **Metrics** — Dual-level entropy/surprisal, rolling perplexity, cloneable state (BranchStore-scoped)
 - **Embeddings** — Pooled extraction, L2 normalization, similarity
 - **Chat Templates** — Jinja2 formatting with fallbacks
 
@@ -174,8 +198,8 @@ using namespace lloyal::branch;
 BranchStore store;
 store.init_tenancy(ctx);
 
-auto root = Branch::create(ctx, model, store, prompt_len, params);
-root.capture_logits();
+auto root = Branch::create(ctx, model, store, 0, params);
+root.decode_and_capture_batch(prompt_tokens.data(), prompt_tokens.size());
 
 // Fork 8 candidates — KV prefix shared, each gets unique PRNG
 std::vector<Branch> candidates;
@@ -208,8 +232,8 @@ store.retainOnly(winner.handle());
 BranchStore store;
 store.init_tenancy(ctx);
 
-auto root = Branch::create(ctx, model, store, prompt_len, params);
-root.capture_logits();
+auto root = Branch::create(ctx, model, store, 0, params);
+root.decode_and_capture_batch(prompt_tokens.data(), prompt_tokens.size());
 
 for (int turn = 0; turn < max_turns; turn++) {
     // Expand: fork children, each samples a different continuation
@@ -248,7 +272,7 @@ for (int turn = 0; turn < max_turns; turn++) {
 
 - **Header-only** — All implementations inline in `include/lloyal/*.hpp`
 - **Managed KV residency** — `kv::tenancy` tracks seq_id leases; consumers never see raw seq_ids
-- **Handle-based APIs** — Generation counters prevent ABA bugs on slot reuse
+- **Handle-based APIs** — Generation counters prevent ABA bugs on slot reuse; sampler chains, grammars, and metrics live in BranchStore-scoped registries (no global state)
 - **Shared model weights** — Thread-safe registry enables multi-context with single model load
 - **Zero runtime dependencies** — Only requires C++20 standard library + llama.cpp
 - **Multi-binding** — C++20 concepts decouple from binding-specific types (Node.js, React Native, CLI)
@@ -287,8 +311,8 @@ s.source_files = "liblloyal/include/**/*.{hpp,h}"
 
 ## Testing
 
-- 260+ unit tests (tenancy, topology, continuous tree batching, RESTRICT/CASCADE)
-- Integration tests with real llama.cpp (seq recycling, retainOnly, multi-tag KV)
+- 256 unit tests (tenancy, topology, continuous tree batching, RESTRICT/CASCADE, handle registries)
+- 128 integration tests with real llama.cpp (multi-step generation, ABA prevention, batch error paths, retainOnly, hot-swap sampler/grammar)
 - Sanitizer validation (ASan, UBSan, LeakSan)
 
 ```bash

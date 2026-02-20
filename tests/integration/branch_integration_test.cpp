@@ -12,6 +12,9 @@
  * - RAII Branch wrapper cleanup
  * - Tenancy lifecycle (seq_id recycling, retainOnly, drain)
  * - Topology (parent/child edges, pruneSubtree CASCADE)
+ * - set_sampler_params() memoization and greedy↔stochastic transitions
+ * - set_grammar() hot-swap, removal, and fork propagation
+ * - Handle registry cleanup on prune and slot reuse
  */
 
 #include <cmath>
@@ -457,7 +460,7 @@ TEST_CASE("branch integration: perplexity tracking across fork") {
 
   BranchState* pstate = store.get(parent);
   REQUIRE(pstate);
-  metrics::add_model_surprisal(pstate->metrics, surprisal);
+  store.add_model_surprisal(pstate->metrics, surprisal);
 
   float parent_ppl = get_perplexity(parent, store);
   CHECK(std::isfinite(parent_ppl));
@@ -470,7 +473,7 @@ TEST_CASE("branch integration: perplexity tracking across fork") {
 
   BranchState* cstate = store.get(child);
   REQUIRE(cstate);
-  metrics::add_model_surprisal(cstate->metrics, 2.0f);
+  store.add_model_surprisal(cstate->metrics, 2.0f);
 
   CHECK(std::abs(get_perplexity(parent, store) - parent_ppl) < 0.001f);
   CHECK(get_perplexity(child, store) != parent_ppl);
@@ -1746,4 +1749,803 @@ TEST_CASE("branch integration: drain then llama_free ordering") {
   llama_free(ctx);
 
   // BranchStore destructor runs — no crash
+}
+
+// ============================================================================
+// set_sampler_params() Tests
+// ============================================================================
+
+TEST_CASE("branch integration: set_sampler_params changes sampling behavior") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 512;
+  cparams.n_batch = 64;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+
+  // Start greedy (temp=0)
+  TestParams greedy_params;
+  greedy_params.temperature = 0.0f;
+  greedy_params.top_k = 0;
+  greedy_params.top_p = 1.0f;
+  greedy_params.min_p = 0.0f;
+
+  BranchHandle h = create(ctx, model.get(), store, 0, greedy_params, 64);
+  REQUIRE(h != INVALID_HANDLE);
+
+  const llama_vocab* vocab = llama_model_get_vocab(model.get());
+  auto prompt = tokenizer::tokenize(vocab, "The capital of France is", true, false);
+  REQUIRE(!prompt.empty());
+  decode_and_capture_batch(h, prompt.data(), prompt.size(), store);
+
+  // Sample greedy — deterministic
+  llama_token greedy_tok = sample(h, store);
+  REQUIRE(greedy_tok >= 0);
+
+  // Switch to stochastic
+  TestParams stochastic_params;
+  stochastic_params.temperature = 1.5f;
+  stochastic_params.seed = 42;
+  stochastic_params.top_k = 0;
+  stochastic_params.top_p = 1.0f;
+  stochastic_params.min_p = 0.0f;
+
+  set_sampler_params(h, stochastic_params, store);
+
+  // Sample multiple times — at temp=1.5 with a real distribution,
+  // at least one should differ from the greedy argmax
+  bool found_different = false;
+  for (int i = 0; i < 20; ++i) {
+    llama_token tok = sample(h, store);
+    if (tok != greedy_tok) {
+      found_different = true;
+      break;
+    }
+  }
+  CHECK(found_different);
+
+  MESSAGE("Greedy token: " << greedy_tok << ", stochastic diverged: " << found_different);
+
+  prune(h, store);
+  llama_free(ctx);
+}
+
+TEST_CASE("branch integration: set_sampler_params memoization skips rebuild") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 512;
+  cparams.n_batch = 64;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+  TestParams params;
+  params.temperature = 0.8f;
+  params.seed = 100;
+
+  BranchHandle h = create(ctx, model.get(), store, 0, params, 64);
+  REQUIRE(h != INVALID_HANDLE);
+
+  BranchState* state = store.get(h);
+  REQUIRE(state);
+  SamplerChainHandle original_handle = state->sampler_chain;
+  CHECK(original_handle != 0);
+
+  // Same params → memoized (handle unchanged)
+  set_sampler_params(h, params, store);
+  state = store.get(h);
+  CHECK(state->sampler_chain == original_handle);
+
+  // Different params → rebuild (handle changed)
+  TestParams different;
+  different.temperature = 0.3f;
+  different.seed = 200;
+
+  set_sampler_params(h, different, store);
+  state = store.get(h);
+  CHECK(state->sampler_chain != original_handle);
+  CHECK(state->sampler_chain != 0);
+
+  MESSAGE("Original handle: " << original_handle
+          << ", after rebuild: " << state->sampler_chain);
+
+  prune(h, store);
+  llama_free(ctx);
+}
+
+TEST_CASE("branch integration: set_sampler_params greedy-stochastic transition") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 512;
+  cparams.n_batch = 64;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+
+  // Start greedy
+  TestParams greedy;
+  greedy.temperature = 0.0f;
+
+  BranchHandle h = create(ctx, model.get(), store, 0, greedy, 64);
+  REQUIRE(h != INVALID_HANDLE);
+
+  BranchState* state = store.get(h);
+  REQUIRE(state);
+  CHECK_FALSE(store.sampler_has_dist(state->sampler_chain));
+
+  // Switch to stochastic
+  TestParams stochastic;
+  stochastic.temperature = 0.8f;
+  stochastic.seed = 42;
+
+  set_sampler_params(h, stochastic, store);
+  state = store.get(h);
+  CHECK(store.sampler_has_dist(state->sampler_chain));
+
+  // Switch back to greedy
+  set_sampler_params(h, greedy, store);
+  state = store.get(h);
+  CHECK_FALSE(store.sampler_has_dist(state->sampler_chain));
+
+  MESSAGE("Greedy→stochastic→greedy transitions: has_dist flag correct");
+
+  prune(h, store);
+  llama_free(ctx);
+}
+
+// ============================================================================
+// set_grammar() Tests
+// ============================================================================
+
+TEST_CASE("branch integration: set_grammar hot-swap constrains output") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 512;
+  cparams.n_batch = 64;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+  TestParams params;
+  params.temperature = 0.0f;  // Greedy for determinism
+
+  // Create WITHOUT grammar
+  BranchHandle h = create(ctx, model.get(), store, 0, params, 64);
+  REQUIRE(h != INVALID_HANDLE);
+
+  BranchState* state = store.get(h);
+  CHECK(state->grammar == 0);  // No grammar initially
+
+  const llama_vocab* vocab = llama_model_get_vocab(model.get());
+  auto prompt = tokenizer::tokenize(vocab, "{\"key\":", true, false);
+  REQUIRE(!prompt.empty());
+  decode_and_capture_batch(h, prompt.data(), prompt.size(), store);
+
+  // Hot-swap grammar: JSON value must be a quoted string
+  const char* json_grammar =
+      "root ::= \"{\" ws \"\\\"key\\\"\" ws \":\" ws value ws \"}\"\n"
+      "value ::= \"\\\"\" [a-z]+ \"\\\"\"\n"
+      "ws ::= [ \\t\\n]*\n";
+
+  set_grammar(h, model.get(), json_grammar, store);
+
+  state = store.get(h);
+  CHECK(state->grammar != 0);  // Grammar now active
+
+  // Sample — grammar should constrain to valid tokens
+  llama_token tok = sample(h, store);
+  REQUIRE(tok >= 0);
+
+  // The grammar requires a quoted string value — first legal token should be '"'
+  std::string text = tokenizer::detokenize(vocab, tok, false);
+  MESSAGE("First token after grammar hot-swap: '" << text << "' (id=" << tok << ")");
+
+  // Verify grammar sampler is accessible
+  CHECK(store.get_grammar_sampler(state->grammar) != nullptr);
+
+  prune(h, store);
+  llama_free(ctx);
+}
+
+TEST_CASE("branch integration: set_grammar removal clears constraint") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 512;
+  cparams.n_batch = 64;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+  TestParams params;
+
+  // Create WITH grammar
+  const char* json_grammar =
+      "root ::= \"{\" ws \"\\\"key\\\"\" ws \":\" ws value ws \"}\"\n"
+      "value ::= \"\\\"\" [a-z]+ \"\\\"\"\n"
+      "ws ::= [ \\t\\n]*\n";
+
+  BranchHandle h = create(ctx, model.get(), store, 0, params, 64, json_grammar);
+  REQUIRE(h != INVALID_HANDLE);
+
+  BranchState* state = store.get(h);
+  GrammarHandle original_grammar = state->grammar;
+  CHECK(original_grammar != 0);
+
+  // Remove grammar
+  set_grammar(h, model.get(), "", store);
+  state = store.get(h);
+  CHECK(state->grammar == 0);
+
+  // Old handle should be freed from registry
+  CHECK(store.get_grammar_sampler(original_grammar) == nullptr);
+
+  MESSAGE("Grammar removed: handle " << original_grammar << " freed");
+
+  prune(h, store);
+  llama_free(ctx);
+}
+
+TEST_CASE("branch integration: set_grammar cloned on fork after hot-swap") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 1024;
+  cparams.n_batch = 64;
+  cparams.n_seq_max = 4;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+  TestParams params;
+
+  // Create WITHOUT grammar, then hot-swap one in
+  BranchHandle parent = create(ctx, model.get(), store, 0, params, 64);
+  REQUIRE(parent != INVALID_HANDLE);
+
+  const llama_vocab* vocab = llama_model_get_vocab(model.get());
+  auto prompt = tokenizer::tokenize(vocab, "{\"key\":", true, false);
+  REQUIRE(!prompt.empty());
+  decode_and_capture_batch(parent, prompt.data(), prompt.size(), store);
+
+  const char* json_grammar =
+      "root ::= \"{\" ws \"\\\"key\\\"\" ws \":\" ws value ws \"}\"\n"
+      "value ::= \"\\\"\" [a-z]+ \"\\\"\"\n"
+      "ws ::= [ \\t\\n]*\n";
+
+  set_grammar(parent, model.get(), json_grammar, store);
+
+  BranchState* pstate = store.get(parent);
+  GrammarHandle parent_grammar = pstate->grammar;
+  CHECK(parent_grammar != 0);
+
+  // Fork — child should get independent grammar clone
+  BranchHandle child = fork(parent, store);
+  REQUIRE(child != INVALID_HANDLE);
+
+  BranchState* cstate = store.get(child);
+  CHECK(cstate->grammar != 0);
+  CHECK(cstate->grammar != parent_grammar);  // Independent handle
+
+  // Both grammars should be valid
+  CHECK(store.get_grammar_sampler(pstate->grammar) != nullptr);
+  CHECK(store.get_grammar_sampler(cstate->grammar) != nullptr);
+
+  // Different underlying pointers (deep clone)
+  CHECK(store.get_grammar_sampler(pstate->grammar)
+        != store.get_grammar_sampler(cstate->grammar));
+
+  MESSAGE("Parent grammar: " << parent_grammar
+          << ", child grammar: " << cstate->grammar
+          << " (independent clones)");
+
+  pruneSubtree(parent, store);
+  llama_free(ctx);
+}
+
+// ============================================================================
+// Handle Registry Cleanup Tests
+// ============================================================================
+
+TEST_CASE("branch integration: handle registry cleanup on prune") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 512;
+  cparams.n_batch = 64;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+  TestParams params;
+
+  const char* json_grammar =
+      "root ::= \"{\" ws \"\\\"key\\\"\" ws \":\" ws value ws \"}\"\n"
+      "value ::= \"\\\"\" [a-z]+ \"\\\"\"\n"
+      "ws ::= [ \\t\\n]*\n";
+
+  BranchHandle h = create(ctx, model.get(), store, 0, params, 64, json_grammar);
+  REQUIRE(h != INVALID_HANDLE);
+
+  BranchState* state = store.get(h);
+  REQUIRE(state);
+
+  // Record all handles
+  SamplerChainHandle sc = state->sampler_chain;
+  GrammarHandle gr = state->grammar;
+  MetricsHandle mt = state->metrics;
+
+  CHECK(sc != 0);
+  CHECK(gr != 0);
+  CHECK(mt != 0);
+
+  // All handles should dereference successfully
+  CHECK(store.get_sampler_chain(sc) != nullptr);
+  CHECK(store.get_grammar_sampler(gr) != nullptr);
+
+  // Prune — should free all registry entries
+  prune(h, store);
+
+  // All handles should now be invalid (freed from registry)
+  CHECK(store.get_sampler_chain(sc) == nullptr);
+  CHECK(store.get_grammar_sampler(gr) == nullptr);
+
+  MESSAGE("Handles freed: sampler=" << sc << " grammar=" << gr << " metrics=" << mt);
+
+  llama_free(ctx);
+}
+
+TEST_CASE("branch integration: slot reuse does not leak sampler chain") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 512;
+  cparams.n_batch = 64;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+
+  // Store with capacity 2: slot 0 reserved, slot 1 is the ONLY usable slot.
+  BranchStore store(2);
+  store.init_tenancy(ctx);
+
+  const llama_vocab* vocab = llama_model_get_vocab(model.get());
+  auto prompt = tokenizer::tokenize(vocab, "The capital of France is", true, false);
+  REQUIRE(!prompt.empty());
+
+  // --- Branch A: stochastic (temp=0.8) ---
+  TestParams stochastic;
+  stochastic.temperature = 0.8f;
+  stochastic.seed = 42;
+
+  BranchHandle a = create(ctx, model.get(), store, 0, stochastic, 64);
+  REQUIRE(a != INVALID_HANDLE);
+
+  BranchState* astate = store.get(a);
+  CHECK(store.sampler_has_dist(astate->sampler_chain));  // Stochastic
+
+  prune(a, store);
+
+  // --- Branch B: greedy (temp=0) in same slot ---
+  kv::clear_all(ctx);
+
+  TestParams greedy;
+  greedy.temperature = 0.0f;
+  greedy.top_k = 0;
+  greedy.top_p = 1.0f;
+  greedy.min_p = 0.0f;
+
+  BranchHandle b = create(ctx, model.get(), store, 0, greedy, 64);
+  REQUIRE(b != INVALID_HANDLE);
+
+  BranchState* bstate = store.get(b);
+  CHECK_FALSE(store.sampler_has_dist(bstate->sampler_chain));  // Greedy
+
+  decode_and_capture_batch(b, prompt.data(), prompt.size(), store);
+
+  // Greedy sampling should be deterministic — sample twice, same token
+  llama_token tok1 = sample(b, store);
+  llama_token tok2 = sample(b, store);
+  CHECK(tok1 == tok2);  // FAILS if stochastic chain leaked from A
+
+  MESSAGE("Slot reuse: greedy tokens " << tok1 << "==" << tok2
+          << " (no stochastic leak)");
+
+  prune(b, store);
+  llama_free(ctx);
+}
+
+// ============================================================================
+// High-Fidelity Tests: Multi-Step Generation, ABA, Batch Errors, retainOnly
+// ============================================================================
+
+TEST_CASE("branch integration: multi-step generation loop with PPL and grammar") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 512;
+  cparams.n_batch = 64;
+  cparams.n_seq_max = 4;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+
+  // Grammar constraining output to a JSON object with lowercase string value
+  const char* json_grammar =
+      "root ::= \"{\" ws \"\\\"name\\\"\" ws \":\" ws value ws \"}\"\n"
+      "value ::= \"\\\"\" [a-z]+ \"\\\"\"\n"
+      "ws ::= [ \\t\\n]*\n";
+
+  TestParams params;
+  params.temperature = 0.0f;  // Greedy for determinism
+  params.top_k = 0;
+  params.top_p = 1.0f;
+  params.min_p = 0.0f;
+
+  BranchHandle h = create(ctx, model.get(), store, 0, params, 64, json_grammar);
+  REQUIRE(h != INVALID_HANDLE);
+
+  const llama_vocab* vocab = llama_model_get_vocab(model.get());
+  auto prompt = tokenizer::tokenize(vocab, "Output a JSON object with a name field:", true, false);
+  REQUIRE(!prompt.empty());
+  decode_and_capture_batch(h, prompt.data(), prompt.size(), store);
+
+  // Multi-step produce/accept/decode loop — 15 tokens
+  const int N = 15;
+  std::vector<llama_token> generated;
+  llama_pos expected_pos = static_cast<llama_pos>(prompt.size());
+
+  for (int i = 0; i < N; ++i) {
+    BranchState* state = store.get(h);
+    REQUIRE(state);
+
+    // Position must track correctly
+    CHECK(state->position == expected_pos);
+
+    // Sample
+    llama_token tok = sample(h, store);
+    REQUIRE(tok >= 0);
+    generated.push_back(tok);
+
+    // Accept — advances grammar, sampler penalties, metrics
+    accept_token(h, tok, store);
+
+    // Decode+capture for next step
+    decode_and_capture_one(h, tok, store);
+    expected_pos += 1;
+  }
+
+  // Position advanced correctly through entire loop
+  BranchState* final_state = store.get(h);
+  CHECK(final_state->position == static_cast<llama_pos>(prompt.size() + N));
+
+  // PPL was accumulated (model metrics count should equal N)
+  float model_ppl = get_perplexity(h, store);
+  CHECK(model_ppl > 0.0f);
+  CHECK(std::isfinite(model_ppl));
+
+  float sampling_ppl = get_sampling_perplexity(h, store);
+  CHECK(sampling_ppl > 0.0f);
+  CHECK(std::isfinite(sampling_ppl));
+
+  // Detokenize and verify grammar held — output should be valid JSON-ish
+  std::string output;
+  for (auto tok : generated) {
+    output += tokenizer::detokenize(vocab, tok, false);
+  }
+  MESSAGE("Multi-step output (" << N << " tokens): " << output);
+  // Grammar requires opening { — check first non-whitespace char
+  size_t first_nonws = output.find_first_not_of(" \t\n");
+  if (first_nonws != std::string::npos) {
+    CHECK(output[first_nonws] == '{');
+  }
+
+  prune(h, store);
+  llama_free(ctx);
+}
+
+TEST_CASE("branch integration: handle ABA prevention via generation counter") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 512;
+  cparams.n_batch = 64;
+  cparams.n_seq_max = 2;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+
+  // Capacity 2: slot 0 reserved, slot 1 is the only usable slot
+  BranchStore store(2);
+  store.init_tenancy(ctx);
+
+  TestParams params;
+  params.temperature = 0.0f;
+  params.top_k = 0;
+  params.top_p = 1.0f;
+  params.min_p = 0.0f;
+
+  // Create branch A — gets slot 1
+  BranchHandle a = create(ctx, model.get(), store, 0, params, 64);
+  REQUIRE(a != INVALID_HANDLE);
+
+  uint16_t a_index = handle_index(a);
+  uint16_t a_gen = handle_generation(a);
+  MESSAGE("Branch A: handle=" << a << " index=" << a_index << " gen=" << a_gen);
+
+  // Verify A is live
+  CHECK(store.get(a) != nullptr);
+
+  // Prune A — frees slot 1, increments generation
+  prune(a, store);
+  kv::clear_all(ctx);
+
+  // Stale handle A should now resolve to nullptr (generation mismatch)
+  CHECK(store.get(a) == nullptr);
+
+  // Create branch B — reuses slot 1 with incremented generation
+  BranchHandle b = create(ctx, model.get(), store, 0, params, 64);
+  REQUIRE(b != INVALID_HANDLE);
+
+  uint16_t b_index = handle_index(b);
+  uint16_t b_gen = handle_generation(b);
+  MESSAGE("Branch B: handle=" << b << " index=" << b_index << " gen=" << b_gen);
+
+  // Same slot, different generation
+  CHECK(b_index == a_index);
+  CHECK(b_gen == static_cast<uint16_t>(a_gen + 1));
+  CHECK(a != b);  // Different handles despite same slot
+
+  // B is live, A is still stale
+  CHECK(store.get(b) != nullptr);
+  CHECK(store.get(a) == nullptr);
+
+  // Operations on stale handle A must be safe no-ops or return nullptr
+  // accept_token on stale handle — silent no-op (returns early on nullptr)
+  CHECK_NOTHROW(accept_token(a, 0, store));
+
+  // sample on stale handle — should not crash
+  // (sample() returns -1 when state is nullptr)
+  llama_token stale_tok = sample(a, store);
+  CHECK(stale_tok < 0);
+
+  prune(b, store);
+  llama_free(ctx);
+}
+
+TEST_CASE("branch integration: decode_each and decode_scatter error paths") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 512;
+  cparams.n_batch = 64;
+  cparams.n_seq_max = 4;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+
+  TestParams params;
+  params.temperature = 0.0f;
+  params.top_k = 0;
+  params.top_p = 1.0f;
+  params.min_p = 0.0f;
+
+  const llama_vocab* vocab = llama_model_get_vocab(model.get());
+  auto prompt = tokenizer::tokenize(vocab, "Hello", true, false);
+  REQUIRE(!prompt.empty());
+
+  // Create two live branches for valid batching
+  BranchHandle h1 = create(ctx, model.get(), store, 0, params, 64);
+  REQUIRE(h1 != INVALID_HANDLE);
+  decode_and_capture_batch(h1, prompt.data(), prompt.size(), store);
+
+  BranchHandle h2 = fork(h1, store);
+  REQUIRE(h2 != INVALID_HANDLE);
+
+  // --- decode_each: empty items is a safe no-op ---
+  std::vector<DecodeEachItem> empty_each;
+  CHECK_NOTHROW(store.decode_each(empty_each));
+
+  // --- decode_each: valid batch works ---
+  llama_token tok = sample(h1, store);
+  REQUIRE(tok >= 0);
+  std::vector<DecodeEachItem> valid_each = {
+    {h1, tok},
+    {h2, tok},
+  };
+  CHECK_NOTHROW(store.decode_each(valid_each));
+
+  // --- decode_each: invalid handle in batch throws ---
+  // Clean up h2 (child of h1) first, then h1, to get a stale handle
+  prune(h2, store);
+  BranchHandle stale = h1;
+  prune(h1, store);
+  kv::clear_all(ctx);
+
+  // Recreate branches for continued testing
+  h1 = create(ctx, model.get(), store, 0, params, 64);
+  REQUIRE(h1 != INVALID_HANDLE);
+  decode_and_capture_batch(h1, prompt.data(), prompt.size(), store);
+
+  std::vector<DecodeEachItem> bad_each = {
+    {stale, tok},  // stale handle from pruned branch
+  };
+  CHECK_THROWS_WITH(store.decode_each(bad_each),
+                     "BranchStore::decode_each - invalid handle at index 0");
+
+  // --- decode_scatter: empty items is a safe no-op ---
+  std::vector<DecodeScatterItem> empty_scatter;
+  CHECK_NOTHROW(store.decode_scatter(empty_scatter));
+
+  // --- decode_scatter: invalid handle throws ---
+  std::vector<llama_token> scatter_toks = {tok};
+  std::vector<DecodeScatterItem> bad_scatter = {
+    {stale, scatter_toks},
+  };
+  CHECK_THROWS_WITH(store.decode_scatter(bad_scatter),
+                     "BranchStore::decode_scatter - invalid handle at index 0");
+
+  // --- decode_scatter: valid batch works ---
+  BranchHandle h3 = fork(h1, store);
+  REQUIRE(h3 != INVALID_HANDLE);
+  std::vector<DecodeScatterItem> valid_scatter = {
+    {h1, scatter_toks},
+    {h3, scatter_toks},
+  };
+  CHECK_NOTHROW(store.decode_scatter(valid_scatter));
+
+  prune(h3, store);
+  prune(h1, store);
+  llama_free(ctx);
+}
+
+TEST_CASE("branch integration: retainOnly edge cases") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 512;
+  cparams.n_batch = 64;
+  cparams.n_seq_max = 4;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+
+  TestParams params;
+  params.temperature = 0.0f;
+  params.top_k = 0;
+  params.top_p = 1.0f;
+  params.min_p = 0.0f;
+
+  const llama_vocab* vocab = llama_model_get_vocab(model.get());
+  auto prompt = tokenizer::tokenize(vocab, "Hello world", true, false);
+  REQUIRE(!prompt.empty());
+
+  // --- retainOnly: invalid handle throws ---
+  CHECK_THROWS_WITH(store.retainOnly(INVALID_HANDLE),
+                     "retainOnly: invalid winner handle");
+
+  // --- retainOnly with stale handle throws ---
+  BranchHandle temp = create(ctx, model.get(), store, 0, params, 64);
+  REQUIRE(temp != INVALID_HANDLE);
+  prune(temp, store);
+  kv::clear_all(ctx);
+  CHECK_THROWS_WITH(store.retainOnly(temp),
+                     "retainOnly: invalid winner handle");
+
+  // --- retainOnly: topology reset ---
+  // Build tree: root → child1, child2
+  BranchHandle root = create(ctx, model.get(), store, 0, params, 64);
+  REQUIRE(root != INVALID_HANDLE);
+  decode_and_capture_batch(root, prompt.data(), prompt.size(), store);
+
+  BranchHandle child1 = fork(root, store);
+  REQUIRE(child1 != INVALID_HANDLE);
+
+  BranchHandle child2 = fork(root, store);
+  REQUIRE(child2 != INVALID_HANDLE);
+
+  // Verify topology before retainOnly
+  BranchState* root_state = store.get(root);
+  CHECK(root_state->children.size() == 2);
+
+  BranchState* c1_state = store.get(child1);
+  CHECK(c1_state->parent == root);
+
+  BranchState* c2_state = store.get(child2);
+  CHECK(c2_state->parent == root);
+
+  // Retain child1 as winner — root and child2 should be released
+  store.retainOnly(child1);
+
+  // Winner's topology is cleared (no parent, no children)
+  c1_state = store.get(child1);
+  REQUIRE(c1_state);
+  CHECK(c1_state->parent == INVALID_HANDLE);
+  CHECK(c1_state->children.empty());
+
+  // Losers are gone
+  CHECK(store.get(root) == nullptr);
+  CHECK(store.get(child2) == nullptr);
+
+  // Winner is still functional — can decode and sample
+  llama_token tok = sample(child1, store);
+  CHECK(tok >= 0);
+  accept_token(child1, tok, store);
+  decode_and_capture_one(child1, tok, store);
+  llama_token tok2 = sample(child1, store);
+  CHECK(tok2 >= 0);
+  MESSAGE("Post-retainOnly sampling: tok1=" << tok << " tok2=" << tok2);
+
+  // --- Second retainOnly on sole survivor is a no-op (no losers) ---
+  store.retainOnly(child1);
+  CHECK(store.get(child1) != nullptr);
+
+  prune(child1, store);
+  llama_free(ctx);
 }
