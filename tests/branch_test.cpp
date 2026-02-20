@@ -676,7 +676,7 @@ TEST_CASE("branch: operations on invalid handle don't crash") {
   accept_token(INVALID_HANDLE, 0, ts.store);
 
   CHECK_THROWS(prefill(INVALID_HANDLE, nullptr, 0, ts.store));
-  CHECK_THROWS(prefill(INVALID_HANDLE, nullptr, 0, ts.store));
+  CHECK_THROWS(step(INVALID_HANDLE, 0, ts.store));
   CHECK(sample(INVALID_HANDLE, ts.store) == -1);
   CHECK(fork(INVALID_HANDLE, ts.store) == INVALID_HANDLE);
 }
@@ -711,7 +711,6 @@ TEST_CASE("branch: decode with zero tokens throws") {
   REQUIRE(h != INVALID_HANDLE);
 
   llama_token empty[] = {};
-  CHECK_THROWS(prefill(h, empty, 0, ts.store));
   CHECK_THROWS(prefill(h, empty, 0, ts.store));
 
   CHECK(get_position(h, ts.store) == 0);

@@ -1588,7 +1588,7 @@ inline void force_snapshot_logits(BranchHandle handle, BranchStore& s) {
 }
 
 /**
- * @brief Decode multiple tokens and capture logits atomically (prompt injection)
+ * @brief Decode multiple tokens and capture logits atomically (prompt prefill)
  *
  * Feeds tokens through the model in n_batch-sized chunks, advances the branch
  * position, and snapshots logits. After this call, sample() and get_logits()
