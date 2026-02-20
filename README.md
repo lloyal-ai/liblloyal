@@ -57,7 +57,7 @@ store.init_tenancy(ctx);
 
 // Shared prompt: "Explain quantum entanglement"
 auto root = Branch::create(ctx, model, store, 0, params);
-root.decode_and_capture_batch(prompt_tokens.data(), prompt_tokens.size());
+root.prefill(prompt_tokens.data(), prompt_tokens.size());
 
 // Fork 4 branches — each will get a different reasoning prefix
 auto analogy  = root.fork();
@@ -111,7 +111,7 @@ for (int i = 0; i < max_tokens; i++) {
     auto tok = root.sample();
     if (root.is_eog(tok)) break;
     root.accept(tok);
-    root.decode_and_capture_one(tok);
+    root.step(tok);
 }
 
 // Hot-swap grammar mid-generation
@@ -199,7 +199,7 @@ BranchStore store;
 store.init_tenancy(ctx);
 
 auto root = Branch::create(ctx, model, store, 0, params);
-root.decode_and_capture_batch(prompt_tokens.data(), prompt_tokens.size());
+root.prefill(prompt_tokens.data(), prompt_tokens.size());
 
 // Fork 8 candidates — KV prefix shared, each gets unique PRNG
 std::vector<Branch> candidates;
@@ -233,7 +233,7 @@ BranchStore store;
 store.init_tenancy(ctx);
 
 auto root = Branch::create(ctx, model, store, 0, params);
-root.decode_and_capture_batch(prompt_tokens.data(), prompt_tokens.size());
+root.prefill(prompt_tokens.data(), prompt_tokens.size());
 
 for (int turn = 0; turn < max_turns; turn++) {
     // Expand: fork children, each samples a different continuation

@@ -129,7 +129,7 @@ TEST_CASE("branch integration: decode updates position") {
   REQUIRE(!tokens.empty());
 
   CHECK(get_position(h, store) == 0);
-  CHECK_NOTHROW(decode_batch(h, tokens.data(), tokens.size(), store));
+  CHECK_NOTHROW(prefill(h, tokens.data(), tokens.size(), store));
   CHECK(get_position(h, store) == static_cast<llama_pos>(tokens.size()));
 
   prune(h, store);
@@ -164,7 +164,7 @@ TEST_CASE("branch integration: decode_and_capture captures logits") {
   auto tokens = tokenizer::tokenize(vocab, "The capital of France is", true, false);
   REQUIRE(!tokens.empty());
 
-  CHECK_NOTHROW(decode_and_capture_batch(h, tokens.data(), tokens.size(), store));
+  CHECK_NOTHROW(prefill(h, tokens.data(), tokens.size(), store));
 
   const float* logits = get_logits(h, store);
   REQUIRE(logits != nullptr);
@@ -211,7 +211,7 @@ TEST_CASE("branch integration: fork creates independent branch") {
   auto prompt = tokenizer::tokenize(vocab, "Once upon a time", true, false);
   REQUIRE(!prompt.empty());
 
-  decode_and_capture_batch(parent, prompt.data(), prompt.size(), store);
+  prefill(parent, prompt.data(), prompt.size(), store);
   llama_pos parent_pos = get_position(parent, store);
   CHECK(parent_pos == static_cast<llama_pos>(prompt.size()));
 
@@ -258,8 +258,8 @@ TEST_CASE("branch integration: fork creates independent branch") {
   REQUIRE(!cont_a.empty());
   REQUIRE(!cont_b.empty());
 
-  decode_and_capture_one(parent, cont_a[0], store);
-  decode_and_capture_one(child, cont_b[0], store);
+  step(parent, cont_a[0], store);
+  step(child, cont_b[0], store);
 
   CHECK(get_position(parent, store) == parent_pos + 1);
   CHECK(get_position(child, store) == parent_pos + 1);
@@ -311,7 +311,7 @@ TEST_CASE("branch integration: prune removes KV entries") {
 
   const llama_vocab* vocab = llama_model_get_vocab(model.get());
   auto tokens = tokenizer::tokenize(vocab, "Hello world", true, false);
-  decode_batch(h, tokens.data(), tokens.size(), store);
+  prefill(h, tokens.data(), tokens.size(), store);
 
   // Get seq_id from state before pruning
   BranchState* state = store.get(h);
@@ -365,7 +365,7 @@ TEST_CASE("branch integration: RAII Branch wrapper") {
     const llama_vocab* vocab = llama_model_get_vocab(model.get());
     auto tokens = tokenizer::tokenize(vocab, "Test", true, false);
 
-    CHECK_NOTHROW(b.decode_batch(tokens.data(), tokens.size()));
+    CHECK_NOTHROW(b.prefill(tokens.data(), tokens.size()));
     CHECK(b.position() > 0);
 
     // Fork — no seq_id param
@@ -411,7 +411,7 @@ TEST_CASE("branch integration: sample and accept token") {
   const llama_vocab* vocab = llama_model_get_vocab(model.get());
   auto prompt = tokenizer::tokenize(vocab, "The answer is", true, false);
 
-  decode_and_capture_batch(h, prompt.data(), prompt.size(), store);
+  prefill(h, prompt.data(), prompt.size(), store);
 
   llama_token tok = sample(h, store);
   CHECK(tok >= 0);
@@ -450,7 +450,7 @@ TEST_CASE("branch integration: perplexity tracking across fork") {
 
   const llama_vocab* vocab = llama_model_get_vocab(model.get());
   auto prompt = tokenizer::tokenize(vocab, "Hello", true, false);
-  decode_and_capture_batch(parent, prompt.data(), prompt.size(), store);
+  prefill(parent, prompt.data(), prompt.size(), store);
 
   const float* logits = get_logits(parent, store);
   int n_vocab = get_n_vocab(parent, store);
@@ -511,7 +511,7 @@ TEST_CASE("branch scoping: logits snapshots are independent memory") {
   auto tokens = tokenizer::tokenize(vocab, "test", true, false);
   REQUIRE(!tokens.empty());
 
-  decode_and_capture_one(branch, tokens[0], store);
+  step(branch, tokens[0], store);
 
   BranchHandle forked = fork(branch, store);
   REQUIRE(forked != INVALID_HANDLE);
@@ -563,7 +563,7 @@ TEST_CASE("branch scoping: decode updates only target branch logits") {
   REQUIRE(!prompt.empty());
 
   BranchHandle parent = create(ctx, model.get(), store, 0, params, 64);
-  decode_and_capture_one(parent, prompt[0], store);
+  step(parent, prompt[0], store);
 
   BranchHandle child = fork(parent, store);
   REQUIRE(child != INVALID_HANDLE);
@@ -580,7 +580,7 @@ TEST_CASE("branch scoping: decode updates only target branch logits") {
   REQUIRE(!cont.empty());
 
   // Decode to CHILD only
-  decode_and_capture_one(child, cont[0], store);
+  step(child, cont[0], store);
 
   // Parent's logits must be UNCHANGED
   const float* parent_after = get_logits(parent, store);
@@ -632,7 +632,7 @@ TEST_CASE("branch scoping: concurrent captures preserve isolation") {
   REQUIRE(!prompt.empty());
 
   BranchHandle root = create(ctx, model.get(), store, 0, params, 64);
-  decode_and_capture_one(root, prompt[0], store);
+  step(root, prompt[0], store);
 
   // Create 4 branches via fork (seq_ids assigned by tenancy)
   std::vector<BranchHandle> branches;
@@ -652,7 +652,7 @@ TEST_CASE("branch scoping: concurrent captures preserve isolation") {
   }
 
   for (size_t i = 0; i < branches.size(); ++i) {
-    decode_and_capture_one(branches[i], continuations[i][0], store);
+    step(branches[i], continuations[i][0], store);
   }
 
   // Verify all branches have independent logits
@@ -720,7 +720,7 @@ TEST_CASE("branch integration: basic logit_bias bans tokens") {
   const llama_vocab* vocab = llama_model_get_vocab(model.get());
   auto tokens = tokenizer::tokenize(vocab, "The capital", true, false);
   REQUIRE(!tokens.empty());
-  CHECK_NOTHROW(decode_and_capture_batch(h, tokens.data(), tokens.size(), store));
+  CHECK_NOTHROW(prefill(h, tokens.data(), tokens.size(), store));
 
   llama_token banned_token = 42;
   llama_logit_bias bias = {banned_token, -std::numeric_limits<float>::infinity()};
@@ -763,7 +763,7 @@ TEST_CASE("branch integration: logit_bias cloned on fork") {
   const llama_vocab* vocab = llama_model_get_vocab(model.get());
   auto tokens = tokenizer::tokenize(vocab, "Hello", true, false);
   REQUIRE(!tokens.empty());
-  CHECK_NOTHROW(decode_and_capture_batch(parent, tokens.data(), tokens.size(), store));
+  CHECK_NOTHROW(prefill(parent, tokens.data(), tokens.size(), store));
 
   llama_logit_bias bias = {42, -std::numeric_limits<float>::infinity()};
   set_logit_bias(parent, &bias, 1, store);
@@ -805,7 +805,7 @@ TEST_CASE("branch integration: basic steer masks tokens") {
   const llama_vocab* vocab = llama_model_get_vocab(model.get());
   auto tokens = tokenizer::tokenize(vocab, "The", true, false);
   REQUIRE(!tokens.empty());
-  CHECK_NOTHROW(decode_and_capture_batch(h, tokens.data(), tokens.size(), store));
+  CHECK_NOTHROW(prefill(h, tokens.data(), tokens.size(), store));
 
   llama_token masked_token = 100;
   set_steer(h, [masked_token](llama_token_data_array& cur_p) {
@@ -856,7 +856,7 @@ TEST_CASE("branch integration: steer NOT cloned on fork") {
   const llama_vocab* vocab = llama_model_get_vocab(model.get());
   auto tokens = tokenizer::tokenize(vocab, "Test", true, false);
   REQUIRE(!tokens.empty());
-  CHECK_NOTHROW(decode_and_capture_batch(parent, tokens.data(), tokens.size(), store));
+  CHECK_NOTHROW(prefill(parent, tokens.data(), tokens.size(), store));
 
   llama_token masked_token = 200;
   set_steer(parent, [masked_token](llama_token_data_array& cur_p) {
@@ -910,7 +910,7 @@ TEST_CASE("branch integration: grammar + bias + steer composition") {
   const llama_vocab* vocab = llama_model_get_vocab(model.get());
   auto tokens = tokenizer::tokenize(vocab, "{\"test\":", true, false);
   REQUIRE(!tokens.empty());
-  CHECK_NOTHROW(decode_and_capture_batch(h, tokens.data(), tokens.size(), store));
+  CHECK_NOTHROW(prefill(h, tokens.data(), tokens.size(), store));
 
   llama_logit_bias bias = {50, -std::numeric_limits<float>::infinity()};
   set_logit_bias(h, &bias, 1, store);
@@ -958,7 +958,7 @@ TEST_CASE("branch integration: clear functions work") {
   const llama_vocab* vocab = llama_model_get_vocab(model.get());
   auto tokens = tokenizer::tokenize(vocab, "Clear", true, false);
   REQUIRE(!tokens.empty());
-  CHECK_NOTHROW(decode_and_capture_batch(h, tokens.data(), tokens.size(), store));
+  CHECK_NOTHROW(prefill(h, tokens.data(), tokens.size(), store));
 
   llama_logit_bias bias = {70, -std::numeric_limits<float>::infinity()};
   set_logit_bias(h, &bias, 1, store);
@@ -1016,7 +1016,7 @@ TEST_CASE("branch integration: exploration with steer deduplication") {
   const llama_vocab* vocab = llama_model_get_vocab(model.get());
   auto tokens = tokenizer::tokenize(vocab, "Explore", true, false);
   REQUIRE(!tokens.empty());
-  CHECK_NOTHROW(decode_and_capture_batch(h, tokens.data(), tokens.size(), store));
+  CHECK_NOTHROW(prefill(h, tokens.data(), tokens.size(), store));
 
   std::vector<llama_token> explored;
 
@@ -1091,7 +1091,7 @@ TEST_CASE("branch integration: successive steer calls replace") {
   const llama_vocab* vocab = llama_model_get_vocab(model.get());
   auto tokens = tokenizer::tokenize(vocab, "Replace", true, false);
   REQUIRE(!tokens.empty());
-  CHECK_NOTHROW(decode_and_capture_batch(h, tokens.data(), tokens.size(), store));
+  CHECK_NOTHROW(prefill(h, tokens.data(), tokens.size(), store));
 
   llama_token masked1 = 90;
   set_steer(h, [masked1](llama_token_data_array& cur_p) {
@@ -1154,7 +1154,7 @@ TEST_CASE("branch integration: slot reuse does not leak logit_bias") {
 
   BranchHandle a = create(ctx, model.get(), store, 0, params, 64);
   REQUIRE(a != INVALID_HANDLE);
-  CHECK_NOTHROW(decode_and_capture_batch(a, tokens.data(), tokens.size(), store));
+  CHECK_NOTHROW(prefill(a, tokens.data(), tokens.size(), store));
 
   llama_token greedy_token = sample(a, store);
   REQUIRE(greedy_token != -1);
@@ -1174,7 +1174,7 @@ TEST_CASE("branch integration: slot reuse does not leak logit_bias") {
 
   BranchHandle b = create(ctx, model.get(), store, 0, params, 64);
   REQUIRE(b != INVALID_HANDLE);
-  CHECK_NOTHROW(decode_and_capture_batch(b, tokens.data(), tokens.size(), store));
+  CHECK_NOTHROW(prefill(b, tokens.data(), tokens.size(), store));
 
   llama_token b_token = sample(b, store);
   REQUIRE(b_token != -1);
@@ -1212,7 +1212,7 @@ TEST_CASE("branch integration: slot reuse does not leak steer_fn") {
 
   BranchHandle a = create(ctx, model.get(), store, 0, params, 64);
   REQUIRE(a != INVALID_HANDLE);
-  CHECK_NOTHROW(decode_and_capture_batch(a, tokens.data(), tokens.size(), store));
+  CHECK_NOTHROW(prefill(a, tokens.data(), tokens.size(), store));
 
   llama_token greedy_token = sample(a, store);
   REQUIRE(greedy_token != -1);
@@ -1236,7 +1236,7 @@ TEST_CASE("branch integration: slot reuse does not leak steer_fn") {
 
   BranchHandle b = create(ctx, model.get(), store, 0, params, 64);
   REQUIRE(b != INVALID_HANDLE);
-  CHECK_NOTHROW(decode_and_capture_batch(b, tokens.data(), tokens.size(), store));
+  CHECK_NOTHROW(prefill(b, tokens.data(), tokens.size(), store));
 
   llama_token b_token = sample(b, store);
   REQUIRE(b_token != -1);
@@ -1277,7 +1277,7 @@ TEST_CASE("branch integration: BranchStore::decode_each batches N branches") {
 
   BranchHandle root = create(ctx, model.get(), store, 0, params, 64);
   REQUIRE(root != INVALID_HANDLE);
-  decode_batch(root, prompt.data(), prompt.size(), store);
+  prefill(root, prompt.data(), prompt.size(), store);
   llama_pos prefix_pos = get_position(root, store);
 
   constexpr int N = 4;
@@ -1350,7 +1350,7 @@ TEST_CASE("branch integration: BranchStore::decode_scatter batches asymmetric pr
 
   BranchHandle root = create(ctx, model.get(), store, 0, params, 512);
   REQUIRE(root != INVALID_HANDLE);
-  decode_batch(root, prompt.data(), prompt.size(), store);
+  prefill(root, prompt.data(), prompt.size(), store);
   llama_pos prefix_pos = get_position(root, store);
 
   constexpr int N = 3;
@@ -1424,7 +1424,7 @@ TEST_CASE("branch integration: BranchStore::decode_scatter auto-chunks with smal
 
   BranchHandle root = create(ctx, model.get(), store, 0, params, 16);
   REQUIRE(root != INVALID_HANDLE);
-  decode_batch(root, prompt.data(), prompt.size(), store);
+  prefill(root, prompt.data(), prompt.size(), store);
   llama_pos prefix_pos = get_position(root, store);
 
   constexpr int N = 3;
@@ -1519,7 +1519,7 @@ TEST_CASE("branch integration: seq recycling after prune") {
   REQUIRE(recycled1 != INVALID_HANDLE);
 
   // Verify recycled branch decodes correctly
-  CHECK_NOTHROW(decode_and_capture_batch(recycled1, prompt.data(), prompt.size(), store));
+  CHECK_NOTHROW(prefill(recycled1, prompt.data(), prompt.size(), store));
   llama_token tok = sample(recycled1, store);
   CHECK(tok >= 0);
 
@@ -1557,7 +1557,7 @@ TEST_CASE("branch integration: retainOnly keeps winner decoding") {
   // Create root and fork a tree
   BranchHandle root = create(ctx, model.get(), store, 0, params, 64);
   REQUIRE(root != INVALID_HANDLE);
-  decode_and_capture_batch(root, prompt.data(), prompt.size(), store);
+  prefill(root, prompt.data(), prompt.size(), store);
 
   BranchHandle child1 = fork(root, store);
   BranchHandle child2 = fork(root, store);
@@ -1569,8 +1569,8 @@ TEST_CASE("branch integration: retainOnly keeps winner decoding") {
   auto cont2 = tokenizer::tokenize(vocab, " the", false, false);
   REQUIRE(!cont1.empty());
   REQUIRE(!cont2.empty());
-  decode_and_capture_one(child1, cont1[0], store);
-  decode_and_capture_one(child2, cont2[0], store);
+  step(child1, cont1[0], store);
+  step(child2, cont2[0], store);
 
   size_t avail_before = store.available();
 
@@ -1581,7 +1581,7 @@ TEST_CASE("branch integration: retainOnly keeps winner decoding") {
   CHECK(store.get(child1) != nullptr);
   auto more = tokenizer::tokenize(vocab, " time", false, false);
   REQUIRE(!more.empty());
-  CHECK_NOTHROW(decode_and_capture_one(child1, more[0], store));
+  CHECK_NOTHROW(step(child1, more[0], store));
 
   llama_token tok = sample(child1, store);
   CHECK(tok >= 0);
@@ -1625,7 +1625,7 @@ TEST_CASE("branch integration: multi-tag KV survival — child intact after pare
   // After fork: parent_seq and child_seq both tag the same KV cells (multi-tag)
   BranchHandle parent = create(ctx, model.get(), store, 0, params, 64);
   REQUIRE(parent != INVALID_HANDLE);
-  decode_and_capture_batch(parent, prompt.data(), prompt.size(), store);
+  prefill(parent, prompt.data(), prompt.size(), store);
 
   BranchHandle child = fork(parent, store);
   REQUIRE(child != INVALID_HANDLE);
@@ -1653,7 +1653,7 @@ TEST_CASE("branch integration: multi-tag KV survival — child intact after pare
   // Child still decodes — KV is functional, not just tagged
   auto cont = tokenizer::tokenize(vocab, " more", false, false);
   REQUIRE(!cont.empty());
-  CHECK_NOTHROW(decode_and_capture_one(child, cont[0], store));
+  CHECK_NOTHROW(step(child, cont[0], store));
   CHECK(get_position(child, store) > static_cast<llama_pos>(prompt.size()));
 
   llama_token tok = sample(child, store);
@@ -1732,7 +1732,7 @@ TEST_CASE("branch integration: drain then llama_free ordering") {
 
   const llama_vocab* vocab = llama_model_get_vocab(model.get());
   auto prompt = tokenizer::tokenize(vocab, "Drain", true, false);
-  decode_batch(h1, prompt.data(), prompt.size(), store);
+  prefill(h1, prompt.data(), prompt.size(), store);
 
   // Drain while ctx alive — evicts all leases
   store.drain();
@@ -1784,7 +1784,7 @@ TEST_CASE("branch integration: set_sampler_params changes sampling behavior") {
   const llama_vocab* vocab = llama_model_get_vocab(model.get());
   auto prompt = tokenizer::tokenize(vocab, "The capital of France is", true, false);
   REQUIRE(!prompt.empty());
-  decode_and_capture_batch(h, prompt.data(), prompt.size(), store);
+  prefill(h, prompt.data(), prompt.size(), store);
 
   // Sample greedy — deterministic
   llama_token greedy_tok = sample(h, store);
@@ -1946,7 +1946,7 @@ TEST_CASE("branch integration: set_grammar hot-swap constrains output") {
   const llama_vocab* vocab = llama_model_get_vocab(model.get());
   auto prompt = tokenizer::tokenize(vocab, "{\"key\":", true, false);
   REQUIRE(!prompt.empty());
-  decode_and_capture_batch(h, prompt.data(), prompt.size(), store);
+  prefill(h, prompt.data(), prompt.size(), store);
 
   // Hot-swap grammar: JSON value must be a quoted string
   const char* json_grammar =
@@ -2043,7 +2043,7 @@ TEST_CASE("branch integration: set_grammar cloned on fork after hot-swap") {
   const llama_vocab* vocab = llama_model_get_vocab(model.get());
   auto prompt = tokenizer::tokenize(vocab, "{\"key\":", true, false);
   REQUIRE(!prompt.empty());
-  decode_and_capture_batch(parent, prompt.data(), prompt.size(), store);
+  prefill(parent, prompt.data(), prompt.size(), store);
 
   const char* json_grammar =
       "root ::= \"{\" ws \"\\\"key\\\"\" ws \":\" ws value ws \"}\"\n"
@@ -2186,7 +2186,7 @@ TEST_CASE("branch integration: slot reuse does not leak sampler chain") {
   BranchState* bstate = store.get(b);
   CHECK_FALSE(store.sampler_has_dist(bstate->sampler_chain));  // Greedy
 
-  decode_and_capture_batch(b, prompt.data(), prompt.size(), store);
+  prefill(b, prompt.data(), prompt.size(), store);
 
   // Greedy sampling should be deterministic — sample twice, same token
   llama_token tok1 = sample(b, store);
@@ -2239,7 +2239,7 @@ TEST_CASE("branch integration: multi-step generation loop with PPL and grammar")
   const llama_vocab* vocab = llama_model_get_vocab(model.get());
   auto prompt = tokenizer::tokenize(vocab, "Output a JSON object with a name field:", true, false);
   REQUIRE(!prompt.empty());
-  decode_and_capture_batch(h, prompt.data(), prompt.size(), store);
+  prefill(h, prompt.data(), prompt.size(), store);
 
   // Multi-step produce/accept/decode loop — 15 tokens
   const int N = 15;
@@ -2262,7 +2262,7 @@ TEST_CASE("branch integration: multi-step generation loop with PPL and grammar")
     accept_token(h, tok, store);
 
     // Decode+capture for next step
-    decode_and_capture_one(h, tok, store);
+    step(h, tok, store);
     expected_pos += 1;
   }
 
@@ -2397,7 +2397,7 @@ TEST_CASE("branch integration: decode_each and decode_scatter error paths") {
   // Create two live branches for valid batching
   BranchHandle h1 = create(ctx, model.get(), store, 0, params, 64);
   REQUIRE(h1 != INVALID_HANDLE);
-  decode_and_capture_batch(h1, prompt.data(), prompt.size(), store);
+  prefill(h1, prompt.data(), prompt.size(), store);
 
   BranchHandle h2 = fork(h1, store);
   REQUIRE(h2 != INVALID_HANDLE);
@@ -2425,7 +2425,7 @@ TEST_CASE("branch integration: decode_each and decode_scatter error paths") {
   // Recreate branches for continued testing
   h1 = create(ctx, model.get(), store, 0, params, 64);
   REQUIRE(h1 != INVALID_HANDLE);
-  decode_and_capture_batch(h1, prompt.data(), prompt.size(), store);
+  prefill(h1, prompt.data(), prompt.size(), store);
 
   std::vector<DecodeEachItem> bad_each = {
     {stale, tok},  // stale handle from pruned branch
@@ -2502,7 +2502,7 @@ TEST_CASE("branch integration: retainOnly edge cases") {
   // Build tree: root → child1, child2
   BranchHandle root = create(ctx, model.get(), store, 0, params, 64);
   REQUIRE(root != INVALID_HANDLE);
-  decode_and_capture_batch(root, prompt.data(), prompt.size(), store);
+  prefill(root, prompt.data(), prompt.size(), store);
 
   BranchHandle child1 = fork(root, store);
   REQUIRE(child1 != INVALID_HANDLE);
@@ -2537,7 +2537,7 @@ TEST_CASE("branch integration: retainOnly edge cases") {
   llama_token tok = sample(child1, store);
   CHECK(tok >= 0);
   accept_token(child1, tok, store);
-  decode_and_capture_one(child1, tok, store);
+  step(child1, tok, store);
   llama_token tok2 = sample(child1, store);
   CHECK(tok2 >= 0);
   MESSAGE("Post-retainOnly sampling: tok1=" << tok << " tok2=" << tok2);

@@ -41,12 +41,12 @@
  * @code
  *   store.init_tenancy(ctx);
  *   auto root = branch::create(ctx, model, store, prompt_len, params);
- *   branch::capture_logits(root, store);
+ *   branch::force_snapshot_logits(root, store);
  *
  *   auto child = branch::fork(root, store);
  *   auto token = branch::sample(child, store);
  *   branch::accept_token(child, token, store);
- *   branch::decode_and_capture_one(child, token, store);
+ *   branch::step(child, token, store);
  *
  *   branch::prune(child, store);          // RESTRICT leaf prune
  *   store.retainOnly(root);               // Keep winner, nuke rest
@@ -277,7 +277,7 @@ struct BranchState {
   std::vector<llama_token_data> last_candidates; ///< Filtered candidates from last sample()
 
   std::vector<float> logits_snapshot;  ///< Captured logit distribution (n_vocab floats)
-  bool has_logits = false;             ///< True only after capture_logits() or decode_and_capture()
+  bool has_logits = false;             ///< True only after force_snapshot_logits(), prefill(), or step()
 
   /// Reusable scratch buffer for sampling (avoids O(n_vocab) allocs per sample call).
   ///
@@ -354,7 +354,7 @@ struct DecodeScatterItem {
  * |---------------------|---------------|-------------|---------------|
  * | decode_each()       | 1             | No (1 call) | Per-branch    |
  * | decode_scatter()    | Variable      | Auto        | Per-branch    |
- * | branch::decode_and_capture_one() | 1 | No       | Single branch |
+ * | branch::step()                   | 1 | No       | Single branch |
  *
  * @warning **n_seq_max constraint:** Each live branch consumes one KV cache
  *          sequence ID (llama_seq_id) managed by kv::tenancy. Call
@@ -1549,76 +1549,16 @@ inline void pruneSubtree(BranchHandle h, BranchStore& s) {
 }
 
 /**
- * @brief Decode multiple tokens into the branch's KV cache sequence
- *
- * Feeds tokens through the model in n_batch-sized chunks, advancing
- * the branch position. Does NOT capture logits — call capture_logits()
- * or use decode_and_capture_batch() if you need them.
- *
- * @param handle Branch to decode into
- * @param tokens Array of token IDs
- * @param n_tokens Number of tokens in the array
- * @param s Branch store
- * @throws std::runtime_error if handle is invalid or decode fails
- *
- * @note For single-token decode, prefer decode_one() (zero heap allocation).
- */
-inline void decode_batch(
-    BranchHandle handle,
-    const llama_token* tokens,
-    size_t n_tokens,
-    BranchStore& s) {
-
-
-  BranchState* state = s.get(handle);
-  if (!state) {
-    throw std::runtime_error("decode_batch: invalid branch handle");
-  }
-
-  // Pass raw pointer directly - no vector copy needed
-  if (decode::many(state->ctx, tokens, static_cast<int32_t>(n_tokens),
-                   state->position, state->n_batch, state->seq_id) != 0) {
-    throw std::runtime_error("decode_batch: llama_decode failed");
-  }
-
-  state->position += static_cast<llama_pos>(n_tokens);
-}
-
-/**
- * @brief Decode a single token (no per-call allocation)
- *
- * Uses decode::one() which maintains a thread_local batch — heap-allocated
- * once per thread, reused across calls. No per-call allocation.
- * Does NOT capture logits; use decode_and_capture_one() if needed.
- *
- * @param handle Branch to decode into
- * @param token Token ID to decode
- * @param s Branch store
- * @throws std::runtime_error if handle is invalid or decode fails
- */
-inline void decode_one(
-    BranchHandle handle,
-    llama_token token,
-    BranchStore& s) {
-
-
-  BranchState* state = s.get(handle);
-  if (!state) {
-    throw std::runtime_error("decode_one: invalid branch handle");
-  }
-
-  if (decode::one(state->ctx, token, state->position, state->seq_id, false) != 0) {
-    throw std::runtime_error("decode_one: llama_decode failed");
-  }
-  state->position += 1;
-}
-
-/**
- * @brief Capture current context logits into the branch's snapshot
+ * @brief Force-copy the shared llama.cpp logits buffer into this branch's private snapshot.
  *
  * Copies the logits from the llama_context into the branch's internal buffer
- * without performing a decode. Call this after prefill to initialize the root
- * branch for sampling.
+ * without performing a decode.
+ *
+ * @warning The shared buffer contains logits from the LAST llama_decode() call.
+ *          If another branch (or batched decode) ran since this branch's last decode,
+ *          the snapshot will contain wrong logits. Only call this immediately after a
+ *          single-branch decode for this handle. Prefer prefill()/step() which capture
+ *          atomically.
  *
  * @param handle Branch to capture logits for
  * @param s Branch store
@@ -1627,19 +1567,19 @@ inline void decode_one(
  *
  * @note Sets has_logits = true, enabling sample() and get_logits().
  */
-inline void capture_logits(BranchHandle handle, BranchStore& s) {
+inline void force_snapshot_logits(BranchHandle handle, BranchStore& s) {
 
 
   BranchState* state = s.get(handle);
   if (!state) {
-    throw std::runtime_error("capture_logits: invalid branch handle");
+    throw std::runtime_error("force_snapshot_logits: invalid branch handle");
   }
 
   // logits::get() throws if ctx is null or logits unavailable
   const float* raw_logits = logits::get(state->ctx, -1);
 
   if (state->n_vocab <= 0) {
-    throw std::runtime_error("capture_logits: invalid vocab size");
+    throw std::runtime_error("force_snapshot_logits: invalid vocab size");
   }
 
   std::memcpy(state->logits_snapshot.data(), raw_logits,
@@ -1648,10 +1588,11 @@ inline void capture_logits(BranchHandle handle, BranchStore& s) {
 }
 
 /**
- * @brief Decode multiple tokens and capture logits atomically
+ * @brief Decode multiple tokens and capture logits atomically (prompt prefill)
  *
- * Combines decode_batch() + capture_logits() in a single call.
- * After this call, sample() and get_logits() are available.
+ * Feeds tokens through the model in n_batch-sized chunks, advances the branch
+ * position, and snapshots logits. After this call, sample() and get_logits()
+ * are available.
  *
  * @param handle Branch to decode into
  * @param tokens Array of token IDs
@@ -1660,9 +1601,9 @@ inline void capture_logits(BranchHandle handle, BranchStore& s) {
  * @throws std::runtime_error if handle is invalid, decode fails,
  *         or logits capture fails
  *
- * @note For single-token decode, prefer decode_and_capture_one() (zero heap allocation).
+ * @note For single-token decode, prefer step() (zero heap allocation).
  */
-inline void decode_and_capture_batch(
+inline void prefill(
     BranchHandle handle,
     const llama_token* tokens,
     size_t n_tokens,
@@ -1671,13 +1612,13 @@ inline void decode_and_capture_batch(
 
   BranchState* state = s.get(handle);
   if (!state) {
-    throw std::runtime_error("decode_and_capture_batch: invalid branch handle");
+    throw std::runtime_error("prefill: invalid branch handle");
   }
 
   // Pass raw pointer directly - no vector copy needed
   if (decode::many(state->ctx, tokens, static_cast<int32_t>(n_tokens),
                    state->position, state->n_batch, state->seq_id) != 0) {
-    throw std::runtime_error("decode_and_capture_batch: llama_decode failed");
+    throw std::runtime_error("prefill: llama_decode failed");
   }
 
   state->position += static_cast<llama_pos>(n_tokens);
@@ -1686,7 +1627,7 @@ inline void decode_and_capture_batch(
   const float* raw_logits = logits::get(state->ctx, -1);
 
   if (state->n_vocab <= 0) {
-    throw std::runtime_error("decode_and_capture_batch: invalid vocab size");
+    throw std::runtime_error("prefill: invalid vocab size");
   }
 
   std::memcpy(state->logits_snapshot.data(), raw_logits,
@@ -1695,11 +1636,10 @@ inline void decode_and_capture_batch(
 }
 
 /**
- * @brief Decode a single token and capture logits (no per-call allocation)
+ * @brief Decode a single token and capture logits (generation step)
  *
  * Uses decode::one() which maintains a thread_local batch — heap-allocated
  * once per thread, reused across calls. No per-call allocation.
- * Combines decode_one() + capture_logits() in a single call.
  *
  * @param handle Branch to decode into
  * @param token Token ID to decode
@@ -1707,7 +1647,7 @@ inline void decode_and_capture_batch(
  * @throws std::runtime_error if handle is invalid, decode fails,
  *         or logits capture fails
  */
-inline void decode_and_capture_one(
+inline void step(
     BranchHandle handle,
     llama_token token,
     BranchStore& s) {
@@ -1715,11 +1655,11 @@ inline void decode_and_capture_one(
 
   BranchState* state = s.get(handle);
   if (!state) {
-    throw std::runtime_error("decode_and_capture_one: invalid branch handle");
+    throw std::runtime_error("step: invalid branch handle");
   }
 
   if (decode::one(state->ctx, token, state->position, state->seq_id, true) != 0) {
-    throw std::runtime_error("decode_and_capture_one: llama_decode failed");
+    throw std::runtime_error("step: llama_decode failed");
   }
   state->position += 1;
 
@@ -1727,7 +1667,7 @@ inline void decode_and_capture_one(
   const float* raw_logits = logits::get(state->ctx, -1);
 
   if (state->n_vocab <= 0) {
-    throw std::runtime_error("decode_and_capture_one: invalid vocab size");
+    throw std::runtime_error("step: invalid vocab size");
   }
 
   std::memcpy(state->logits_snapshot.data(), raw_logits,
@@ -1739,7 +1679,7 @@ inline void decode_and_capture_one(
  * @brief Get the branch's captured logits snapshot
  *
  * Returns a pointer to the internal logits buffer (n_vocab floats).
- * Only valid after capture_logits() or a decode_and_capture call.
+ * Only valid after force_snapshot_logits(), prefill(), or step().
  *
  * @param handle Branch to read logits from
  * @param s Branch store
@@ -1763,7 +1703,7 @@ inline const float* get_logits(BranchHandle handle, BranchStore& s) {
  * Applies modifiers in order: Grammar → Logit Bias → Steer → Sampler Chain,
  * then selects a token. Also records filtered candidates for metrics.
  *
- * Requires prior capture_logits() or decode_and_capture call.
+ * Requires prior force_snapshot_logits(), prefill(), or step().
  *
  * @param handle Branch to sample from
  * @param s Branch store
@@ -1782,7 +1722,7 @@ inline llama_token sample(BranchHandle handle, BranchStore& s) {
 
   // Must have logits captured before sampling
   if (!state->has_logits) {
-    LLOYAL_LOG_DEBUG("[branch::sample] No logits captured - call decode_and_capture first");
+    LLOYAL_LOG_DEBUG("[branch::sample] No logits captured - call prefill()/step() first");
     return -1;
   }
 
@@ -2343,7 +2283,7 @@ inline int get_n_vocab(BranchHandle handle, BranchStore& s) {
  *   Branch root = Branch::create(ctx, model, store, pos, params);
  *   Branch child = root.fork();
  *
- *   child.decode_and_capture_one(token);
+ *   child.step(token);
  *   auto next = child.sample();
  *   child.accept(next);
  * @endcode
@@ -2415,37 +2355,23 @@ public:
     handle_ = INVALID_HANDLE;
   }
 
-  /// @brief Capture current context logits into this branch's snapshot
-  /// @copydetails branch::capture_logits()
-  void capture_logits() {
-    branch::capture_logits(handle_, *store_);
+  /// @brief Force-copy shared logits buffer into this branch's snapshot
+  /// @copydetails branch::force_snapshot_logits()
+  void force_snapshot_logits() {
+    branch::force_snapshot_logits(handle_, *store_);
   }
 
-  /// @brief Decode multiple tokens into this branch's KV cache
+  /// @brief Decode multiple tokens and capture logits atomically (prompt injection)
   /// @param tokens Array of token IDs
   /// @param n Number of tokens
-  /// @copydetails branch::decode_batch()
-  void decode_batch(const llama_token* tokens, size_t n) {
-    branch::decode_batch(handle_, tokens, n, *store_);
+  void prefill(const llama_token* tokens, size_t n) {
+    branch::prefill(handle_, tokens, n, *store_);
   }
 
-  /// @brief Decode a single token (zero per-call allocation)
+  /// @brief Decode one token and capture logits (generation step)
   /// @param token Token ID to decode
-  void decode_one(llama_token token) {
-    branch::decode_one(handle_, token, *store_);
-  }
-
-  /// @brief Decode multiple tokens and capture logits atomically
-  /// @param tokens Array of token IDs
-  /// @param n Number of tokens
-  void decode_and_capture_batch(const llama_token* tokens, size_t n) {
-    branch::decode_and_capture_batch(handle_, tokens, n, *store_);
-  }
-
-  /// @brief Decode one token and capture logits (zero per-call allocation)
-  /// @param token Token ID to decode
-  void decode_and_capture_one(llama_token token) {
-    branch::decode_and_capture_one(handle_, token, *store_);
+  void step(llama_token token) {
+    branch::step(handle_, token, *store_);
   }
 
   /// @brief Get the branch's captured logits snapshot

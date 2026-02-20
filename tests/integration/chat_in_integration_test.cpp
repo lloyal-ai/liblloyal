@@ -815,7 +815,7 @@ TEST_CASE("ChatIn Integration: warm multi-turn conversation with semantic recall
       if (lloyal::tokenizer::is_eog(model.get(), token)) break;
       text += lloyal::tokenizer::detokenize(model.get(), token);
       lloyal::branch::accept_token(branch, token, store);
-      lloyal::branch::decode_and_capture_one(branch, token, store);
+      lloyal::branch::step(branch, token, store);
     }
     return text;
   };
@@ -836,7 +836,7 @@ TEST_CASE("ChatIn Integration: warm multi-turn conversation with semantic recall
     prefill.insert(prefill.end(), separator.begin(), separator.end());
     prefill.insert(prefill.end(), delta.begin(), delta.end());
 
-    lloyal::branch::decode_and_capture_batch(branch, prefill.data(),
+    lloyal::branch::prefill(branch, prefill.data(),
                                               prefill.size(), store);
   };
 
@@ -853,7 +853,7 @@ TEST_CASE("ChatIn Integration: warm multi-turn conversation with semantic recall
     branch = lloyal::branch::create(ctx, model.get(), store, 0, params, 512);
     REQUIRE(branch != lloyal::branch::INVALID_HANDLE);
 
-    lloyal::branch::decode_and_capture_batch(branch, tokens.data(),
+    lloyal::branch::prefill(branch, tokens.data(),
                                               tokens.size(), store);
   }
 
