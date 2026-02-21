@@ -35,6 +35,27 @@
 
 namespace lloyal::kv {
 
+// ===== KV CACHE TYPE MAPPING =====
+
+namespace cache_type {
+
+/// Map string name to ggml_type enum (matches llama.cpp CLI `-ctk`/`-ctv` flags).
+/// Returns GGML_TYPE_COUNT as sentinel on unknown input — caller must check.
+inline ggml_type from_str(const std::string& s) {
+    if (s == "f32")    return GGML_TYPE_F32;
+    if (s == "f16")    return GGML_TYPE_F16;
+    if (s == "bf16")   return GGML_TYPE_BF16;
+    if (s == "q8_0")   return GGML_TYPE_Q8_0;
+    if (s == "q4_0")   return GGML_TYPE_Q4_0;
+    if (s == "q4_1")   return GGML_TYPE_Q4_1;
+    if (s == "iq4_nl") return GGML_TYPE_IQ4_NL;
+    if (s == "q5_0")   return GGML_TYPE_Q5_0;
+    if (s == "q5_1")   return GGML_TYPE_Q5_1;
+    return GGML_TYPE_COUNT;
+}
+
+}  // namespace cache_type
+
 // ===== KV SEQUENCE OPERATIONS =====
 // Thin wrappers — tenancy is built on top of these.
 
