@@ -16,6 +16,7 @@ enum ggml_type {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    GGML_TYPE_COUNT,  // Sentinel — must be last
 };
 
 // Stub implementation for type name conversion
