@@ -446,4 +446,65 @@ struct Scratch {
   return scatter(ctx, items.data(), static_cast<int32_t>(items.size()), scratch);
 }
 
+// ============================================================================
+// Bin-Packing Utility
+// ============================================================================
+
+/**
+ * @brief A chunk of item indices produced by bin_pack()
+ *
+ * Normal chunks contain items whose total tokens fit in n_batch.
+ * Oversized chunks contain a single item whose tokens exceed n_batch
+ * (caller must dispatch via decode::many with auto-chunking).
+ */
+struct PackedChunk {
+  std::vector<int32_t> indices;   ///< Indices into the original items array
+  bool oversized = false;         ///< True → single item exceeding n_batch
+};
+
+/**
+ * @brief Greedy first-fit bin-packing of token spans into n_batch-sized chunks
+ *
+ * Pure packing algorithm — no decoding, no logit capture, no context.
+ * Callers use the returned chunks to drive their own dispatch logic
+ * (decode::scatter for normal chunks, decode::many for oversized).
+ *
+ * Empty spans (size 0) are skipped. Items exceeding n_batch get a
+ * solo oversized chunk.
+ *
+ * @param items   Array of token spans (only .size() is inspected)
+ * @param n       Number of items
+ * @param n_batch Maximum total tokens per normal chunk
+ * @return Vector of PackedChunks with indices into the input array
+ */
+inline std::vector<PackedChunk> bin_pack(
+    const std::span<const llama_token>* items,
+    int32_t n,
+    int32_t n_batch) {
+
+  std::vector<PackedChunk> chunks;
+  int32_t chunk_total = 0;
+
+  for (int32_t i = 0; i < n; ++i) {
+    int32_t tc = static_cast<int32_t>(items[i].size());
+    if (tc == 0) continue;
+
+    if (tc > n_batch) {
+      chunks.push_back({{i}, true});
+      continue;
+    }
+
+    if (chunks.empty() || chunks.back().oversized ||
+        chunk_total + tc > n_batch) {
+      chunks.push_back({{i}, false});
+      chunk_total = tc;
+    } else {
+      chunks.back().indices.push_back(i);
+      chunk_total += tc;
+    }
+  }
+
+  return chunks;
+}
+
 } // namespace lloyal::decode

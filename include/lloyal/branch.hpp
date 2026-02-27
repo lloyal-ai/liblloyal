@@ -925,54 +925,26 @@ public:
     llama_context* ctx = states[0]->ctx;
     const int32_t batch_limit = static_cast<int32_t>(llama_n_batch(ctx));
 
-    // --- Pass 1: Build chunks ---
-    struct Chunk {
-      std::vector<int32_t> item_indices;
-      bool oversized = false;
-    };
-
-    std::vector<Chunk> chunks;
-    int32_t chunk_total = 0;
-
+    // Build flat token spans — bin_pack skips empties internally
+    std::vector<std::span<const llama_token>> spans(n);
     for (int32_t i = 0; i < n; ++i) {
-      int32_t tc = static_cast<int32_t>(items[i].tokens.size());
-      if (tc == 0) continue;
-
-      if (tc > batch_limit) {
-        chunks.push_back({{i}, true});
-        continue;
-      }
-
-      if (chunks.empty() || chunks.back().oversized ||
-          chunk_total + tc > batch_limit) {
-        chunks.push_back({{i}, false});
-        chunk_total = tc;
-      } else {
-        chunks.back().item_indices.push_back(i);
-        chunk_total += tc;
-      }
+      spans[i] = items[i].tokens;
     }
 
-    // --- Pass 2: Dispatch each chunk ---
+    auto chunks = decode::bin_pack(spans.data(), n, batch_limit);
+
     for (const auto& chunk : chunks) {
       if (chunk.oversized) {
-        // Single oversized item — dispatch via decode::many
-        int32_t idx = chunk.item_indices[0];
+        int32_t idx = chunk.indices[0];
         int32_t tc = static_cast<int32_t>(items[idx].tokens.size());
 
-        // Clamp to context batch limit — branch n_batch may exceed it
-        const int32_t safe_batch = std::min(states[idx]->n_batch, batch_limit);
         if (decode::many(ctx, items[idx].tokens.data(), tc,
-                         states[idx]->position, safe_batch,
+                         states[idx]->position, batch_limit,
                          states[idx]->seq_id) != 0) {
           throw std::runtime_error("BranchStore::decode_scatter - decode::many failed for oversized item " + std::to_string(idx));
         }
 
-        // Capture logits (many() outputs logits for last token at index -1)
         const float* raw_logits = logits::get(ctx, -1);
-        if (states[idx]->n_vocab <= 0) {
-          throw std::runtime_error("BranchStore::decode_scatter - invalid vocab size");
-        }
         assert(states[idx]->logits_snapshot.size() >= static_cast<size_t>(states[idx]->n_vocab));
         std::memcpy(states[idx]->logits_snapshot.data(), raw_logits,
                     states[idx]->n_vocab * sizeof(float));
@@ -982,9 +954,9 @@ public:
       }
 
       // Normal chunk — build ScatterItems and dispatch
-      std::vector<decode::ScatterItem> scatter_items(chunk.item_indices.size());
-      for (size_t k = 0; k < chunk.item_indices.size(); ++k) {
-        int32_t idx = chunk.item_indices[k];
+      std::vector<decode::ScatterItem> scatter_items(chunk.indices.size());
+      for (size_t k = 0; k < chunk.indices.size(); ++k) {
+        int32_t idx = chunk.indices[k];
         scatter_items[k].tokens = items[idx].tokens;
         scatter_items[k].start_pos = states[idx]->position;
         scatter_items[k].seq_id = states[idx]->seq_id;
@@ -1000,14 +972,10 @@ public:
       // Capture logits for each item in the chunk
       int32_t cursor = 0;
       for (size_t k = 0; k < scatter_items.size(); ++k) {
-        int32_t idx = chunk.item_indices[k];
+        int32_t idx = chunk.indices[k];
         int32_t item_n = static_cast<int32_t>(scatter_items[k].tokens.size());
-        int32_t logit_pos = cursor + item_n - 1;
 
-        const float* raw_logits = logits::get(ctx, logit_pos);
-        if (states[idx]->n_vocab <= 0) {
-          throw std::runtime_error("BranchStore::decode_scatter - invalid vocab size for item " + std::to_string(idx));
-        }
+        const float* raw_logits = logits::get(ctx, cursor + item_n - 1);
         assert(states[idx]->logits_snapshot.size() >= static_cast<size_t>(states[idx]->n_vocab));
         std::memcpy(states[idx]->logits_snapshot.data(), raw_logits,
                     states[idx]->n_vocab * sizeof(float));
