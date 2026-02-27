@@ -2754,12 +2754,31 @@ TEST_CASE("branch integration: lazy grammar allows free generation before trigge
   REQUIRE(!prompt.empty());
   prefill(h, prompt.data(), prompt.size(), store);
 
-  // Apply the lazy grammar from formatChat
+  // Apply the lazy grammar from formatChat.
+  // Mirrors the TS applyLazyGrammar fix: truncate WORD triggers to scope_start
+  // (up to first \n) so the grammar activates before JSON/XML divergence.
+  // Also regex-escape WORD values (matching common_sampler_init behavior).
   std::vector<std::string> trigger_patterns;
   std::vector<llama_token> trigger_tokens;
+  auto regex_escape = [](const std::string& s) {
+    std::string r;
+    for (char c : s) {
+      if (std::string(".+*?^${}()|[]\\").find(c) != std::string::npos)
+        r += '\\';
+      r += c;
+    }
+    return r;
+  };
   for (const auto& t : fmt.grammar_triggers) {
     if (t.type == COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN) {
       trigger_tokens.push_back(t.token);
+    } else if (t.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD) {
+      // Truncate to scope_start (up to first \n inclusive)
+      std::string val = t.value;
+      auto nl = val.find('\n');
+      if (nl != std::string::npos && nl < val.size() - 1)
+        val = val.substr(0, nl + 1);
+      trigger_patterns.push_back(regex_escape(val));
     } else {
       trigger_patterns.push_back(t.value);
     }

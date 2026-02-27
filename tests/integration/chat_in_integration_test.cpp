@@ -20,6 +20,7 @@
 #include <nlohmann/json.hpp>
 #include <llama/llama.h>
 #include <cstdlib>
+#include <regex>
 #include <string>
 
 using json = nlohmann::ordered_json;
@@ -757,11 +758,66 @@ TEST_CASE("ChatIn Integration: format returns lazy grammar fields when tools pro
     CHECK(!result.grammar.empty());
     CHECK(!result.grammar_triggers.empty());
 
+    // Log all raw triggers from formatChat
     for (size_t i = 0; i < result.grammar_triggers.size(); ++i) {
       const auto& t = result.grammar_triggers[i];
       MESSAGE("  Trigger[" << i << "]: type=" << static_cast<int>(t.type)
               << " value=\"" << t.value << "\" token=" << t.token);
     }
+
+    // At least one non-TOKEN trigger must contain a tool-call scope marker
+    // (e.g. "<tool_call>") so lazy grammar can detect tool call start.
+    bool has_scope_trigger = false;
+    for (const auto& t : result.grammar_triggers) {
+      if (t.type == COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN) continue;
+      if (t.value.find("<tool_call>") != std::string::npos ||
+          t.value.find("tool_call") != std::string::npos) {
+        has_scope_trigger = true;
+      }
+    }
+    CHECK(has_scope_trigger);
+
+    // Verify: after applying scope-only truncation (Agent.ts fix), a WORD
+    // trigger matches the JSON tool call path. This proves the grammar
+    // activates before JSON/XML divergence.
+    auto regex_escape = [](const std::string& s) {
+      std::string r;
+      for (char c : s) {
+        if (std::string(".+*?^${}()|[]\\").find(c) != std::string::npos)
+          r += '\\';
+        r += c;
+      }
+      return r;
+    };
+
+    std::string json_tool_call = "<tool_call>\n{\"name\": \"get_time\", \"arguments\": {}}";
+    bool truncated_trigger_fires = false;
+    for (const auto& t : result.grammar_triggers) {
+      if (t.type == COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN) continue;
+
+      std::string pattern;
+      if (t.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD) {
+        // Apply scope-only truncation (mirrors Agent.ts applyLazyGrammar)
+        std::string val = t.value;
+        auto nl = val.find('\n');
+        if (nl != std::string::npos && nl < val.size() - 1)
+          val = val.substr(0, nl + 1);
+        pattern = regex_escape(val);
+      } else {
+        pattern = t.value;
+      }
+
+      try {
+        std::regex re(pattern);
+        if (std::regex_search(json_tool_call, re)) {
+          truncated_trigger_fires = true;
+          MESSAGE("  Truncated trigger fires on JSON path: \"" << pattern << "\"");
+        }
+      } catch (const std::regex_error&) {
+        MESSAGE("  Trigger regex failed to compile: \"" << pattern << "\"");
+      }
+    }
+    CHECK(truncated_trigger_fires);
   } else {
     MESSAGE("[ INFO ] Model template does not produce lazy grammar — skipping trigger checks");
   }
