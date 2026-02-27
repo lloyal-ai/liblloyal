@@ -522,6 +522,14 @@ llama_sampler *llama_sampler_init_grammar(const llama_vocab * /*vocab*/,
   return reinterpret_cast<llama_sampler *>(0xA000); // Stub pointer
 }
 
+llama_sampler *llama_sampler_init_grammar_lazy_patterns(
+    const llama_vocab * /*vocab*/, const char * /*grammar_str*/,
+    const char * /*grammar_root*/,
+    const char ** /*trigger_patterns*/, size_t /*num_trigger_patterns*/,
+    const llama_token * /*trigger_tokens*/, size_t /*num_trigger_tokens*/) {
+  return reinterpret_cast<llama_sampler *>(0xA001); // Stub pointer (lazy)
+}
+
 void llama_sampler_apply(llama_sampler * /*smpl*/,
                          llama_token_data_array * /*cur_p*/) {
   // Stub - no-op

@@ -686,6 +686,30 @@ public:
   }
 
   /**
+   * @brief Create a lazy grammar (unconstrained until trigger fires)
+   * @param model Llama model (for vocab)
+   * @param grammar_str GBNF grammar string
+   * @param trigger_patterns Regex patterns that activate the grammar
+   * @param trigger_tokens Token IDs that activate the grammar
+   * @param root Root rule name (default "root")
+   * @return Handle to the new grammar, or 0 on failure
+   */
+  GrammarHandle create_grammar_lazy(
+      const llama_model* model,
+      const char* grammar_str,
+      const std::vector<std::string>& trigger_patterns,
+      const std::vector<llama_token>& trigger_tokens,
+      const char* root = "root") {
+    GrammarHandle h = next_grammar_handle_++;
+    GrammarEntry entry;
+    entry.sampler = grammar::init_lazy_sampler(
+        model, grammar_str, trigger_patterns, trigger_tokens, root);
+    if (!entry.sampler) return 0;
+    grammars_.emplace(h, std::move(entry));
+    return h;
+  }
+
+  /**
    * @brief Clone a grammar (for fork)
    * @param h Source grammar handle
    * @return New handle with cloned grammar, or 0 if source is invalid
@@ -1474,6 +1498,46 @@ inline void set_grammar(
   }
 
   LLOYAL_LOG_DEBUG("[branch::set_grammar] %s grammar on handle=%u",
+                   state->grammar != 0 ? "Set" : "Cleared", handle);
+}
+
+/**
+ * @brief Set lazy grammar on a branch (unconstrained until trigger fires)
+ *
+ * Replaces any existing grammar. The lazy grammar accepts all tokens until
+ * a trigger pattern or token fires, then constrains subsequent generation.
+ *
+ * @param handle Branch handle
+ * @param model Llama model (for vocab)
+ * @param grammar_str GBNF grammar string
+ * @param trigger_patterns Regex patterns that activate the grammar
+ * @param trigger_tokens Token IDs that activate the grammar
+ * @param s Branch store
+ * @throws std::runtime_error if handle is invalid
+ */
+inline void set_grammar_lazy(
+    BranchHandle handle,
+    const llama_model* model,
+    const char* grammar_str,
+    const std::vector<std::string>& trigger_patterns,
+    const std::vector<llama_token>& trigger_tokens,
+    BranchStore& s) {
+  BranchState* state = s.get(handle);
+  if (!state) {
+    throw std::runtime_error("set_grammar_lazy: invalid branch handle");
+  }
+
+  if (state->grammar != 0) {
+    s.free_grammar(state->grammar);
+    state->grammar = 0;
+  }
+
+  if (grammar_str && grammar_str[0] != '\0') {
+    state->grammar = s.create_grammar_lazy(
+        model, grammar_str, trigger_patterns, trigger_tokens);
+  }
+
+  LLOYAL_LOG_DEBUG("[branch::set_grammar_lazy] %s grammar on handle=%u",
                    state->grammar != 0 ? "Set" : "Cleared", handle);
 }
 

@@ -24,6 +24,7 @@
 #include "test_config.hpp"
 #include <llama/llama.h>
 #include <lloyal/branch.hpp>
+#include <lloyal/chat_in.hpp>
 #include <lloyal/decode.hpp>
 #include <lloyal/kv.hpp>
 #include <lloyal/model_registry.hpp>
@@ -2547,5 +2548,240 @@ TEST_CASE("branch integration: retainOnly edge cases") {
   CHECK(store.get(child1) != nullptr);
 
   prune(child1, store);
+  llama_free(ctx);
+}
+
+// ============================================================================
+// set_grammar_lazy() Tests
+// ============================================================================
+
+TEST_CASE("branch integration: set_grammar_lazy creates valid grammar handle") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 512;
+  cparams.n_batch = 64;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+  TestParams params;
+  params.temperature = 0.0f;
+
+  BranchHandle h = create(ctx, model.get(), store, 0, params, 64);
+  REQUIRE(h != INVALID_HANDLE);
+
+  BranchState* state = store.get(h);
+  CHECK(state->grammar == 0);  // No grammar initially
+
+  // Set lazy grammar — same GBNF as non-lazy tests, with a trigger pattern
+  const char* json_grammar =
+      "root ::= \"{\" ws \"\\\"key\\\"\" ws \":\" ws value ws \"}\"\n"
+      "value ::= \"\\\"\" [a-z]+ \"\\\"\"\n"
+      "ws ::= [ \\t\\n]*\n";
+
+  std::vector<std::string> trigger_patterns = {"\\{"};  // Trigger on opening brace
+  std::vector<llama_token> trigger_tokens;  // No token triggers
+
+  set_grammar_lazy(h, model.get(), json_grammar, trigger_patterns, trigger_tokens, store);
+
+  state = store.get(h);
+  CHECK(state->grammar != 0);  // Grammar handle allocated
+  CHECK(store.get_grammar_sampler(state->grammar) != nullptr);
+
+  MESSAGE("Lazy grammar handle: " << state->grammar);
+
+  prune(h, store);
+  llama_free(ctx);
+}
+
+TEST_CASE("branch integration: set_grammar_lazy removal clears constraint") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 512;
+  cparams.n_batch = 64;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+  TestParams params;
+
+  BranchHandle h = create(ctx, model.get(), store, 0, params, 64);
+  REQUIRE(h != INVALID_HANDLE);
+
+  const char* json_grammar =
+      "root ::= \"{\" ws \"\\\"key\\\"\" ws \":\" ws value ws \"}\"\n"
+      "value ::= \"\\\"\" [a-z]+ \"\\\"\"\n"
+      "ws ::= [ \\t\\n]*\n";
+
+  std::vector<std::string> patterns = {"\\{"};
+  std::vector<llama_token> tokens;
+
+  set_grammar_lazy(h, model.get(), json_grammar, patterns, tokens, store);
+
+  BranchState* state = store.get(h);
+  GrammarHandle original = state->grammar;
+  CHECK(original != 0);
+
+  // Remove by setting empty grammar (uses set_grammar_lazy with empty string)
+  set_grammar_lazy(h, model.get(), "", patterns, tokens, store);
+
+  state = store.get(h);
+  CHECK(state->grammar == 0);
+  CHECK(store.get_grammar_sampler(original) == nullptr);
+
+  MESSAGE("Lazy grammar removed: handle " << original << " freed");
+
+  prune(h, store);
+  llama_free(ctx);
+}
+
+TEST_CASE("branch integration: set_grammar_lazy cloned on fork") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 1024;
+  cparams.n_batch = 64;
+  cparams.n_seq_max = 4;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+  TestParams params;
+
+  BranchHandle parent = create(ctx, model.get(), store, 0, params, 64);
+  REQUIRE(parent != INVALID_HANDLE);
+
+  const llama_vocab* vocab = llama_model_get_vocab(model.get());
+  auto prompt = tokenizer::tokenize(vocab, "Hello", true, false);
+  prefill(parent, prompt.data(), prompt.size(), store);
+
+  const char* json_grammar =
+      "root ::= \"{\" ws \"\\\"key\\\"\" ws \":\" ws value ws \"}\"\n"
+      "value ::= \"\\\"\" [a-z]+ \"\\\"\"\n"
+      "ws ::= [ \\t\\n]*\n";
+
+  std::vector<std::string> patterns = {"\\{"};
+  std::vector<llama_token> tokens;
+
+  set_grammar_lazy(parent, model.get(), json_grammar, patterns, tokens, store);
+
+  BranchState* pstate = store.get(parent);
+  GrammarHandle parent_grammar = pstate->grammar;
+  CHECK(parent_grammar != 0);
+
+  // Fork — child should get independent lazy grammar clone
+  BranchHandle child = fork(parent, store);
+  REQUIRE(child != INVALID_HANDLE);
+
+  BranchState* cstate = store.get(child);
+  CHECK(cstate->grammar != 0);
+  CHECK(cstate->grammar != parent_grammar);  // Independent handle
+
+  // Both grammars valid and distinct sampler pointers
+  CHECK(store.get_grammar_sampler(pstate->grammar) != nullptr);
+  CHECK(store.get_grammar_sampler(cstate->grammar) != nullptr);
+  CHECK(store.get_grammar_sampler(pstate->grammar)
+        != store.get_grammar_sampler(cstate->grammar));
+
+  MESSAGE("Parent lazy grammar: " << parent_grammar
+          << ", child lazy grammar: " << cstate->grammar);
+
+  prune(child, store);
+  prune(parent, store);
+  llama_free(ctx);
+}
+
+TEST_CASE("branch integration: lazy grammar allows free generation before trigger") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 2048;
+  cparams.n_batch = 512;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+  TestParams params;
+  params.temperature = 0.0f;  // Greedy for determinism
+  params.top_k = 0;
+  params.top_p = 1.0f;
+  params.min_p = 0.0f;
+
+  BranchHandle h = create(ctx, model.get(), store, 0, params, 512);
+  REQUIRE(h != INVALID_HANDLE);
+
+  const llama_vocab* vocab = llama_model_get_vocab(model.get());
+
+  // Format a tool-call conversation to get grammar + triggers from the model's template
+  lloyal::chat_in::FormatInputs inputs;
+  inputs.messages_json = R"([{"role":"user","content":"Search for quantum computing papers"}])";
+  inputs.tools_json = R"([{"type":"function","function":{"name":"search","description":"Search","parameters":{"type":"object","properties":{"query":{"type":"string"}}}}}])";
+
+  auto fmt = lloyal::chat_in::format(model.get(), inputs);
+
+  if (fmt.grammar.empty() || !fmt.grammar_lazy || fmt.grammar_triggers.empty()) {
+    MESSAGE("[ SKIP ] Model template does not produce lazy grammar for tools");
+    prune(h, store);
+    llama_free(ctx);
+    return;
+  }
+
+  MESSAGE("Grammar triggers: " << fmt.grammar_triggers.size());
+
+  auto prompt = tokenizer::tokenize(vocab, fmt.prompt, true, false);
+  REQUIRE(!prompt.empty());
+  prefill(h, prompt.data(), prompt.size(), store);
+
+  // Apply the lazy grammar from formatChat
+  std::vector<std::string> trigger_patterns;
+  std::vector<llama_token> trigger_tokens;
+  for (const auto& t : fmt.grammar_triggers) {
+    if (t.type == COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN) {
+      trigger_tokens.push_back(t.token);
+    } else {
+      trigger_patterns.push_back(t.value);
+    }
+  }
+  set_grammar_lazy(h, model.get(), fmt.grammar.c_str(),
+                   trigger_patterns, trigger_tokens, store);
+
+  // Generate — lazy grammar should allow free text before tool call trigger
+  std::string output;
+  for (int i = 0; i < 200; ++i) {
+    llama_token tok = sample(h, store);
+    if (tokenizer::is_eog(model.get(), tok)) break;
+    output += tokenizer::detokenize(vocab, tok, false);
+    accept_token(h, tok, store);
+    step(h, tok, store);
+  }
+
+  MESSAGE("Lazy grammar output (" << output.size() << " chars): " << output.substr(0, 300));
+
+  // Generation must have produced output (grammar didn't block everything)
+  CHECK(output.size() > 0);
+
+  prune(h, store);
   llama_free(ctx);
 }

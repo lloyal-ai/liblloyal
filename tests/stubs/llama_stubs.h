@@ -196,6 +196,10 @@ extern "C" {
 
     // Grammar sampler operations (for vendored common_sampler)
     llama_sampler* llama_sampler_init_grammar(const llama_vocab* vocab, const char* grammar_str, const char* grammar_root);
+    llama_sampler* llama_sampler_init_grammar_lazy_patterns(
+        const llama_vocab* vocab, const char* grammar_str, const char* grammar_root,
+        const char** trigger_patterns, size_t num_trigger_patterns,
+        const llama_token* trigger_tokens, size_t num_trigger_tokens);
     void llama_sampler_apply(llama_sampler* smpl, llama_token_data_array* cur_p);
     void llama_sampler_accept(llama_sampler* smpl, llama_token token);
     void llama_sampler_reset(llama_sampler* smpl);

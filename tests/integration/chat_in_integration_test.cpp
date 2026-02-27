@@ -726,6 +726,47 @@ TEST_CASE("ChatIn Integration: format returns grammar string when tools provided
   MESSAGE("Format: " << static_cast<int>(result.format));
 }
 
+TEST_CASE("ChatIn Integration: format returns lazy grammar fields when tools provided") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard backend;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model != nullptr);
+
+  lloyal::chat_in::FormatInputs inputs;
+  inputs.messages_json = json::array({
+    {{"role", "user"}, {"content", "Call get_time"}}
+  }).dump();
+  inputs.tools_json = json::array({
+    {{"type", "function"}, {"function", {
+      {"name", "get_time"},
+      {"description", "Get current time"},
+      {"parameters", {{"type", "object"}}}
+    }}}
+  }).dump();
+
+  auto result = lloyal::chat_in::format(model.get(), inputs);
+
+  CHECK(!result.prompt.empty());
+
+  MESSAGE("Grammar size: " << result.grammar.size() << " bytes");
+  MESSAGE("Grammar lazy: " << result.grammar_lazy);
+  MESSAGE("Triggers count: " << result.grammar_triggers.size());
+
+  if (result.grammar_lazy) {
+    CHECK(!result.grammar.empty());
+    CHECK(!result.grammar_triggers.empty());
+
+    for (size_t i = 0; i < result.grammar_triggers.size(); ++i) {
+      const auto& t = result.grammar_triggers[i];
+      MESSAGE("  Trigger[" << i << "]: type=" << static_cast<int>(t.type)
+              << " value=\"" << t.value << "\" token=" << t.token);
+    }
+  } else {
+    MESSAGE("[ INFO ] Model template does not produce lazy grammar — skipping trigger checks");
+  }
+}
+
 TEST_CASE("ChatIn Integration: format with tools in multi-turn") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
