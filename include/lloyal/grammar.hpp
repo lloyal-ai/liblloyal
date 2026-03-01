@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 /**
  * @file grammar.hpp
@@ -131,6 +132,67 @@ inline llama_sampler *init_sampler(const llama_model *model,
   if (!sampler) {
     LLOYAL_LOG_DEBUG("[grammar::init_sampler] ERROR: "
                      "llama_sampler_init_grammar returned null");
+  }
+
+  return sampler;
+}
+
+/**
+ * Initialize a lazy grammar sampler from GBNF grammar string
+ *
+ * Generation runs unconstrained until a trigger pattern or token fires,
+ * at which point the grammar activates and constrains subsequent tokens.
+ * Used for tool-call generation: model writes freely until `<tool_call>`,
+ * then grammar forces valid XML structure.
+ *
+ * @param model Llama model (for vocab extraction)
+ * @param grammar_str GBNF grammar string
+ * @param trigger_patterns Regex patterns that activate the grammar
+ * @param trigger_tokens Token IDs that activate the grammar
+ * @param root_rule Root rule name (default: "root")
+ * @return Initialized lazy grammar sampler, or nullptr on failure
+ *
+ * OWNERSHIP: Caller owns returned sampler and must call llama_sampler_free()
+ */
+inline llama_sampler *init_lazy_sampler(
+    const llama_model *model,
+    const std::string &grammar_str,
+    const std::vector<std::string> &trigger_patterns,
+    const std::vector<llama_token> &trigger_tokens,
+    const std::string &root_rule = "root") {
+  if (!model) {
+    LLOYAL_LOG_DEBUG("[grammar::init_lazy_sampler] ERROR: model is null");
+    return nullptr;
+  }
+
+  if (grammar_str.empty()) {
+    LLOYAL_LOG_DEBUG("[grammar::init_lazy_sampler] ERROR: grammar_str is empty");
+    return nullptr;
+  }
+
+  const llama_vocab *vocab = tokenizer::get_vocab(model);
+  if (!vocab) {
+    LLOYAL_LOG_DEBUG("[grammar::init_lazy_sampler] ERROR: get_vocab returned null");
+    return nullptr;
+  }
+
+  std::vector<const char *> patterns_c;
+  patterns_c.reserve(trigger_patterns.size());
+  for (const auto &p : trigger_patterns) patterns_c.push_back(p.c_str());
+
+  LLOYAL_LOG_DEBUG("[grammar::init_lazy_sampler] Initializing lazy grammar "
+                   "(grammar: %zu bytes, %zu patterns, %zu tokens, root: %s)",
+                   grammar_str.size(), trigger_patterns.size(),
+                   trigger_tokens.size(), root_rule.c_str());
+
+  llama_sampler *sampler = llama_sampler_init_grammar_lazy_patterns(
+      vocab, grammar_str.c_str(), root_rule.c_str(),
+      patterns_c.data(), patterns_c.size(),
+      trigger_tokens.data(), trigger_tokens.size());
+
+  if (!sampler) {
+    LLOYAL_LOG_DEBUG("[grammar::init_lazy_sampler] ERROR: "
+                     "llama_sampler_init_grammar_lazy_patterns returned null");
   }
 
   return sampler;
