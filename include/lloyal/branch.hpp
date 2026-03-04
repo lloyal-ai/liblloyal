@@ -100,6 +100,19 @@ constexpr uint32_t GEN_SHIFT = 16;          ///< Bit shift for generation field
 constexpr uint32_t INDEX_MASK = 0xFFFF;     ///< Mask for slot index field
 
 /**
+ * @brief Snapshot of KV cache pressure from BranchStore
+ *
+ * cells_used is a monotonic counter incremented on every decode and reset
+ * on bulk operations (drain, retainOnly). Conservative: overcounts if
+ * individual branches are evicted mid-run, which is safe (triggers grace sooner).
+ */
+struct KvPressure {
+  uint32_t n_ctx;       ///< Total KV capacity
+  uint32_t cells_used;  ///< Cells allocated since last reset
+  uint32_t remaining;   ///< n_ctx - cells_used (clamped to 0)
+};
+
+/**
  * @brief Extract slot index from a branch handle
  * @param h Branch handle
  * @return Slot index (lower 16 bits)
@@ -459,6 +472,11 @@ public:
     free_branch_resources(*st);
     reset_slot(*st);
     freelist_.push_back(handle_index(handle));
+
+    // All branches released → KV cache empty, reset pressure counter
+    if (freelist_.size() == slots_.size() - 1) {
+      cells_used_ = 0;
+    }
   }
 
   // ===== TENANCY LIFECYCLE =====
@@ -469,6 +487,7 @@ public:
    */
   void init_tenancy(llama_context* ctx) {
     tenancy_ = kv::tenancy::init(ctx, llama_n_seq_max(ctx));
+    cells_used_ = 0;
   }
 
   /**
@@ -489,6 +508,7 @@ public:
       }
     }
     tenancy_.ctx = nullptr;  // marks as drained
+    cells_used_ = 0;
   }
 
   /**
@@ -517,6 +537,7 @@ public:
       release_slot_only(h);  // CPU only, KV already stripped
     w->parent = INVALID_HANDLE;
     w->children.clear();
+    cells_used_ = static_cast<uint32_t>(w->position);
   }
 
   // ===== TOPOLOGY QUERIES =====
@@ -526,6 +547,23 @@ public:
    * @return Count of seq_ids in the tenancy vacant pool
    */
   size_t available() const { return kv::tenancy::available(tenancy_); }
+
+  /**
+   * @brief KV cache pressure snapshot — O(1), no tree walking
+   *
+   * cells_used is a monotonic counter incremented on decode_each/decode_scatter,
+   * reset on drain/retainOnly/init_tenancy. Conservative: overcounts if branches
+   * are individually released mid-run (safe — triggers grace sooner).
+   */
+  KvPressure kv_pressure() const {
+    if (!tenancy_.ctx) return {0, 0, 0};
+    uint32_t n_ctx = static_cast<uint32_t>(llama_n_ctx(tenancy_.ctx));
+    uint32_t remaining = (n_ctx > cells_used_) ? n_ctx - cells_used_ : 0;
+    return { n_ctx, cells_used_, remaining };
+  }
+
+  /** Increment cells_used counter (for standalone prefill/step outside BranchStore methods) */
+  void add_cells_used(uint32_t n) { cells_used_ += n; }
 
   /**
    * @brief Get a branch's parent handle
@@ -902,6 +940,7 @@ public:
       states[i]->has_logits = true;
       states[i]->position += 1;
     }
+    cells_used_ += static_cast<uint32_t>(items.size());
   }
 
   /**
@@ -1009,6 +1048,11 @@ public:
         cursor += item_n;
       }
     }
+
+    // Accumulate total tokens decoded across all items
+    for (int32_t i = 0; i < n; ++i) {
+      cells_used_ += static_cast<uint32_t>(items[i].tokens.size());
+    }
   }
 
 private:
@@ -1109,6 +1153,10 @@ private:
   /// seq_id ownership invariant: only the BranchState that received a seq_id
   /// from allocate() may hold it, and only while its handle+generation is live.
   kv::tenancy::State tenancy_;
+
+  /// Monotonic counter of KV cells consumed. Incremented by decode_each/decode_scatter,
+  /// reset by drain/retainOnly/init_tenancy. See kv_pressure().
+  uint32_t cells_used_ = 0;
 
   /// Reusable scratch buffers for batched decode. Safe without locking because
   /// BranchStore requires external synchronization (caller's mutex).
@@ -1654,6 +1702,7 @@ inline void prefill(
   }
 
   state->position += static_cast<llama_pos>(n_tokens);
+  s.add_cells_used(static_cast<uint32_t>(n_tokens));
 
   // logits::get() throws if logits unavailable
   const float* raw_logits = logits::get(state->ctx, -1);
@@ -1694,6 +1743,7 @@ inline void step(
     throw std::runtime_error("step: llama_decode failed");
   }
   state->position += 1;
+  s.add_cells_used(1);
 
   // logits::get() throws if logits unavailable
   const float* raw_logits = logits::get(state->ctx, -1);
