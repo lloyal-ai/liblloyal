@@ -102,9 +102,14 @@ constexpr uint32_t INDEX_MASK = 0xFFFF;     ///< Mask for slot index field
 /**
  * @brief Snapshot of KV cache pressure from BranchStore
  *
- * cells_used is a monotonic counter incremented on every decode and reset
- * on bulk operations (drain, retainOnly). Conservative: overcounts if
- * individual branches are evicted mid-run, which is safe (triggers grace sooner).
+ * cells_used is incremented on every decode (decode_each, decode_scatter,
+ * add_cells_used) and reset to zero on bulk operations: drain(),
+ * init_tenancy(), and when the last active branch is released. retainOnly()
+ * resets it to the surviving branch's position.
+ *
+ * Conservative: overcounts if individual branches are pruned mid-run
+ * (prune does NOT decrement), which is safe — it triggers soft limits
+ * sooner rather than later.
  */
 struct KvPressure {
   uint32_t n_ctx;       ///< Total KV capacity
@@ -1154,8 +1159,9 @@ private:
   /// from allocate() may hold it, and only while its handle+generation is live.
   kv::tenancy::State tenancy_;
 
-  /// Monotonic counter of KV cells consumed. Incremented by decode_each/decode_scatter,
-  /// reset by drain/retainOnly/init_tenancy. See kv_pressure().
+  /// KV cells consumed. Incremented by decode_each/decode_scatter/add_cells_used,
+  /// reset to 0 by drain/init_tenancy/last-branch-release, set to position by
+  /// retainOnly. Not decremented on individual prune. See kv_pressure().
   uint32_t cells_used_ = 0;
 
   /// Reusable scratch buffers for batched decode. Safe without locking because
