@@ -100,6 +100,24 @@ constexpr uint32_t GEN_SHIFT = 16;          ///< Bit shift for generation field
 constexpr uint32_t INDEX_MASK = 0xFFFF;     ///< Mask for slot index field
 
 /**
+ * @brief Snapshot of KV cache pressure from BranchStore
+ *
+ * cells_used is incremented on every decode (decode_each, decode_scatter,
+ * add_cells_used) and reset to zero on bulk operations: drain(),
+ * init_tenancy(), and when the last active branch is released. retainOnly()
+ * resets it to the surviving branch's position.
+ *
+ * Conservative: overcounts if individual branches are pruned mid-run
+ * (prune does NOT decrement), which is safe — it triggers soft limits
+ * sooner rather than later.
+ */
+struct KvPressure {
+  uint32_t n_ctx;       ///< Total KV capacity
+  uint32_t cells_used;  ///< Cells allocated since last reset
+  uint32_t remaining;   ///< n_ctx - cells_used (clamped to 0)
+};
+
+/**
  * @brief Extract slot index from a branch handle
  * @param h Branch handle
  * @return Slot index (lower 16 bits)
@@ -459,6 +477,11 @@ public:
     free_branch_resources(*st);
     reset_slot(*st);
     freelist_.push_back(handle_index(handle));
+
+    // All branches released → KV cache empty, reset pressure counter
+    if (freelist_.size() == slots_.size() - 1) {
+      cells_used_ = 0;
+    }
   }
 
   // ===== TENANCY LIFECYCLE =====
@@ -469,6 +492,7 @@ public:
    */
   void init_tenancy(llama_context* ctx) {
     tenancy_ = kv::tenancy::init(ctx, llama_n_seq_max(ctx));
+    cells_used_ = 0;
   }
 
   /**
@@ -489,6 +513,7 @@ public:
       }
     }
     tenancy_.ctx = nullptr;  // marks as drained
+    cells_used_ = 0;
   }
 
   /**
@@ -517,6 +542,7 @@ public:
       release_slot_only(h);  // CPU only, KV already stripped
     w->parent = INVALID_HANDLE;
     w->children.clear();
+    cells_used_ = static_cast<uint32_t>(w->position);
   }
 
   // ===== TOPOLOGY QUERIES =====
@@ -526,6 +552,23 @@ public:
    * @return Count of seq_ids in the tenancy vacant pool
    */
   size_t available() const { return kv::tenancy::available(tenancy_); }
+
+  /**
+   * @brief KV cache pressure snapshot — O(1), no tree walking
+   *
+   * cells_used is a monotonic counter incremented on decode_each/decode_scatter,
+   * reset on drain/retainOnly/init_tenancy. Conservative: overcounts if branches
+   * are individually released mid-run (safe — triggers grace sooner).
+   */
+  KvPressure kv_pressure() const {
+    if (!tenancy_.ctx) return {0, 0, 0};
+    uint32_t n_ctx = static_cast<uint32_t>(llama_n_ctx(tenancy_.ctx));
+    uint32_t remaining = (n_ctx > cells_used_) ? n_ctx - cells_used_ : 0;
+    return { n_ctx, cells_used_, remaining };
+  }
+
+  /** Increment cells_used counter (for standalone prefill/step outside BranchStore methods) */
+  void add_cells_used(uint32_t n) { cells_used_ += n; }
 
   /**
    * @brief Get a branch's parent handle
@@ -681,6 +724,30 @@ public:
     GrammarHandle h = next_grammar_handle_++;
     GrammarEntry entry;
     entry.sampler = grammar::init_sampler(model, grammar_str, root);
+    grammars_.emplace(h, std::move(entry));
+    return h;
+  }
+
+  /**
+   * @brief Create a lazy grammar (unconstrained until trigger fires)
+   * @param model Llama model (for vocab)
+   * @param grammar_str GBNF grammar string
+   * @param trigger_patterns Regex patterns that activate the grammar
+   * @param trigger_tokens Token IDs that activate the grammar
+   * @param root Root rule name (default "root")
+   * @return Handle to the new grammar, or 0 on failure
+   */
+  GrammarHandle create_grammar_lazy(
+      const llama_model* model,
+      const char* grammar_str,
+      const std::vector<std::string>& trigger_patterns,
+      const std::vector<llama_token>& trigger_tokens,
+      const char* root = "root") {
+    GrammarHandle h = next_grammar_handle_++;
+    GrammarEntry entry;
+    entry.sampler = grammar::init_lazy_sampler(
+        model, grammar_str, trigger_patterns, trigger_tokens, root);
+    if (!entry.sampler) return 0;
     grammars_.emplace(h, std::move(entry));
     return h;
   }
@@ -878,6 +945,7 @@ public:
       states[i]->has_logits = true;
       states[i]->position += 1;
     }
+    cells_used_ += static_cast<uint32_t>(items.size());
   }
 
   /**
@@ -985,6 +1053,11 @@ public:
         cursor += item_n;
       }
     }
+
+    // Accumulate total tokens decoded across all items
+    for (int32_t i = 0; i < n; ++i) {
+      cells_used_ += static_cast<uint32_t>(items[i].tokens.size());
+    }
   }
 
 private:
@@ -1085,6 +1158,11 @@ private:
   /// seq_id ownership invariant: only the BranchState that received a seq_id
   /// from allocate() may hold it, and only while its handle+generation is live.
   kv::tenancy::State tenancy_;
+
+  /// KV cells consumed. Incremented by decode_each/decode_scatter/add_cells_used,
+  /// reset to 0 by drain/init_tenancy/last-branch-release, set to position by
+  /// retainOnly. Not decremented on individual prune. See kv_pressure().
+  uint32_t cells_used_ = 0;
 
   /// Reusable scratch buffers for batched decode. Safe without locking because
   /// BranchStore requires external synchronization (caller's mutex).
@@ -1478,6 +1556,46 @@ inline void set_grammar(
 }
 
 /**
+ * @brief Set lazy grammar on a branch (unconstrained until trigger fires)
+ *
+ * Replaces any existing grammar. The lazy grammar accepts all tokens until
+ * a trigger pattern or token fires, then constrains subsequent generation.
+ *
+ * @param handle Branch handle
+ * @param model Llama model (for vocab)
+ * @param grammar_str GBNF grammar string
+ * @param trigger_patterns Regex patterns that activate the grammar
+ * @param trigger_tokens Token IDs that activate the grammar
+ * @param s Branch store
+ * @throws std::runtime_error if handle is invalid
+ */
+inline void set_grammar_lazy(
+    BranchHandle handle,
+    const llama_model* model,
+    const char* grammar_str,
+    const std::vector<std::string>& trigger_patterns,
+    const std::vector<llama_token>& trigger_tokens,
+    BranchStore& s) {
+  BranchState* state = s.get(handle);
+  if (!state) {
+    throw std::runtime_error("set_grammar_lazy: invalid branch handle");
+  }
+
+  if (state->grammar != 0) {
+    s.free_grammar(state->grammar);
+    state->grammar = 0;
+  }
+
+  if (grammar_str && grammar_str[0] != '\0') {
+    state->grammar = s.create_grammar_lazy(
+        model, grammar_str, trigger_patterns, trigger_tokens);
+  }
+
+  LLOYAL_LOG_DEBUG("[branch::set_grammar_lazy] %s grammar on handle=%u",
+                   state->grammar != 0 ? "Set" : "Cleared", handle);
+}
+
+/**
  * @brief Prune a leaf branch (RESTRICT — throws if children exist)
  *
  * Evicts the KV lease and frees all resources via BranchStore::release().
@@ -1590,6 +1708,7 @@ inline void prefill(
   }
 
   state->position += static_cast<llama_pos>(n_tokens);
+  s.add_cells_used(static_cast<uint32_t>(n_tokens));
 
   // logits::get() throws if logits unavailable
   const float* raw_logits = logits::get(state->ctx, -1);
@@ -1630,6 +1749,7 @@ inline void step(
     throw std::runtime_error("step: llama_decode failed");
   }
   state->position += 1;
+  s.add_cells_used(1);
 
   // logits::get() throws if logits unavailable
   const float* raw_logits = logits::get(state->ctx, -1);
