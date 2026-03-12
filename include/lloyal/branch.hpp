@@ -278,6 +278,7 @@ struct BranchState {
 
   llama_seq_id seq_id = NO_LEASE;  ///< KV cache sequence identifier (NO_LEASE when inactive)
   llama_pos position = 0;    ///< Current decode position in the sequence
+  llama_pos fork_head = 0;   ///< Parent's position at fork time (0 for root branches)
 
   SamplerChainHandle sampler_chain = 0;  ///< Handle into BranchStore's sampler registry
   GrammarHandle grammar = 0;             ///< Handle into BranchStore's grammar registry
@@ -471,6 +472,11 @@ public:
         c.erase(std::remove(c.begin(), c.end(), handle), c.end());
       }
     }
+    // Subtract unique cells owned by this branch (above fork_head)
+    if (st->position > st->fork_head) {
+      uint32_t unique = static_cast<uint32_t>(st->position - st->fork_head);
+      cells_used_ = (unique <= cells_used_) ? cells_used_ - unique : 0;
+    }
     // Evict lease (KV strip + bookkeeping)
     if (st->seq_id != NO_LEASE)
       kv::tenancy::evict(tenancy_, st->seq_id);
@@ -556,9 +562,9 @@ public:
   /**
    * @brief KV cache pressure snapshot — O(1), no tree walking
    *
-   * cells_used is a monotonic counter incremented on decode_each/decode_scatter,
-   * reset on drain/retainOnly/init_tenancy. Conservative: overcounts if branches
-   * are individually released mid-run (safe — triggers grace sooner).
+   * cells_used tracks unique KV cells per branch. Incremented on
+   * decode_each/decode_scatter, decremented on release (position - fork_head),
+   * reset on drain/retainOnly/init_tenancy.
    */
   KvPressure kv_pressure() const {
     if (!tenancy_.ctx) return {0, 0, 0};
@@ -578,6 +584,16 @@ public:
   BranchHandle parent(BranchHandle h) const {
     const BranchState* st = get(h);
     return st ? st->parent : INVALID_HANDLE;
+  }
+
+  /**
+   * @brief Get a branch's fork head (parent position at fork time)
+   * @param h Branch handle
+   * @return Fork head position (0 for root branches or invalid handles)
+   */
+  llama_pos fork_head(BranchHandle h) const {
+    const BranchState* st = get(h);
+    return st ? st->fork_head : 0;
   }
 
   /**
@@ -1089,6 +1105,7 @@ private:
     slot.model = nullptr;
     slot.seq_id = NO_LEASE;
     slot.position = 0;
+    slot.fork_head = 0;
     slot.sampler_chain = 0;
     slot.grammar = 0;
     slot.metrics = 0;
@@ -1160,8 +1177,8 @@ private:
   kv::tenancy::State tenancy_;
 
   /// KV cells consumed. Incremented by decode_each/decode_scatter/add_cells_used,
-  /// reset to 0 by drain/init_tenancy/last-branch-release, set to position by
-  /// retainOnly. Not decremented on individual prune. See kv_pressure().
+  /// decremented on release (unique cells = position - fork_head), reset to 0 by
+  /// drain/init_tenancy/last-branch-release, set to position by retainOnly.
   uint32_t cells_used_ = 0;
 
   /// Reusable scratch buffers for batched decode. Safe without locking because
@@ -1302,6 +1319,7 @@ inline BranchHandle fork(BranchHandle source, BranchStore& s) {
   dst->model = src->model;
   dst->seq_id = new_seq_id;
   dst->position = src->position;
+  dst->fork_head = src->position;
   dst->n_batch = src->n_batch;
   dst->n_vocab = src->n_vocab;
 
@@ -2264,6 +2282,17 @@ inline llama_pos get_position(BranchHandle handle, BranchStore& s) {
 }
 
 /**
+ * @brief Get the branch's fork head (parent position at fork time)
+ * @param handle Branch handle
+ * @param s Branch store
+ * @return Fork head position (0 for root branches or invalid handles)
+ */
+inline llama_pos get_fork_head(BranchHandle handle, BranchStore& s) {
+  const BranchState* state = s.get(handle);
+  return state ? state->fork_head : 0;
+}
+
+/**
  * @brief Get model-level perplexity (from raw logits)
  *
  * Returns perplexity computed from the full logit distribution before any
@@ -2505,6 +2534,8 @@ public:
 
   /// @brief Current decode position (token count)
   llama_pos position() const { return branch::get_position(handle_, *store_); }
+  /// @brief Parent's position at fork time (0 for root branches)
+  llama_pos forkHead() const { return branch::get_fork_head(handle_, *store_); }
   /// @brief Model-level perplexity (from raw logits, pre-filter)
   float perplexity() const { return branch::get_perplexity(handle_, *store_); }
   /// @brief Vocabulary size
