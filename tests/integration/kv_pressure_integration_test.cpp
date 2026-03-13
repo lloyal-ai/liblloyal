@@ -540,3 +540,71 @@ TEST_CASE("kv_pressure: pruneSubtree decrements correctly") {
   store.drain();
   llama_free(ctx);
 }
+
+TEST_CASE("kv_pressure: retainOnly resets fork_head") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 2048;
+  cparams.n_batch = 256;
+  cparams.n_seq_max = 8;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+
+  BranchStore store(16);
+  store.init_tenancy(ctx);
+  TestParams params;
+
+  // Create root, prefill
+  BranchHandle root = create(ctx, model.get(), store, 0, params, 256);
+  REQUIRE(root != INVALID_HANDLE);
+
+  const auto* vocab = llama_model_get_vocab(model.get());
+  auto tokens = tokenizer::tokenize(vocab, "RetainOnly fork_head regression test", true, false);
+  DecodeScatterItem prefill{root, std::span<const llama_token>(tokens)};
+  store.decode_scatter(std::span<const DecodeScatterItem>(&prefill, 1));
+
+  uint32_t prefill_n = static_cast<uint32_t>(tokens.size());
+
+  // Fork child from root, generate tokens on child
+  BranchHandle child = fork(root, store);
+  REQUIRE(child != INVALID_HANDLE);
+  CHECK(get_fork_head(child, store) == static_cast<llama_pos>(prefill_n));
+
+  const int gen_steps = 5;
+  for (int i = 0; i < gen_steps; ++i) {
+    llama_token t = sample(child, store);
+    accept_token(child, t, store);
+    DecodeEachItem item{child, t};
+    store.decode_each(std::span<const DecodeEachItem>(&item, 1));
+  }
+
+  CHECK(store.kv_pressure().cells_used == prefill_n + gen_steps);
+
+  // retainOnly(child) — child becomes root, fork_head must reset to 0
+  store.retainOnly(child);
+  CHECK(get_fork_head(child, store) == 0);
+  CHECK(store.kv_pressure().cells_used == prefill_n + gen_steps);
+
+  // Generate more tokens on the promoted root
+  const int gen_steps2 = 3;
+  for (int i = 0; i < gen_steps2; ++i) {
+    llama_token t = sample(child, store);
+    accept_token(child, t, store);
+    DecodeEachItem item{child, t};
+    store.decode_each(std::span<const DecodeEachItem>(&item, 1));
+  }
+
+  CHECK(store.kv_pressure().cells_used == prefill_n + gen_steps + gen_steps2);
+
+  // Release promoted root — should decrement full position (not position - stale fork_head)
+  prune(child, store);
+  CHECK(store.kv_pressure().cells_used == 0);
+
+  store.drain();
+  llama_free(ctx);
+}

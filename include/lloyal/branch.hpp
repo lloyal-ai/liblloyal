@@ -547,6 +547,7 @@ public:
     for (auto h : losers)
       release_slot_only(h);  // CPU only, KV already stripped
     w->parent = INVALID_HANDLE;
+    w->fork_head = 0;
     w->children.clear();
     cells_used_ = static_cast<uint32_t>(w->position);
   }
