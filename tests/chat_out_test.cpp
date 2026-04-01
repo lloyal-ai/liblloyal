@@ -81,13 +81,13 @@ TEST_CASE("ChatOut: parse empty string") {
   CHECK(result.tool_calls.empty());
 }
 
-TEST_CASE("ChatOut: parse with thinking_forced_open") {
+TEST_CASE("ChatOut: parse with generation_prompt") {
   auto result = lloyal::chat_out::parse(
     "still thinking",
     COMMON_CHAT_FORMAT_DEEPSEEK_R1,
     COMMON_REASONING_FORMAT_DEEPSEEK,
-    false,  // is_partial
-    true    // thinking_forced_open
+    false,        // is_partial
+    "<think>"     // generation_prompt
   );
 
   // Stub passthrough — just verify no crash

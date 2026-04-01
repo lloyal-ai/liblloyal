@@ -107,9 +107,8 @@ constexpr uint32_t INDEX_MASK = 0xFFFF;     ///< Mask for slot index field
  * init_tenancy(), and when the last active branch is released. retainOnly()
  * resets it to the surviving branch's position.
  *
- * Conservative: overcounts if individual branches are pruned mid-run
- * (prune does NOT decrement), which is safe — it triggers soft limits
- * sooner rather than later.
+ * Decremented on release: each pruned branch subtracts its unique cells
+ * (position - fork_head). Pressure recovers as branches are freed.
  */
 struct KvPressure {
   uint32_t n_ctx;       ///< Total KV capacity

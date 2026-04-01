@@ -111,7 +111,7 @@ struct common_chat_params {
   std::string prompt;
   std::string grammar;
   bool grammar_lazy = false;
-  bool thinking_forced_open = false;
+  std::string generation_prompt;
   std::vector<common_grammar_trigger> grammar_triggers;
   std::vector<std::string> preserved_tokens;
   std::vector<std::string> additional_stops;
@@ -123,14 +123,14 @@ struct common_chat_parser_params {
   common_chat_format format = COMMON_CHAT_FORMAT_CONTENT_ONLY;
   common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_NONE;
   bool reasoning_in_content = false;
-  bool thinking_forced_open = false;
+  std::string generation_prompt;
   bool parse_tool_calls = true;
   common_peg_arena parser = {};
 
   common_chat_parser_params() = default;
   common_chat_parser_params(const common_chat_params& chat_params) {
     format = chat_params.format;
-    thinking_forced_open = chat_params.thinking_forced_open;
+    generation_prompt = chat_params.generation_prompt;
   }
 };
 

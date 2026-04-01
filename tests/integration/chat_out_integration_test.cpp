@@ -93,7 +93,7 @@ TEST_CASE("ChatOut Integration: parse with format from chat_in roundtrip") {
     fmt.format,
     fmt.reasoning_format,
     false,
-    fmt.thinking_forced_open,
+    fmt.generation_prompt,
     fmt.parser
   );
 

@@ -89,7 +89,7 @@ struct FormatResult {
   common_chat_format format = COMMON_CHAT_FORMAT_CONTENT_ONLY;  ///< Detected chat format
   std::string grammar;                             ///< GBNF grammar for constrained sampling
   bool grammar_lazy = false;                       ///< Whether grammar should use lazy compilation
-  bool thinking_forced_open = false;               ///< Whether thinking tag is forced open
+  std::string generation_prompt;                    ///< Generation prompt prefill (e.g. "<think>")
   std::vector<common_grammar_trigger> grammar_triggers; ///< Triggers for lazy grammar activation
   std::vector<std::string> preserved_tokens;       ///< Tokens to preserve during grammar constraining
   std::string parser;                              ///< PEG parser definition (for PEG formats)
@@ -206,7 +206,7 @@ inline FormatResult format(const llama_model *model, const FormatInputs& inputs)
       result.format = params.format;
       result.grammar = params.grammar;
       result.grammar_lazy = params.grammar_lazy;
-      result.thinking_forced_open = params.thinking_forced_open;
+      result.generation_prompt = params.generation_prompt;
       result.grammar_triggers = params.grammar_triggers;
       result.preserved_tokens = params.preserved_tokens;
       result.parser = params.parser;

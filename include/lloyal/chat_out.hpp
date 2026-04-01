@@ -60,7 +60,7 @@ struct ToolCall {
  *
  * @code{.cpp}
  * auto parsed = chat_out::parse(raw_output, fmt.format, fmt.reasoning_format,
- *                                false, fmt.thinking_forced_open, fmt.parser);
+ *                                false, fmt.generation_prompt, fmt.parser);
  *
  * // Build assistant message with separate fields
  * json assistant_msg = {{"role", "assistant"}, {"content", parsed.content}};
@@ -91,7 +91,7 @@ struct ParseResult {
  * @param format The chat format (from chat_in::FormatResult.format)
  * @param reasoning_format How to handle reasoning/thinking blocks
  * @param is_partial True if output is incomplete (streaming)
- * @param thinking_forced_open Whether thinking tag was forced open
+ * @param generation_prompt Generation prompt prefill text (e.g. "<think>")
  * @param parser_data Serialized PEG parser (from chat_in::FormatResult.parser).
  *                    Required for PEG format models; ignored for others.
  *
@@ -109,7 +109,7 @@ struct ParseResult {
  * auto fmt = chat_in::format(model, inputs);
  * // ... generate tokens ...
  * auto parsed = chat_out::parse(output_text, fmt.format, fmt.reasoning_format,
- *                                false, fmt.thinking_forced_open, fmt.parser);
+ *                                false, fmt.generation_prompt, fmt.parser);
  * if (!parsed.tool_calls.empty()) {
  *   // Handle tool calls
  * }
@@ -129,7 +129,7 @@ struct ParseResult {
  *
  * // Parse: separates reasoning from content
  * auto parsed = chat_out::parse(raw_output, fmt.format,
- *     fmt.reasoning_format, false, fmt.thinking_forced_open, fmt.parser);
+ *     fmt.reasoning_format, false, fmt.generation_prompt, fmt.parser);
  *
  * // Store with separate fields for correct re-formatting on cold restart
  * json msg = {{"role", "assistant"}, {"content", parsed.content}};
@@ -144,7 +144,7 @@ inline ParseResult parse(
     common_chat_format format,
     common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_NONE,
     bool is_partial = false,
-    bool thinking_forced_open = false,
+    const std::string& generation_prompt = "",
     const std::string& parser_data = ""
 ) {
   ParseResult result;
@@ -154,7 +154,7 @@ inline ParseResult parse(
     common_chat_parser_params syntax;
     syntax.format = format;
     syntax.reasoning_format = reasoning_format;
-    syntax.thinking_forced_open = thinking_forced_open;
+    syntax.generation_prompt = generation_prompt;
 
     // Load serialized PEG parser if provided (required for PEG format models)
     if (!parser_data.empty()) {
@@ -222,7 +222,7 @@ inline ParseResult parse(
 
     // Delegate to explicit-format overload
     return parse(output, params.format, COMMON_REASONING_FORMAT_NONE, is_partial,
-                 params.thinking_forced_open);
+                 params.generation_prompt);
 
   } catch (const std::exception& e) {
     LLOYAL_LOG_DEBUG("[chat_out::parse] Auto-detect failed: %s", e.what());

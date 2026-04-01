@@ -368,5 +368,5 @@ TEST_CASE("ChatIn: format returns default format when no tools") {
   CHECK(result.preserved_tokens.empty());
   CHECK(result.parser.empty());
   CHECK(!result.grammar_lazy);
-  CHECK(!result.thinking_forced_open);
+  CHECK(result.generation_prompt.empty());
 }
