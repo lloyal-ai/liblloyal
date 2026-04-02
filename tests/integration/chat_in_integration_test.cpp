@@ -925,6 +925,7 @@ TEST_CASE("ChatIn Integration: warm multi-turn conversation with semantic recall
       {{"role", "user"}, {"content", user_msg}}
     }).dump();
 
+    inputs.enable_thinking = false;
     auto result = lloyal::chat_in::format(model.get(), inputs);
     MESSAGE("warm_turn format: [" << result.prompt << "]");
     auto delta = lloyal::tokenizer::tokenize(vocab, result.prompt, false, true);
@@ -943,6 +944,7 @@ TEST_CASE("ChatIn Integration: warm multi-turn conversation with semantic recall
     inputs.messages_json = json::array({
       {{"role", "user"}, {"content", "Hi, my name is Lloyal"}}
     }).dump();
+    inputs.enable_thinking = false;
 
     auto result = lloyal::chat_in::format(model.get(), inputs);
     auto tokens = lloyal::tokenizer::tokenize(vocab, result.prompt, true, true);

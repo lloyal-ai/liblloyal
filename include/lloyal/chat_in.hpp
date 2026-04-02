@@ -181,22 +181,77 @@ inline FormatResult format(const llama_model *model, const FormatInputs& inputs)
       // empty system message — the library completes the intent by removing the
       // rendered empty block, leaving only the user+assistant portion.
       if (!messages.empty() && messages[0].role == "system" && messages[0].content.empty()) {
-        common_chat_msg sys_msg;
-        sys_msg.role = "system";
-        sys_msg.content = "";
+        bool stripped = false;
 
-        common_chat_templates_inputs sys_inputs;
-        sys_inputs.messages = {sys_msg};
-        sys_inputs.add_generation_prompt = false;
-        sys_inputs.use_jinja = true;
-        auto sys_params = common_chat_templates_apply(tmpls.get(), sys_inputs);
+        // Primary: format [{system:""}] to learn the empty system prefix
+        try {
+          common_chat_msg sys_msg;
+          sys_msg.role = "system";
+          sys_msg.content = "";
 
-        const auto& sys_prefix = sys_params.prompt;
-        if (!sys_prefix.empty() &&
-            params.prompt.size() >= sys_prefix.size() &&
-            params.prompt.substr(0, sys_prefix.size()) == sys_prefix) {
-          params.prompt = params.prompt.substr(sys_prefix.size());
-          LLOYAL_LOG_DEBUG("[chat_in::format] Stripped empty system prefix (%zu bytes)", sys_prefix.size());
+          common_chat_templates_inputs sys_inputs;
+          sys_inputs.messages = {sys_msg};
+          sys_inputs.add_generation_prompt = false;
+          sys_inputs.use_jinja = true;
+          auto sys_params = common_chat_templates_apply(tmpls.get(), sys_inputs);
+
+          const auto& sys_prefix = sys_params.prompt;
+          if (!sys_prefix.empty() &&
+              params.prompt.size() >= sys_prefix.size() &&
+              params.prompt.substr(0, sys_prefix.size()) == sys_prefix) {
+            params.prompt = params.prompt.substr(sys_prefix.size());
+            stripped = true;
+            LLOYAL_LOG_DEBUG("[chat_in::format] Stripped empty system prefix (%zu bytes)", sys_prefix.size());
+          }
+        } catch (const std::exception &e) {
+          LLOYAL_LOG_DEBUG("[chat_in::format] Primary stripping failed: %s", e.what());
+        }
+
+        // Sentinel fallback: template requires a user message (e.g. Qwen 3.5).
+        // Format [{system:""}, {user:SENTINEL}] and [{user:SENTINEL}], subtract
+        // to learn the empty system prefix.
+        if (!stripped) {
+          try {
+            static const std::string SENTINEL = "\x1F__LLOYAL_SYS_STRIP__\x1F";
+
+            common_chat_msg sys_msg;
+            sys_msg.role = "system";
+            sys_msg.content = "";
+            common_chat_msg user_msg;
+            user_msg.role = "user";
+            user_msg.content = SENTINEL;
+
+            common_chat_templates_inputs with_sys;
+            with_sys.messages = {sys_msg, user_msg};
+            with_sys.add_generation_prompt = false;
+            with_sys.use_jinja = true;
+            auto with_sys_params = common_chat_templates_apply(tmpls.get(), with_sys);
+
+            common_chat_templates_inputs without_sys;
+            without_sys.messages = {user_msg};
+            without_sys.add_generation_prompt = false;
+            without_sys.use_jinja = true;
+            auto without_sys_params = common_chat_templates_apply(tmpls.get(), without_sys);
+
+            const auto& with_prompt = with_sys_params.prompt;
+            const auto& without_prompt = without_sys_params.prompt;
+
+            // If with_sys ends with without_sys, the prefix is the difference
+            if (with_prompt.size() > without_prompt.size() &&
+                with_prompt.substr(with_prompt.size() - without_prompt.size()) == without_prompt) {
+              std::string sys_prefix = with_prompt.substr(0, with_prompt.size() - without_prompt.size());
+              if (!sys_prefix.empty() &&
+                  params.prompt.size() >= sys_prefix.size() &&
+                  params.prompt.substr(0, sys_prefix.size()) == sys_prefix) {
+                params.prompt = params.prompt.substr(sys_prefix.size());
+                LLOYAL_LOG_DEBUG("[chat_in::format] Stripped empty system prefix via sentinel (%zu bytes)", sys_prefix.size());
+              }
+            } else {
+              LLOYAL_LOG_DEBUG("[chat_in::format] Sentinel subtraction failed, skipping strip");
+            }
+          } catch (const std::exception &e) {
+            LLOYAL_LOG_DEBUG("[chat_in::format] Sentinel stripping also failed: %s", e.what());
+          }
         }
       }
 
@@ -224,6 +279,95 @@ inline FormatResult format(const llama_model *model, const FormatInputs& inputs)
 
   } catch (const std::exception &e) {
     LLOYAL_LOG_DEBUG("[chat_in::format] Template processing failed: %s", e.what());
+
+    // Retry with synthetic user: templates like Qwen 3.5 require a user message.
+    // Inject a sentinel user message, re-apply the template, then strip the
+    // sentinel user turn from the output to recover just the system/tool portion.
+    try {
+      using json = nlohmann::ordered_json;
+      json messages_array = json::parse(inputs.messages_json);
+
+      common_chat_templates_ptr tmpls = common_chat_templates_init(model, inputs.template_override);
+      if (tmpls) {
+        static const std::string SENTINEL = "\x1F__LLOYAL_RETRY__\x1F";
+
+        std::vector<common_chat_msg> messages = common_chat_msgs_parse_oaicompat(messages_array);
+
+        // Check that no user role exists (otherwise the failure was something else)
+        bool has_user = false;
+        for (const auto& m : messages) {
+          if (m.role == "user") { has_user = true; break; }
+        }
+
+        if (!has_user) {
+          // Build augmented messages: original + synthetic user
+          std::vector<common_chat_msg> augmented = messages;
+          common_chat_msg sentinel_user;
+          sentinel_user.role = "user";
+          sentinel_user.content = SENTINEL;
+          augmented.push_back(sentinel_user);
+
+          common_chat_templates_inputs tmpl_inputs;
+          tmpl_inputs.messages = augmented;
+          tmpl_inputs.add_generation_prompt = false;
+          tmpl_inputs.use_jinja = true;
+
+          // Carry over tools so the system block includes tool definitions
+          if (!inputs.tools_json.empty()) {
+            json tools_array = json::parse(inputs.tools_json);
+            tmpl_inputs.tools = common_chat_tools_parse_oaicompat(tools_array);
+            tmpl_inputs.tool_choice = common_chat_tool_choice_parse_oaicompat(inputs.tool_choice);
+            tmpl_inputs.parallel_tool_calls = inputs.parallel_tool_calls;
+          }
+          tmpl_inputs.reasoning_format = common_reasoning_format_from_name(inputs.reasoning_format);
+          tmpl_inputs.enable_thinking = inputs.enable_thinking;
+          tmpl_inputs.json_schema = inputs.json_schema;
+          tmpl_inputs.grammar = inputs.grammar;
+
+          common_chat_params params = common_chat_templates_apply(tmpls.get(), tmpl_inputs);
+
+          // Also format just [{user:SENTINEL}] to learn its rendered form
+          common_chat_msg user_only_msg;
+          user_only_msg.role = "user";
+          user_only_msg.content = SENTINEL;
+
+          common_chat_templates_inputs user_only_inputs;
+          user_only_inputs.messages = {user_only_msg};
+          user_only_inputs.add_generation_prompt = false;
+          user_only_inputs.use_jinja = true;
+          auto user_only_params = common_chat_templates_apply(tmpls.get(), user_only_inputs);
+
+          const auto& full = params.prompt;
+          const auto& user_suffix = user_only_params.prompt;
+
+          // Strip the sentinel user turn from the end
+          if (full.size() > user_suffix.size() &&
+              full.substr(full.size() - user_suffix.size()) == user_suffix) {
+            params.prompt = full.substr(0, full.size() - user_suffix.size());
+
+            result.prompt = params.prompt;
+            result.additional_stops = params.additional_stops;
+            result.format = params.format;
+            result.grammar = params.grammar;
+            result.grammar_lazy = params.grammar_lazy;
+            result.generation_prompt = params.generation_prompt;
+            result.grammar_triggers = params.grammar_triggers;
+            result.preserved_tokens = params.preserved_tokens;
+            result.parser = params.parser;
+            result.reasoning_format = tmpl_inputs.reasoning_format;
+
+            LLOYAL_LOG_DEBUG(
+                "[chat_in::format] Retry with synthetic user succeeded, format=%d (%zu bytes)",
+                static_cast<int>(result.format), result.prompt.size());
+            return result;
+          } else {
+            LLOYAL_LOG_DEBUG("[chat_in::format] Retry sentinel subtraction failed");
+          }
+        }
+      }
+    } catch (const std::exception &e2) {
+      LLOYAL_LOG_DEBUG("[chat_in::format] Retry also failed: %s", e2.what());
+    }
   }
 
 fallback:
