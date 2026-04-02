@@ -348,6 +348,40 @@ inline FormatResult format(const llama_model *model, const FormatInputs& inputs)
               full.substr(full.size() - user_suffix.size()) == user_suffix) {
             params.prompt = full.substr(0, full.size() - user_suffix.size());
 
+            // Strip empty system block if messages[0] is {system, ""}
+            if (!messages.empty() && messages[0].role == "system" && messages[0].content.empty()) {
+              // Use sentinel subtraction: [{system:""}, {user:S}] minus [{user:S}]
+              common_chat_msg sys_msg;  sys_msg.role = "system"; sys_msg.content = "";
+              common_chat_msg usr_msg;  usr_msg.role = "user";   usr_msg.content = SENTINEL;
+
+              common_chat_templates_inputs with_sys_inputs;
+              with_sys_inputs.messages = {sys_msg, usr_msg};
+              with_sys_inputs.add_generation_prompt = false;
+              with_sys_inputs.use_jinja = true;
+
+              common_chat_templates_inputs without_sys_inputs;
+              without_sys_inputs.messages = {usr_msg};
+              without_sys_inputs.add_generation_prompt = false;
+              without_sys_inputs.use_jinja = true;
+
+              try {
+                auto with_sys = common_chat_templates_apply(tmpls.get(), with_sys_inputs);
+                auto without_sys = common_chat_templates_apply(tmpls.get(), without_sys_inputs);
+                if (with_sys.prompt.size() > without_sys.prompt.size() &&
+                    with_sys.prompt.substr(with_sys.prompt.size() - without_sys.prompt.size()) == without_sys.prompt) {
+                  std::string sys_prefix = with_sys.prompt.substr(0, with_sys.prompt.size() - without_sys.prompt.size());
+                  if (!sys_prefix.empty() &&
+                      params.prompt.size() >= sys_prefix.size() &&
+                      params.prompt.substr(0, sys_prefix.size()) == sys_prefix) {
+                    params.prompt = params.prompt.substr(sys_prefix.size());
+                    LLOYAL_LOG_DEBUG("[chat_in::format] Retry: stripped empty system prefix (%zu bytes)", sys_prefix.size());
+                  }
+                }
+              } catch (...) {
+                // Stripping failed — proceed without it
+              }
+            }
+
             result.prompt = params.prompt;
             result.additional_stops = params.additional_stops;
             result.format = params.format;
