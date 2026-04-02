@@ -53,7 +53,7 @@ ctest --test-dir build
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the Apache 2.0 License.
+By contributing, you agree that your contributions will be licensed under the Business Source License 1.1. See [LICENSE](./LICENSE) for details.
 
 ## Questions?
 
