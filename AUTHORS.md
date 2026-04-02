@@ -40,6 +40,6 @@ This library wraps and depends on llama.cpp:
 
 ## License
 
-liblloyal is licensed under the Business Source License 1.1. See [LICENSE](./LICENSE) for details.
+liblloyal itself is licensed under Apache 2.0.
 
 Vendored dependencies retain their original licenses (MIT) as noted above.

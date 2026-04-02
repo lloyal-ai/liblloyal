@@ -1,7 +1,7 @@
 # liblloyal
 
 [![Tests](https://github.com/lloyal-ai/liblloyal/actions/workflows/tests.yml/badge.svg)](https://github.com/lloyal-ai/liblloyal/actions/workflows/tests.yml)
-[![License](https://img.shields.io/badge/License-BSL%201.1-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![C++](https://img.shields.io/badge/C++-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
 [![llama.cpp](https://img.shields.io/badge/llama.cpp-b8087-green.svg)](https://github.com/ggml-org/llama.cpp/releases/tag/b8087)
 
@@ -339,13 +339,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development guidelines.
 
 ## License
 
-liblloyal is licensed under the [Business Source License 1.1](./LICENSE).
-
-**Free for:** non-commercial use, academic research, personal projects, evaluation.
-
-**Commercial use:** requires a separate license from [Lloyal Labs](mailto:licensing@lloyal.ai).
-
-After 4 years from each release, the code converts to Apache 2.0.
-
-All other packages in the lloyal ecosystem (lloyal.node, lloyal-sdk, lloyal-agents,
-@lloyal-labs/rig, nitro-llama) remain open-source under their respective licenses.
+Apache 2.0 — See LICENSE file for details

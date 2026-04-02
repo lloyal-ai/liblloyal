@@ -1,9 +1,7 @@
-// Copyright (c) 2024-2026 Lloyal Labs
-// Licensed under the Business Source License 1.1 (the "License");
-// you may not use this file except in compliance with the License.
-// See LICENSE in the root of this repository.
-
 #pragma once
+
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Lloyal Labs
 
 
 /**
@@ -11,7 +9,7 @@
  *
  * Header-only library for llama.cpp-bound LLM operations
  * Version: 1.0.0 (bound to llama.cpp b8087)
- * License: BSL-1.1
+ * License: Apache-2.0
  */
 
 // ===== PLATFORM-NATIVE LOGGING =====
