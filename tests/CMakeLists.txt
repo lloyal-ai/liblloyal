@@ -176,6 +176,7 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
     integration/logits_integration_test.cpp
     integration/branch_integration_test.cpp
     integration/kv_pressure_integration_test.cpp
+    integration/contrastive_logits_test.cpp
   )
 
   # Create llama/ subdirectory and symlink headers so #include <llama/llama.h> works

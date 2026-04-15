@@ -1077,6 +1077,71 @@ public:
     }
   }
 
+  /**
+   * @brief Merge experts' logits_snapshot into dst's logits_snapshot
+   *
+   * Accumulates additively (in log-probability space):
+   *   dst.logits_snapshot[t] += alpha * sum_i(experts[i].logits_snapshot[t])
+   *
+   * Mutates `dst` in place. After this call, `sample`/`produce` on `dst`
+   * draws from the combined distribution via `dst`'s existing sampler chain.
+   *
+   * Backend-agnostic: operates purely on cached logits buffers, no KV ops,
+   * no GPU dispatch. Works identically for transformer and recurrent backends.
+   *
+   * Inspired by DExperts-style contrastive decoding: experts are different
+   * KV states of the same model — their live logits_snapshot at each step
+   * reflect their own KV history, shaping `dst`'s next-token choice.
+   *
+   * @param dst_handle    Destination branch (must have captured logits)
+   * @param expert_handles Span of expert branches (all must have captured logits)
+   * @param alpha         Expert weight (additive in log space)
+   * @throws std::runtime_error if any handle invalid, logits not captured,
+   *         or n_vocab mismatch across branches
+   */
+  void merge_logits(
+      BranchHandle dst_handle,
+      std::span<const BranchHandle> expert_handles,
+      float alpha) {
+    BranchState* dst = get(dst_handle);
+    if (!dst) {
+      throw std::runtime_error("BranchStore::merge_logits - invalid dst handle");
+    }
+    if (!dst->has_logits) {
+      throw std::runtime_error("BranchStore::merge_logits - dst has no captured logits");
+    }
+    if (dst->n_vocab <= 0) {
+      throw std::runtime_error("BranchStore::merge_logits - dst n_vocab invalid");
+    }
+
+    const int32_t n_vocab = dst->n_vocab;
+    float* dst_logits = dst->logits_snapshot.data();
+
+    for (size_t i = 0; i < expert_handles.size(); ++i) {
+      BranchState* src = get(expert_handles[i]);
+      if (!src) {
+        throw std::runtime_error(
+            "BranchStore::merge_logits - invalid expert handle at index " +
+            std::to_string(i));
+      }
+      if (!src->has_logits) {
+        throw std::runtime_error(
+            "BranchStore::merge_logits - expert has no captured logits at index " +
+            std::to_string(i));
+      }
+      if (src->n_vocab != n_vocab) {
+        throw std::runtime_error(
+            "BranchStore::merge_logits - n_vocab mismatch at index " +
+            std::to_string(i));
+      }
+
+      const float* src_logits = src->logits_snapshot.data();
+      for (int32_t t = 0; t < n_vocab; ++t) {
+        dst_logits[t] += alpha * src_logits[t];
+      }
+    }
+  }
+
 private:
   /// @brief Free owned resources (sampler, grammar, boundary tracker, metrics)
   void free_branch_resources(BranchState& slot) {
@@ -1802,6 +1867,43 @@ inline const float* get_logits(BranchHandle handle, BranchStore& s) {
   }
 
   return state->logits_snapshot.data();
+}
+
+/**
+ * @brief Overwrite a branch's logits_snapshot with caller-provided values
+ *
+ * Copies `data.size()` floats into `state->logits_snapshot`. The branch's KV
+ * state is unchanged — only the cached next-token distribution is replaced.
+ * After this call, `sample()` / `produce()` on this branch reads the supplied
+ * values (then runs the branch's sampler chain on top: grammar, logit_bias,
+ * steer, temperature, etc.).
+ *
+ * Companion to `get_logits()`: read out, compute, write back. Use cases include
+ * distributions computed in JS/TS, save/restore patterns across decision
+ * points, and custom merge rules that aren't covered by `BranchStore::merge_logits`.
+ *
+ * @param handle Branch to write to
+ * @param data   Span of n_vocab floats (must match branch's vocab size)
+ * @param s      Branch store
+ * @throws std::runtime_error if handle invalid or data length mismatches n_vocab
+ */
+inline void set_logits(BranchHandle handle, std::span<const float> data, BranchStore& s) {
+  BranchState* state = s.get(handle);
+  if (!state) {
+    throw std::runtime_error("set_logits: invalid handle");
+  }
+  if (state->n_vocab <= 0) {
+    throw std::runtime_error("set_logits: invalid vocab size");
+  }
+  if (static_cast<int32_t>(data.size()) != state->n_vocab) {
+    throw std::runtime_error(
+        "set_logits: data length (" + std::to_string(data.size()) +
+        ") does not match branch n_vocab (" + std::to_string(state->n_vocab) + ")");
+  }
+
+  std::memcpy(state->logits_snapshot.data(), data.data(),
+              state->n_vocab * sizeof(float));
+  state->has_logits = true;
 }
 
 /**
