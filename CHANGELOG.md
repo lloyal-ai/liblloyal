@@ -5,6 +5,19 @@ All notable changes to liblloyal will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 3.0.0 — 2026-06-12
+
+- **Relicensed from Apache 2.0 to FSL-1.1-Apache-2.0** (Functional Source
+  License; each release converts to Apache 2.0 after two years). See LICENSE,
+  NOTICE, and LICENSE-FAQ.md.
+- llama.cpp pinned to b9581 (build-llama.sh gains LLAMA_BUILD_APP=OFF;
+  test CMake adapts to the llama-common/common-base split).
+- Branch natives: `branch::get_logits_at` (position logit reads) and
+  `ForkOpts{clone_logits}` — the primitives behind the SDK's single-decode
+  rerank scoring.
+- +307-line branch integration test covering fork/logits semantics.
+
+
 ## [Unreleased]
 
 ## [1.0.1-alpha] - 2025-01-25

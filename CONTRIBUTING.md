@@ -53,7 +53,7 @@ ctest --test-dir build
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the Apache 2.0 License.
+By contributing, you agree that your contributions are licensed under the project's license: the Functional Source License, Version 1.1, with Apache 2.0 Future License (FSL-1.1-Apache-2.0) — the same inbound and outbound terms. Each release converts to Apache 2.0 per the License's Future License clause. See [LICENSE](./LICENSE) and [LICENSE-FAQ.md](./LICENSE-FAQ.md).
 
 ## Questions?
 

@@ -236,3 +236,14 @@ worry about it.
 - [Fair Source](https://fair.io) — the category FSL belongs to
 - [The FSL template, instantiated for each repo](./fsl-template)
 - [Why we chose FSL over BSL, Apache, or a custom license](./why-fsl)
+
+## Is there a safe harbor for building products with the HDK?
+
+Yes. The [Lloyal Harness Builder Grant](./GRANT.md) irrevocably guarantees
+that building, selling, and hosting Harnesses and Apps is a Permitted Purpose
+and never a Competing Use — even products that compete head-on with Lloyal's
+own (including reasoning.run). Only three uses remain restricted: offering the
+HDK itself as a developer framework, hosting the HDK as-a-service for
+third-party developers, and operating a general-purpose App distribution
+channel. Private/internal App distribution and your Harness's own plugin
+system are explicitly permitted.
