@@ -30,6 +30,7 @@
 #include <lloyal/model_registry.hpp>
 #include <lloyal/tokenizer.hpp>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -2804,3 +2805,309 @@ TEST_CASE("branch integration: lazy grammar allows free generation before trigge
   prune(h, store);
   llama_free(ctx);
 }
+
+// ============================================================================
+// R5 (rerank hardening): ForkOpts{clone_logits=false} + get_logits_at
+// ============================================================================
+
+TEST_CASE("branch integration: fork ForkOpts{clone_logits=false} leaves child without logits") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 1024;
+  cparams.n_batch = 64;
+  cparams.n_seq_max = 4;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+  TestParams params;
+
+  BranchHandle parent = create(ctx, model.get(), store, 0, params, 64);
+  REQUIRE(parent != INVALID_HANDLE);
+
+  const llama_vocab* vocab = llama_model_get_vocab(model.get());
+  auto prompt = tokenizer::tokenize(vocab, "Once upon a time", true, false);
+  REQUIRE(!prompt.empty());
+  prefill(parent, prompt.data(), prompt.size(), store);
+
+  // Parent has logits captured
+  REQUIRE(get_logits(parent, store) != nullptr);
+
+  // Default fork (clone_logits=true) — child has logits
+  BranchHandle child_clone = fork(parent, store);
+  REQUIRE(child_clone != INVALID_HANDLE);
+  CHECK(get_logits(child_clone, store) != nullptr);
+
+  // R5(a): Fork with clone_logits=false — child should NOT have logits captured
+  BranchHandle child_skip = fork(parent, store, ForkOpts{ /*clone_logits=*/ false });
+  REQUIRE(child_skip != INVALID_HANDLE);
+  CHECK(get_logits(child_skip, store) == nullptr);
+
+  // KV is still copied (forks share the same prefix), only the logits snapshot is skipped
+  CHECK(get_position(child_skip, store) == get_position(parent, store));
+
+  // After prefill on the skip-clone child, it captures fresh logits
+  auto cont = tokenizer::tokenize(vocab, " princess", false, false);
+  REQUIRE(!cont.empty());
+  prefill(child_skip, cont.data(), cont.size(), store);
+  CHECK(get_logits(child_skip, store) != nullptr);
+
+  pruneSubtree(parent, store);
+  llama_free(ctx);
+}
+
+TEST_CASE("branch integration: get_logits_at bounds check + reads from logits_snapshot") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 1024;
+  cparams.n_batch = 64;
+  cparams.n_seq_max = 4;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+  TestParams params;
+
+  BranchHandle h = create(ctx, model.get(), store, 0, params, 64);
+  REQUIRE(h != INVALID_HANDLE);
+
+  const llama_vocab* vocab = llama_model_get_vocab(model.get());
+  auto prompt = tokenizer::tokenize(vocab, "The answer is", true, false);
+  REQUIRE(!prompt.empty());
+  prefill(h, prompt.data(), prompt.size(), store);
+
+  int n_vocab = get_n_vocab(h, store);
+  REQUIRE(n_vocab > 0);
+
+  // R5(b): valid in-range reads match the full-buffer values from get_logits()
+  const float* logits_full = get_logits(h, store);
+  REQUIRE(logits_full != nullptr);
+
+  const std::vector<int32_t> indices_v = {0, 1, n_vocab / 2, n_vocab - 1};
+  std::vector<float> out(indices_v.size());
+  CHECK_NOTHROW(get_logits_at(h,
+                              std::span<const int32_t>(indices_v.data(), indices_v.size()),
+                              std::span<float>(out.data(), out.size()),
+                              store));
+  for (size_t i = 0; i < indices_v.size(); ++i) {
+    CHECK(out[i] == logits_full[indices_v[i]]);
+  }
+
+  // OOB negative index throws
+  const std::vector<int32_t> oob_neg = { -1 };
+  std::vector<float> out1(1);
+  CHECK_THROWS_AS(
+      get_logits_at(h,
+                    std::span<const int32_t>(oob_neg.data(), oob_neg.size()),
+                    std::span<float>(out1.data(), out1.size()),
+                    store),
+      std::runtime_error);
+
+  // OOB >= n_vocab throws
+  const std::vector<int32_t> oob_high = { n_vocab };
+  CHECK_THROWS_AS(
+      get_logits_at(h,
+                    std::span<const int32_t>(oob_high.data(), oob_high.size()),
+                    std::span<float>(out1.data(), out1.size()),
+                    store),
+      std::runtime_error);
+
+  // Size mismatch (indices.size() != out.size()) throws
+  const std::vector<int32_t> two_indices = { 0, 1 };
+  std::vector<float> one_out(1);
+  CHECK_THROWS_AS(
+      get_logits_at(h,
+                    std::span<const int32_t>(two_indices.data(), two_indices.size()),
+                    std::span<float>(one_out.data(), one_out.size()),
+                    store),
+      std::runtime_error);
+
+  // No-logits handle (fresh branch, no prefill) throws
+  BranchHandle fresh = create(ctx, model.get(), store, 0, params, 64);
+  REQUIRE(fresh != INVALID_HANDLE);
+  REQUIRE(get_logits(fresh, store) == nullptr);
+  const std::vector<int32_t> idx0 = { 0 };
+  std::vector<float> out0(1);
+  CHECK_THROWS_AS(
+      get_logits_at(fresh,
+                    std::span<const int32_t>(idx0.data(), idx0.size()),
+                    std::span<float>(out0.data(), out0.size()),
+                    store),
+      std::runtime_error);
+
+  pruneSubtree(h, store);
+  prune(fresh, store);
+  llama_free(ctx);
+}
+
+TEST_CASE("branch integration: get_logits_at reads per-branch snapshot after decode_each") {
+  // Anchors the contract _branchLogitsAt depends on: when N branches decode
+  // through the batched dispatch, each branch's get_logits_at must read from
+  // its own logits_snapshot, NOT from a shared ctx-buffer. Mirrors decode_each
+  // test but probes via get_logits_at instead of get_logits.
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 1024;
+  cparams.n_batch = 128;
+  cparams.n_seq_max = 8;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+
+  BranchStore store(16);
+  store.init_tenancy(ctx);
+  TestParams params;
+
+  const llama_vocab* vocab = llama_model_get_vocab(model.get());
+  int32_t n_vocab = llama_vocab_n_tokens(vocab);
+  auto prompt = tokenizer::tokenize(vocab, "The answer is", true, false);
+  REQUIRE(!prompt.empty());
+
+  BranchHandle root = create(ctx, model.get(), store, 0, params, 64);
+  REQUIRE(root != INVALID_HANDLE);
+  prefill(root, prompt.data(), prompt.size(), store);
+
+  constexpr int N = 4;
+  BranchHandle children[N];
+  for (int i = 0; i < N; ++i) {
+    children[i] = fork(root, store);
+    REQUIRE(children[i] != INVALID_HANDLE);
+  }
+
+  DecodeEachItem each_items[N];
+  for (int i = 0; i < N; ++i) {
+    each_items[i].handle = children[i];
+    each_items[i].token = static_cast<llama_token>((100 + i * 50) % n_vocab);
+  }
+  CHECK_NOTHROW(store.decode_each(each_items));
+
+  // R5(c): get_logits_at on each branch reads the per-branch snapshot.
+  // Read 3 vocab indices per branch via get_logits_at; cross-check vs get_logits.
+  const std::vector<int32_t> probe_idx = { 0, n_vocab / 2, n_vocab - 1 };
+  std::vector<std::vector<float>> per_branch_reads(N, std::vector<float>(probe_idx.size()));
+  for (int i = 0; i < N; ++i) {
+    CHECK_NOTHROW(get_logits_at(children[i],
+                                std::span<const int32_t>(probe_idx.data(), probe_idx.size()),
+                                std::span<float>(per_branch_reads[i].data(), per_branch_reads[i].size()),
+                                store));
+    const float* logits_full = get_logits(children[i], store);
+    REQUIRE(logits_full != nullptr);
+    for (size_t k = 0; k < probe_idx.size(); ++k) {
+      CHECK(per_branch_reads[i][k] == logits_full[probe_idx[k]]);
+    }
+  }
+
+  // Adjacent branches received different tokens — at least one probe index
+  // should differ across some branch pair (sanity: snapshots are not shared).
+  bool any_diff = false;
+  for (int i = 0; i < N && !any_diff; ++i) {
+    for (int j = i + 1; j < N && !any_diff; ++j) {
+      for (size_t k = 0; k < probe_idx.size(); ++k) {
+        if (per_branch_reads[i][k] != per_branch_reads[j][k]) { any_diff = true; break; }
+      }
+    }
+  }
+  CHECK(any_diff);
+
+  pruneSubtree(root, store);
+  llama_free(ctx);
+}
+
+// ============================================================================
+// b9581 ship-blocker (#443) — diagnostic: mirror lloyal-node's full
+// SessionContext param combo in pure C++ to isolate "is it the params" from
+// "is it the N-API dynamic-linking path". Test runs against the SAME model
+// (LLAMA_TEST_MODEL → typically Qwen3.5-4B-Q4_K_M) as the other integration
+// tests; ALL other branch_integration_test cases above pass at b9581 against
+// this model using minimal params (n_ctx=512, no kv_unified, no quant KV).
+// Smoke run reproduction is:
+//
+//   reasoning.run --query foo Qwen3.5-4B-Q4_K_M.gguf
+//   → boot:error "Failed to create context"
+//   → ggml-metal-device.m:622: GGML_ASSERT([rsets->data count] == 0) failed
+//
+// If this test ALSO crashes → the param combination triggers the b9581 Metal
+// residency regression at the llama.cpp level (file upstream issue with this
+// repro). If this test PASSES → the regression is in the N-API path
+// (dynamic linking, Node lifecycle, AsyncWorker, etc.) and we need a
+// different repro.
+TEST_CASE("b9581 diagnostic: lloyal-node SessionContext full param combo") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  // EXACT copy of SessionContext.cpp:1773-1786 — reasoning.run's default
+  // path when only the model arg is passed (no typeK/V override, no
+  // explicit nBatch, so SDK defaults apply).
+  //
+  // Production constants:
+  //   nCtx       = 4096   (LLAMA_CTX_SIZE=4096 from smoke; default 32768)
+  //   nBatch     = 512    (SDK default — matches llama.cpp's default)
+  //   nUbatch    = 512    (SessionContext sets ubatch = batch)
+  //   nSeqMax    = 8      (typical for reasoning.run's agent pool)
+  //   typeK/V    = F16    (NOT set by smoke → llama_context_default_params)
+  //   kv_unified = true   (architecturally required — branch/spine depends)
+  llama_context_params ctx_params = llama_context_default_params();
+  ctx_params.n_ctx = 4096;
+  ctx_params.n_batch = 512;
+  ctx_params.n_ubatch = 512;
+  ctx_params.n_threads = 4;
+  ctx_params.n_seq_max = 8;
+  ctx_params.type_k = GGML_TYPE_F16;
+  ctx_params.type_v = GGML_TYPE_F16;
+  ctx_params.kv_unified = true;
+  // No embeddings/pooling — main LLM, not reranker.
+
+  MESSAGE("b9581 diagnostic: creating context with lloyal-node's param combo");
+  MESSAGE("  n_ctx=" << ctx_params.n_ctx << " n_batch=" << ctx_params.n_batch
+                    << " n_seq_max=" << ctx_params.n_seq_max
+                    << " kv_unified=" << ctx_params.kv_unified);
+
+  llama_context* ctx = llama_init_from_model(model.get(), ctx_params);
+
+  // The crash from the smoke run manifests as llama_init_from_model returning
+  // NULL (and a Metal residency assert firing at process exit). If this test
+  // hits that path, REQUIRE(ctx) will fail loud and the process will likely
+  // abort with the same Metal assert — that's the desired signal.
+  REQUIRE(ctx != nullptr);
+
+  MESSAGE("b9581 diagnostic: ctx created OK — params alone do not reproduce");
+
+  // Optional smoke: do a single decode to ensure init didn't just lazy-defer
+  // the failure. Use a minimal prompt to exercise the KV path.
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+  TestParams params;
+  BranchHandle h = create(ctx, model.get(), store, 0, params, 64);
+  REQUIRE(h != INVALID_HANDLE);
+
+  const llama_vocab* vocab = llama_model_get_vocab(model.get());
+  auto tokens = tokenizer::tokenize(vocab, "The quick brown fox", true, false);
+  REQUIRE(!tokens.empty());
+  prefill(h, tokens.data(), tokens.size(), store);
+
+  CHECK(get_position(h, store) == static_cast<llama_pos>(tokens.size()));
+  CHECK(get_logits(h, store) != nullptr);
+
+  prune(h, store);
+  llama_free(ctx);
+}
+

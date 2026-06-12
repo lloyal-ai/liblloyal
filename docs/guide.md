@@ -995,10 +995,10 @@ liblloyal pins llama.cpp version for reproducible builds. To update:
 **Edit `.llama-cpp-version`:**
 ```bash
 # Current content (example)
-b8087
+b9581
 
 # Update to new version
-echo "b7000" > .llama-cpp-version
+echo "b9700" > .llama-cpp-version
 ```
 
 **Test locally:**

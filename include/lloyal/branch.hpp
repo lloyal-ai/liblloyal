@@ -1,6 +1,6 @@
 #pragma once
 
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LicenseRef-FSL-1.1-Apache-2.0
 // Copyright 2026 Lloyal Labs
 
 
@@ -1342,6 +1342,23 @@ inline BranchHandle create(
 
 
 /**
+ * @brief Options controlling what state fork() clones from source to child.
+ *
+ * Default `{}` preserves fork's full "sample same distribution" contract.
+ * Set `clone_logits=false` for prefill-overwrite consumers (rerank leaves,
+ * embedding probes) that fork → prefill → read → prune and never sample the
+ * parent's distribution.
+ */
+struct ForkOpts {
+  /// If true (default), copy src->logits_snapshot to child (~n_vocab*4 bytes,
+  /// ~600KB for 150k-vocab models). If false, leave child has_logits=false
+  /// until subsequent prefill()/step(); calling sample() on the child before
+  /// that returns -1 (the kernel's no-logits sentinel; the SDK Branch.sample()
+  /// converts this to BranchSampleError).
+  bool clone_logits = true;
+};
+
+/**
  * @brief Fork a branch into a new independent sequence
  *
  * Allocates a slot + KV lease, deep copies source state under the new seq_id.
@@ -1353,16 +1370,17 @@ inline BranchHandle create(
  * - Grammar (parser state)
  * - Boundary tracker
  * - Metrics (model + sampling perplexity)
- * - Logits snapshot and logit bias
+ * - Logits snapshot and logit bias (logits skipped if opts.clone_logits=false)
  *
  * NOT cloned:
  * - steer_fn (may capture references — call set_steer() on the child if needed)
  *
  * @param source Handle of the branch to fork from
  * @param s Branch store
+ * @param opts  Fine-grained control over what to clone (see ForkOpts)
  * @return Handle to the new child branch, or INVALID_HANDLE on failure
  */
-inline BranchHandle fork(BranchHandle source, BranchStore& s) {
+inline BranchHandle fork(BranchHandle source, BranchStore& s, ForkOpts opts = {}) {
   BranchState* src = s.get(source);
   if (!src) {
     LLOYAL_LOG_DEBUG("[branch::fork] Invalid source handle");
@@ -1422,11 +1440,19 @@ inline BranchHandle fork(BranchHandle source, BranchStore& s) {
   dst->last_token = src->last_token;
   dst->last_candidates = src->last_candidates;
 
-  // logits_snapshot copy is intentional: fork's contract is "sample different
-  // tokens from the same logit distribution." Without the copy, the child can't
-  // sample without a redundant decode. Cost: n_vocab * 4 bytes (~512KB at 128k vocab).
-  dst->logits_snapshot = src->logits_snapshot;
-  dst->has_logits = src->has_logits;
+  // Logits snapshot: default preserves fork's "sample same distribution" contract.
+  // opts.clone_logits=false skips the ~600KB memcpy from src for prefill-overwrite
+  // consumers (rerank leaves, embedding probes). Buffer is still kept sized to
+  // n_vocab so subsequent decode_scatter/prefill can write into it.
+  if (opts.clone_logits) {
+    dst->logits_snapshot = src->logits_snapshot;
+    dst->has_logits = src->has_logits;
+  } else {
+    if (static_cast<int32_t>(dst->logits_snapshot.size()) != dst->n_vocab) {
+      dst->logits_snapshot.resize(dst->n_vocab);
+    }
+    dst->has_logits = false;
+  }
   dst->logit_bias = src->logit_bias;
 
   dst->candidates_buffer.resize(dst->n_vocab);
@@ -1904,6 +1930,53 @@ inline void set_logits(BranchHandle handle, std::span<const float> data, BranchS
   std::memcpy(state->logits_snapshot.data(), data.data(),
               state->n_vocab * sizeof(float));
   state->has_logits = true;
+}
+
+/**
+ * @brief Read selected logit values from a branch's snapshot
+ *
+ * Reads logit values at the given vocab indices from `state->logits_snapshot`
+ * into the provided output buffer. Use when only a few logit values are needed
+ * (rerank yes/no probe, entailment scoring, semantic-entropy reads) instead of
+ * copying n_vocab floats out via `get_logits()`.
+ *
+ * Reads from `state->logits_snapshot` (per-branch persistent snapshot) — NOT
+ * from `logits::get(ctx, ...)` (which uses flattened cursor indexing and whose
+ * pointer's lifetime ends at the next decode). Handle-addressed, decode-order
+ * -immune, concurrency-safe by virtue of being branch-local.
+ *
+ * @param handle  Branch to read from
+ * @param indices Vocab indices to read (Int32Array from JS through N-API)
+ * @param out     Output span; same length as indices
+ * @param s       Branch store
+ * @throws std::runtime_error if handle invalid, no logits captured, sizes
+ *                            mismatch, or any index is out of [0, n_vocab)
+ */
+inline void get_logits_at(BranchHandle handle,
+                          std::span<const int32_t> indices,
+                          std::span<float> out,
+                          BranchStore& s) {
+  if (indices.size() != out.size()) {
+    throw std::runtime_error("get_logits_at: indices/out size mismatch");
+  }
+  const BranchState* state = s.get(handle);
+  if (!state) {
+    throw std::runtime_error("get_logits_at: invalid handle");
+  }
+  if (!state->has_logits) {
+    throw std::runtime_error("get_logits_at: no captured logits for handle");
+  }
+  const int32_t n_vocab = state->n_vocab;
+  const float* logits = state->logits_snapshot.data();
+  for (size_t i = 0; i < indices.size(); ++i) {
+    const int32_t idx = indices[i];
+    // Bounds check: indices arrive from JS Int32Array via N-API — must validate
+    // against n_vocab to prevent native OOB reads driven by JS-controlled offsets.
+    if (idx < 0 || idx >= n_vocab) {
+      throw std::runtime_error("get_logits_at: index out of range");
+    }
+    out[i] = logits[idx];
+  }
 }
 
 /**

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(liblloyal VERSION 0.1.0 LANGUAGES CXX)
+project(liblloyal VERSION 3.0.0 LANGUAGES CXX)
 
 # =============================================================================
 # liblloyal - Header-only C++20 library for llama.cpp inference wrappers

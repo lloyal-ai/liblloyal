@@ -1,9 +1,9 @@
 # liblloyal
 
 [![Tests](https://github.com/lloyal-ai/liblloyal/actions/workflows/tests.yml/badge.svg)](https://github.com/lloyal-ai/liblloyal/actions/workflows/tests.yml)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-FSL--1.1--Apache--2.0-blue.svg)](LICENSE)
 [![C++](https://img.shields.io/badge/C++-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
-[![llama.cpp](https://img.shields.io/badge/llama.cpp-b8087-green.svg)](https://github.com/ggml-org/llama.cpp/releases/tag/b8087)
+[![llama.cpp](https://img.shields.io/badge/llama.cpp-b9581-green.svg)](https://github.com/ggml-org/llama.cpp/releases/tag/b9581)
 
 **Covalent Inference for llama.cpp**
 
@@ -339,4 +339,14 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development guidelines.
 
 ## License
 
-Apache 2.0 — See LICENSE file for details
+You can build and sell commercial products using liblloyal.
+
+liblloyal 3.0 is source-available under FSL-1.1-Apache-2.0 and converts to
+Apache 2.0 two years after each release. The restriction is narrow: you
+cannot offer a competing HDK runtime, managed HDK service, or alternative
+HDK App distribution channel.
+
+See [`LICENSE-FAQ.md`](./LICENSE-FAQ.md) for concrete examples of what's
+permitted and what's restricted. See [`LICENSE`](./LICENSE) for the legal
+text and [`NOTICE`](./NOTICE) for attribution including the bundled
+llama.cpp MIT dependency.

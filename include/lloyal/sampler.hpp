@@ -1,6 +1,6 @@
 #pragma once
 
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: LicenseRef-FSL-1.1-Apache-2.0
 // Copyright 2026 Lloyal Labs
 
 

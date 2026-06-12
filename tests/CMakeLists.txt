@@ -210,8 +210,9 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
   # Standalone llama.cpp builds to: build/common/libcommon.a
   get_filename_component(LLAMA_BUILD_PARENT "${LLAMA_CPP_DYLIB_DIR}" DIRECTORY)
 
+  # llama.cpp renamed common library: libcommon.a (≤b9000-ish) → libllama-common.a (b9100+)
   find_library(LLAMA_COMMON_LIB
-    NAMES common libcommon
+    NAMES llama-common common libllama-common libcommon
     PATHS
       ${LLAMA_BUILD_PARENT}/llama.cpp/common   # lloyal-node: build/llama.cpp/common
       ${LLAMA_CPP_DYLIB_DIR}/llama.cpp/common  # alternative
@@ -221,7 +222,7 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
   )
 
   if(NOT LLAMA_COMMON_LIB)
-    # Fallback to expected paths (cross-platform static lib names)
+    # Fallback to expected paths (cross-platform static lib names, new + legacy)
     set(_COMMON_PATHS
       "${LLAMA_BUILD_PARENT}/llama.cpp/common"
       "${LLAMA_CPP_DYLIB_DIR}/llama.cpp/common"
@@ -229,8 +230,14 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
       "${LLAMA_CPP_DYLIB_DIR}"
     )
     foreach(_path ${_COMMON_PATHS})
-      if(EXISTS "${_path}/libcommon.a")
+      if(EXISTS "${_path}/libllama-common.a")
+        set(LLAMA_COMMON_LIB "${_path}/libllama-common.a")
+        break()
+      elseif(EXISTS "${_path}/libcommon.a")
         set(LLAMA_COMMON_LIB "${_path}/libcommon.a")
+        break()
+      elseif(EXISTS "${_path}/llama-common.lib")
+        set(LLAMA_COMMON_LIB "${_path}/llama-common.lib")
         break()
       elseif(EXISTS "${_path}/common.lib")
         set(LLAMA_COMMON_LIB "${_path}/common.lib")
@@ -250,6 +257,23 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
   endif()
 
   message(STATUS "Common library: ${LLAMA_COMMON_LIB}")
+
+  # llama.cpp b9100+ split build-info symbols (llama_commit, llama_compiler,
+  # llama_build_number, llama_build_target) out of libllama.a into a new
+  # libllama-common-base.a. libllama-common.a calls these, so we must link
+  # the -base lib after libllama-common. Optional for legacy llama.cpp.
+  find_library(LLAMA_COMMON_BASE_LIB
+    NAMES llama-common-base libllama-common-base
+    PATHS
+      ${LLAMA_BUILD_PARENT}/llama.cpp/common
+      ${LLAMA_CPP_DYLIB_DIR}/llama.cpp/common
+      ${LLAMA_CPP_DYLIB_DIR}/common
+      ${LLAMA_CPP_DYLIB_DIR}
+    NO_DEFAULT_PATH
+  )
+  if(LLAMA_COMMON_BASE_LIB)
+    message(STATUS "Common-base library: ${LLAMA_COMMON_BASE_LIB}")
+  endif()
 
   # Find llama library (cross-platform)
   find_library(LLAMA_LIB
@@ -274,8 +298,15 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
     list(APPEND LLAMA_LIBS ${GGML_BASE_LIB})
   endif()
 
+  # Link order: common before common-base (common calls into base); base before
+  # libllama.dylib (which provides ggml symbols that base may reference).
+  set(LLAMA_COMMON_LIBS ${LLAMA_COMMON_LIB})
+  if(LLAMA_COMMON_BASE_LIB)
+    list(APPEND LLAMA_COMMON_LIBS ${LLAMA_COMMON_BASE_LIB})
+  endif()
+
   target_link_libraries(IntegrationRunner PRIVATE
-    ${LLAMA_COMMON_LIB}
+    ${LLAMA_COMMON_LIBS}
     ${LLAMA_LIBS}
     doctest::doctest
   )

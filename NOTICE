@@ -1,0 +1,46 @@
+liblloyal
+Copyright 2026 Lloyal Labs
+
+This product includes software developed by Lloyal Labs and licensed
+under the Functional Source License, Version 1.1, Apache 2.0 Future
+License (FSL-1.1-Apache-2.0). See LICENSE for terms.
+
+This product links against and depends on llama.cpp, distributed under
+the MIT License:
+
+    Copyright (c) 2023-2026 The ggml authors
+
+    MIT License
+
+    Permission is hereby granted, free of charge, to any person obtaining
+    a copy of this software and associated documentation files (the
+    "Software"), to deal in the Software without restriction, including
+    without limitation the rights to use, copy, modify, merge, publish,
+    distribute, sublicense, and/or sell copies of the Software, and to
+    permit persons to whom the Software is furnished to do so, subject to
+    the following conditions:
+
+    The above copyright notice and this permission notice shall be
+    included in all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+    EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+    MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-
+    INFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+    LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+    ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+    CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+The llama.cpp source tree ships in this distribution under its original
+MIT terms. Its LICENSE file is preserved verbatim at the llama.cpp
+submodule root (../llama.cpp/LICENSE in the parent lloyal-node repository,
+or vendored alongside in binary distributions). MIT attribution carries
+through to any binary distribution that links against llama.cpp.
+
+---
+
+For a plain-English explanation of what FSL-1.1-Apache-2.0 means in
+practice — including what commercial uses are permitted and what is
+specifically restricted — see LICENSE-FAQ.md in this repository or the
+canonical version at https://docs.lloyal.ai/licensing/faq.
