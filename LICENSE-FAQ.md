@@ -26,6 +26,13 @@ HDK runtime, a managed HDK service, or an alternative HDK App distribution
 channel.** Everything else — commercial use, redistribution, modification,
 sale, embedding in shipped products — is freely permitted.
 
+The reason the channel restriction exists is consumer-protective: every App
+listed on `apps.lloyal.ai` is reviewed by Lloyal Labs for tool-safety,
+manifest conformance, and signature provenance before publication. Pinning
+the App ecosystem to one verified channel keeps the AI-safety review meaningful
+(consumers can rely on a single trust boundary) and prevents protocol
+fragmentation (an App that works on one harness works on every harness).
+
 The `harness.dev` CLI and `hdk-create-app` scaffolder are licensed under
 **Apache 2.0** (unrestricted). They're not part of the runtime stack.
 
@@ -224,7 +231,7 @@ each repo has the details.
 
 ## I have a use case that's borderline — who do I ask?
 
-Email <legal@lloyal.ai> (or open a discussion in the repo). The runtime
+Email [legal@lloyal.ai](mailto:legal@lloyal.ai) (or open a discussion in the repo). The runtime
 team will help you confirm whether your use case falls under Permitted
 Purpose or Competing Use. We'd rather give you a quick yes than have you
 worry about it.
@@ -239,11 +246,11 @@ worry about it.
 
 ## Is there a safe harbor for building products with the HDK?
 
-Yes. The [Lloyal Harness Builder Grant](./GRANT.md) irrevocably guarantees
-that building, selling, and hosting Harnesses and Apps is a Permitted Purpose
-and never a Competing Use — even products that compete head-on with Lloyal's
-own (including reasoning.run). Only three uses remain restricted: offering the
-HDK itself as a developer framework, hosting the HDK as-a-service for
-third-party developers, and operating a general-purpose App distribution
-channel. Private/internal App distribution and your Harness's own plugin
-system are explicitly permitted.
+Yes. The [Lloyal Harness Builder Grant](https://github.com/lloyal-ai/hdk/blob/main/GRANT.md)
+irrevocably guarantees that building, selling, and hosting Harnesses and Apps
+is a Permitted Purpose and never a Competing Use — even products that compete
+head-on with Lloyal's own (including reasoning.run). Only three uses remain
+restricted: offering the HDK itself as a developer framework, hosting the HDK
+as-a-service for third-party developers, and operating a general-purpose App
+distribution channel. Private/internal App distribution and your Harness's
+own plugin system are explicitly permitted.
