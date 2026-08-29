@@ -40,10 +40,42 @@ store.decode_scatter({
 
 The underlying decode grid (`decode.hpp`):
 
-|                  | Single Sequence  | Multi Sequence   |
-|------------------|------------------|------------------|
-| **Single Token** | `decode::one`    | `decode::each`   |
-| **Multi Token**  | `decode::many`   | `decode::scatter` |
+|                    | Single Sequence  | Multi Sequence   |
+|--------------------|------------------|------------------|
+| **Single Token**   | `decode::one`    | `decode::each`   |
+| **Multi Token**    | `decode::many`   | `decode::scatter` |
+| **Embedding Rows** | `decode::embd`   | —                |
+
+## The Embedding Rail (Multimodal)
+
+Text and images are two input rails into the same KV cache. A clip-encoded
+image is dense embedding rows; `decode::embd` injects them via `batch.embd`
+(a `llama_batch` is token-XOR-embd, so image rows are always their own
+dispatch — they never bin-pack with text). Positions are section-major and
+carry M-RoPE's 4-wide layout when the model needs it; sub-chunking by
+`n_batch` is built in.
+
+`BranchStore::prefill_embd` is the branch-level wrapper with the one
+multimodal bookkeeping difference: cells grow by `n_tokens` (every row is a
+KV cell) while position advances by `n_pos` (`max(nx, ny)` under M-RoPE).
+The gap is tracked as embedding-row slack so `release()`/`retainOnly()`
+recover exact cell counts.
+
+```cpp
+// A multimodal prefill interleaves sequential calls per branch:
+store.decode_scatter({{h, text_before}});          // token rail
+store.prefill_embd(h, rows, n_tokens, n_embd_inp,  // embedding rail
+                   n_pos, pos_section_major, /*n_pos_per_embd*/ 4,
+                   /*non_causal*/ false, /*want_logits*/ false);
+store.decode_scatter({{h, text_after}});           // token rail
+```
+
+Everything downstream of the KV — fork, batched decode, sampling, prune —
+is modality-agnostic: a KV cell doesn't know whether it came from `.token`
+or `.embd`. Fork after an image and the child shares the image's cells
+(`kv::seq_cp`, unified cache) — N branches attend one image, encoded once.
+Encoding itself (clip/mtmd) lives in the consumer; liblloyal takes raw rows
+and positions.
 
 ## The Branch API
 
@@ -157,7 +189,7 @@ RAII `~Branch()` uses CASCADE — cleanup always succeeds, even with deep trees.
 The building blocks that compose into the above:
 
 - **Tokenization** — Two-pass safe buffer sizing, special token handling
-- **Decoding** — Continuous tree batching, cross-sequence dispatch packing
+- **Decoding** — Continuous tree batching, cross-sequence dispatch packing, embedding-row injection (multimodal)
 - **KV Cache** — Tenancy (vacancy manager), sequence ops, state snapshots, long-context compression
 - **Sampling** — Grammar-constrained, persistent chains, hot-swap with memoization
 - **Metrics** — Dual-level entropy/surprisal, rolling perplexity, cloneable state (BranchStore-scoped)

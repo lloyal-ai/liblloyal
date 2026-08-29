@@ -448,6 +448,145 @@ struct Scratch {
 }
 
 // ============================================================================
+// Embedding-Row Decode (multimodal ingress)
+// ============================================================================
+
+/**
+ * @brief Decode pre-computed embedding rows into one sequence's KV cache
+ *
+ * The embedding rail beside the token rail: rows (e.g. a clip-encoded image)
+ * enter the KV via `batch.embd` with `batch.token = nullptr`. A llama_batch
+ * is token-XOR-embd, so embedding rows can NEVER share a dispatch with
+ * tokens — this is always its own llama_decode, distinct from scatter().
+ *
+ * Positions are SECTION-MAJOR: `n_tokens * n_pos_per_embd` entries laid out
+ * `[s0...][s1...][s2...][s3...]`. For M-RoPE image rows the caller packs
+ * t/y/x/z per mtmd's decoder-pos convention (y in section 1, x in section 2);
+ * for plain-position models `n_pos_per_embd == 1` and `pos` is ordinary.
+ *
+ * Sub-chunks internally by n_batch — the MAIN path, not an edge: image row
+ * counts routinely exceed the default batch size. Each view re-packs the pos
+ * sections for the visible rows (the decode_embd_batch::get_view semantics).
+ *
+ * Rows are an interior prefix and request no logits; `want_last_logits`
+ * marks the final row of the final view for the rows-terminal case (a
+ * subsequent llama_decode resets the output buffer, so a prefill whose LAST
+ * dispatch is this one must request logits here or `logits::get(ctx, -1)`
+ * has no output row).
+ *
+ * `non_causal` brackets the whole loop in llama_set_causal_attn(false/true),
+ * restoring on error (Gemma-class projectors; requires n_ubatch >= n_tokens).
+ *
+ * Buffers are allocated per call: embedding decodes are low-frequency
+ * relative to the per-tick token paths, so allocation cost is noise next to
+ * the encode itself (no Scratch/thread_local reuse needed).
+ *
+ * ABI-sensitive: writes llama_batch fields directly, same as
+ * Scratch::as_batch above. Audit on llama.cpp submodule bumps.
+ *
+ * @param ctx            Llama context (must not be null)
+ * @param rows           Embedding rows, n_tokens x n_embd_inp floats
+ * @param n_tokens       Number of rows
+ * @param n_embd_inp     Row width — llama_model_n_embd_inp(model)
+ * @param pos            Section-major positions, n_tokens * n_pos_per_embd
+ * @param n_pos_per_embd 1 (plain) or 4 (M-RoPE)
+ * @param seq_id         Target sequence ID
+ * @param n_batch        Max rows per llama_decode (sub-chunk bound)
+ * @param non_causal     Bracket the loop in non-causal attention
+ * @param want_last_logits Request logits on the final row (rows-terminal)
+ * @return 0 on success, non-zero llama_decode rc on failure
+ * @throws std::runtime_error if ctx/rows/pos are null or sizes non-positive
+ *
+ * @see scatter() for the multi-sequence token-rail primitive
+ * @see BranchStore::prefill_embd for the branch-level wrapper (bookkeeping)
+ */
+[[nodiscard]] inline int embd(llama_context* ctx,
+                              const float* rows,
+                              int32_t n_tokens,
+                              int32_t n_embd_inp,
+                              const llama_pos* pos,
+                              int32_t n_pos_per_embd,
+                              llama_seq_id seq_id,
+                              int32_t n_batch,
+                              bool non_causal,
+                              bool want_last_logits) {
+  if (!ctx) {
+    throw std::runtime_error("decode::embd - NULL context");
+  }
+  if (!rows || n_tokens <= 0 || n_embd_inp <= 0) {
+    throw std::runtime_error("decode::embd - invalid rows");
+  }
+  if (!pos || (n_pos_per_embd != 1 && n_pos_per_embd != 4)) {
+    throw std::runtime_error("decode::embd - invalid positions");
+  }
+  if (n_batch <= 0) {
+    throw std::runtime_error("decode::embd - n_batch must be positive");
+  }
+
+  // Per-row metadata (full length; views index into these with an offset)
+  std::vector<int32_t> n_seq_id(n_tokens, 1);
+  llama_seq_id seq_id_single = seq_id;
+  std::vector<llama_seq_id*> seq_id_ptrs(
+      static_cast<size_t>(n_tokens) + 1, &seq_id_single);
+  seq_id_ptrs[n_tokens] = nullptr;
+  std::vector<int8_t> logits(n_tokens, 0);
+  if (want_last_logits) logits[n_tokens - 1] = 1;
+
+  // Per-view position buffer (re-packed section-major for the view)
+  std::vector<llama_pos> pos_view;
+
+  int32_t processed = 0;
+  if (non_causal) llama_set_causal_attn(ctx, false);
+
+  while (processed < n_tokens) {
+    const int32_t n_view = std::min(n_tokens - processed, n_batch);
+
+    const llama_pos* view_pos;
+    if (n_pos_per_embd > 1) {
+      // Section-major re-pack: source section s spans
+      // pos[s*n_tokens + processed .. +n_view); view wants them contiguous
+      // per section over n_view rows.
+      pos_view.resize(static_cast<size_t>(n_view) * n_pos_per_embd);
+      for (int32_t s = 0; s < n_pos_per_embd; ++s) {
+        std::copy(pos + static_cast<size_t>(s) * n_tokens + processed,
+                  pos + static_cast<size_t>(s) * n_tokens + processed + n_view,
+                  pos_view.begin() + static_cast<size_t>(s) * n_view);
+      }
+      view_pos = pos_view.data();
+    } else {
+      view_pos = pos + processed;
+    }
+
+    llama_batch batch{};
+    batch.n_tokens = n_view;
+    batch.token = nullptr;
+    batch.embd = const_cast<float*>(rows) +
+                 static_cast<size_t>(processed) * n_embd_inp;
+    batch.pos = const_cast<llama_pos*>(view_pos);
+    batch.n_seq_id = n_seq_id.data() + processed;
+    batch.seq_id = seq_id_ptrs.data() + processed;
+    batch.logits = logits.data() + processed;
+
+    LLOYAL_LOG_DEBUG("[decode::embd] Submitting %d/%d rows (seq %d)",
+                     processed + n_view, n_tokens, seq_id);
+
+    const int rc = llama_decode(ctx, batch);
+    if (rc != 0) {
+      if (non_causal) llama_set_causal_attn(ctx, true);
+      LLOYAL_LOG_DEBUG("[decode::embd] ERROR: llama_decode failed (rc=%d)", rc);
+      return rc;
+    }
+
+    processed += n_view;
+  }
+
+  if (non_causal) llama_set_causal_attn(ctx, true);
+
+  LLOYAL_LOG_DEBUG("[decode::embd] Decode complete (%d rows)", n_tokens);
+  return 0;
+}
+
+// ============================================================================
 // Bin-Packing Utility
 // ============================================================================
 

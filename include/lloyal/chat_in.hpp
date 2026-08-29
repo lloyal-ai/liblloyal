@@ -181,7 +181,11 @@ inline FormatResult format(const llama_model *model, const FormatInputs& inputs)
       // suppress template auto-injection (e.g. SmolLM2/ChatML) by prepending an
       // empty system message — the library completes the intent by removing the
       // rendered empty block, leaving only the user+assistant portion.
-      if (!messages.empty() && messages[0].role == "system" && messages[0].content.empty()) {
+      // content_parts guard: a parts-based system message (e.g. text +
+      // media_marker) keeps its content STRING empty while carrying parts —
+      // that is a real system prompt, not a suppression request.
+      if (!messages.empty() && messages[0].role == "system" &&
+          messages[0].content.empty() && messages[0].content_parts.empty()) {
         bool stripped = false;
 
         // Primary: format [{system:""}] to learn the empty system prefix
@@ -346,8 +350,11 @@ inline FormatResult format(const llama_model *model, const FormatInputs& inputs)
               full.substr(full.size() - user_suffix.size()) == user_suffix) {
             params.prompt = full.substr(0, full.size() - user_suffix.size());
 
-            // Strip empty system block if messages[0] is {system, ""}
-            if (!messages.empty() && messages[0].role == "system" && messages[0].content.empty()) {
+            // Strip empty system block if messages[0] is {system, ""}.
+            // Same content_parts guard as the primary path: parts-based
+            // system messages are real content, never a strip request.
+            if (!messages.empty() && messages[0].role == "system" &&
+                messages[0].content.empty() && messages[0].content_parts.empty()) {
               // Use sentinel subtraction: [{system:""}, {user:S}] minus [{user:S}]
               common_chat_msg sys_msg;  sys_msg.role = "system"; sys_msg.content = "";
               common_chat_msg usr_msg;  usr_msg.role = "user";   usr_msg.content = SENTINEL;

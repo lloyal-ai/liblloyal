@@ -104,12 +104,15 @@ constexpr uint32_t INDEX_MASK = 0xFFFF;     ///< Mask for slot index field
  * @brief Snapshot of KV cache pressure from BranchStore
  *
  * cells_used is incremented on every decode (decode_each, decode_scatter,
- * add_cells_used) and reset to zero on bulk operations: drain(),
- * init_tenancy(), and when the last active branch is released. retainOnly()
- * resets it to the surviving branch's position.
+ * prefill_embd, add_cells_used) and reset to zero on bulk operations:
+ * drain(), init_tenancy(), and when the last active branch is released.
+ * retainOnly() resets it to the surviving branch's position plus its
+ * embedding-row slack (img_slack_total).
  *
- * Decremented on release: each pruned branch subtracts its unique cells
- * (position - fork_head). Pressure recovers as branches are freed.
+ * Decremented on release: each pruned branch subtracts its unique cells —
+ * (position - fork_head) + img_slack_own, the slack covering embedding-row
+ * prefills whose cells exceed their position advance. Pressure recovers as
+ * branches are freed.
  */
 struct KvPressure {
   uint32_t n_ctx;       ///< Total KV capacity
@@ -279,6 +282,15 @@ struct BranchState {
   llama_seq_id seq_id = NO_LEASE;  ///< KV cache sequence identifier (NO_LEASE when inactive)
   llama_pos position = 0;    ///< Current decode position in the sequence
   llama_pos fork_head = 0;   ///< Parent's position at fork time (0 for root branches)
+
+  /// Embedding-row slack: cells beyond position-delta from prefill_embd()
+  /// (an M-RoPE image adds nx*ny cells but advances position by max(nx,ny)).
+  /// `own` = slack accrued on THIS branch since its fork (release() adds it
+  /// to the position-delta when subtracting unique cells); `total` =
+  /// inherited + own for the whole prefix (retainOnly()'s winner absorbs the
+  /// prefix via fork_head=0 and needs it). fork() copies total, zeroes own.
+  uint32_t img_slack_own = 0;
+  uint32_t img_slack_total = 0;
 
   SamplerChainHandle sampler_chain = 0;  ///< Handle into BranchStore's sampler registry
   GrammarHandle grammar = 0;             ///< Handle into BranchStore's grammar registry
@@ -472,10 +484,18 @@ public:
         c.erase(std::remove(c.begin(), c.end(), handle), c.end());
       }
     }
-    // Subtract unique cells owned by this branch (above fork_head)
-    if (st->position > st->fork_head) {
-      uint32_t unique = static_cast<uint32_t>(st->position - st->fork_head);
-      cells_used_ = (unique <= cells_used_) ? cells_used_ - unique : 0;
+    // Subtract unique cells owned by this branch (above fork_head).
+    // Position-delta alone undercounts embedding-row prefills (cells grow by
+    // n_tokens while position advances by n_pos) — add the branch's own
+    // slack so the pressure gauge recovers exactly what was decoded.
+    {
+      uint32_t unique = st->img_slack_own;
+      if (st->position > st->fork_head) {
+        unique += static_cast<uint32_t>(st->position - st->fork_head);
+      }
+      if (unique > 0) {
+        cells_used_ = (unique <= cells_used_) ? cells_used_ - unique : 0;
+      }
     }
     // Evict lease (KV strip + bookkeeping)
     if (st->seq_id != NO_LEASE)
@@ -549,7 +569,11 @@ public:
     w->parent = INVALID_HANDLE;
     w->fork_head = 0;
     w->children.clear();
-    cells_used_ = static_cast<uint32_t>(w->position);
+    // The winner absorbs the whole prefix (fork_head = 0), so its "own"
+    // slack becomes the inherited total, and the pressure counter is the
+    // prefix's real cell count: position-delta + embedding-row slack.
+    w->img_slack_own = w->img_slack_total;
+    cells_used_ = static_cast<uint32_t>(w->position) + w->img_slack_total;
   }
 
   // ===== TOPOLOGY QUERIES =====
@@ -1005,6 +1029,19 @@ public:
       if (i > 0 && states[i]->ctx != states[0]->ctx) {
         throw std::runtime_error("BranchStore::decode_scatter - all branches must share the same context");
       }
+      // A handle may appear at most once per call: start_pos is read from
+      // states[]->position at chunk-build time and advances only after
+      // dispatch, so two items for one branch could bin-pack into the same
+      // chunk and collide on start_pos (overlapping KV positions). Callers
+      // with multiple runs for one branch must issue sequential calls.
+      for (int32_t j = 0; j < i; ++j) {
+        if (items[j].handle == items[i].handle) {
+          throw std::runtime_error(
+              "BranchStore::decode_scatter - duplicate handle at indices " +
+              std::to_string(j) + " and " + std::to_string(i) +
+              " (sequential calls required for multiple runs per branch)");
+        }
+      }
     }
 
     llama_context* ctx = states[0]->ctx;
@@ -1074,6 +1111,76 @@ public:
     // Accumulate total tokens decoded across all items
     for (int32_t i = 0; i < n; ++i) {
       cells_used_ += static_cast<uint32_t>(items[i].tokens.size());
+    }
+  }
+
+  /**
+   * @brief Decode embedding rows into ONE branch's KV (multimodal ingress)
+   *
+   * The branch-level wrapper over decode::embd(): dispatches the rows into
+   * the branch's sequence and does the bookkeeping the token paths do for
+   * tokens — with the one multimodal difference: cells grow by `n_tokens`
+   * (every row is a KV cell) while position advances by `n_pos` (max(nx,ny)
+   * under M-RoPE; == n_tokens for plain-position models). The gap is
+   * tracked as embedding-row slack so release()/retainOnly() recover the
+   * true cell count.
+   *
+   * Rows are an interior prefix: no logits are captured unless
+   * `want_logits` (the rows-terminal prefill), in which case the final
+   * row's logits land in logits_snapshot like a token prefill's would.
+   *
+   * A llama_batch is token-XOR-embd, so this is always its own dispatch —
+   * a multimodal prefill interleaves sequential calls per branch:
+   * decode_scatter(text) → prefill_embd(rows) → decode_scatter(text).
+   *
+   * @param handle          Branch to decode into (must be valid + leased)
+   * @param rows            Embedding rows, n_tokens x n_embd_inp floats
+   * @param n_tokens        Number of rows (cells added)
+   * @param n_embd_inp      Row width — llama_model_n_embd_inp(model)
+   * @param n_pos           Position advance (max(nx,ny) under M-RoPE)
+   * @param pos             Section-major positions, n_tokens * n_pos_per_embd
+   * @param n_pos_per_embd  1 (plain) or 4 (M-RoPE)
+   * @param non_causal      Bracket the decode in non-causal attention
+   * @param want_logits     Capture the final row's logits (rows-terminal)
+   * @throws std::runtime_error if the handle is invalid or decode fails
+   *
+   * @see decode::embd() for the underlying primitive
+   * @see decode_scatter() for the token rail
+   */
+  void prefill_embd(BranchHandle handle,
+                    const float* rows, int32_t n_tokens, int32_t n_embd_inp,
+                    llama_pos n_pos,
+                    const llama_pos* pos, int32_t n_pos_per_embd,
+                    bool non_causal, bool want_logits) {
+    BranchState* state = get(handle);
+    if (!state) {
+      throw std::runtime_error("BranchStore::prefill_embd - invalid handle");
+    }
+    if (n_pos <= 0 || n_pos > n_tokens) {
+      throw std::runtime_error("BranchStore::prefill_embd - invalid n_pos");
+    }
+
+    if (decode::embd(state->ctx, rows, n_tokens, n_embd_inp,
+                     pos, n_pos_per_embd, state->seq_id,
+                     state->n_batch, non_causal, want_logits) != 0) {
+      throw std::runtime_error("BranchStore::prefill_embd - llama_decode failed");
+    }
+
+    state->position += n_pos;
+    cells_used_ += static_cast<uint32_t>(n_tokens);
+    const uint32_t slack = static_cast<uint32_t>(n_tokens - n_pos);
+    state->img_slack_own += slack;
+    state->img_slack_total += slack;
+
+    if (want_logits) {
+      const float* raw_logits = logits::get(state->ctx, -1);  // throws if absent
+      if (state->n_vocab <= 0) {
+        throw std::runtime_error("BranchStore::prefill_embd - invalid vocab size");
+      }
+      assert(state->logits_snapshot.size() >= static_cast<size_t>(state->n_vocab));
+      std::memcpy(state->logits_snapshot.data(), raw_logits,
+                  state->n_vocab * sizeof(float));
+      state->has_logits = true;
     }
   }
 
@@ -1172,6 +1279,8 @@ private:
     slot.seq_id = NO_LEASE;
     slot.position = 0;
     slot.fork_head = 0;
+    slot.img_slack_own = 0;
+    slot.img_slack_total = 0;
     slot.sampler_chain = 0;
     slot.grammar = 0;
     slot.metrics = 0;
@@ -1404,6 +1513,9 @@ inline BranchHandle fork(BranchHandle source, BranchStore& s, ForkOpts opts = {}
   dst->seq_id = new_seq_id;
   dst->position = src->position;
   dst->fork_head = src->position;
+  // Inherit the prefix's embedding-row slack; the child owns none yet.
+  dst->img_slack_total = src->img_slack_total;
+  dst->img_slack_own = 0;
   dst->n_batch = src->n_batch;
   dst->n_vocab = src->n_vocab;
 
