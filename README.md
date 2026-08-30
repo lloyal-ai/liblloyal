@@ -11,7 +11,7 @@ A KV cache already holds everything the model has read. Git-like branching is wh
 
 So the operations are the ones you already know:
 
-| Git command | liblloyal composition |
+| Git command&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; | liblloyal composition |
 |---|---|
 | `git branch` | `fork()` — from the current position |
 | `git branch -d` / `-D` | `prune()` / `pruneSubtree()`, descendants included |
