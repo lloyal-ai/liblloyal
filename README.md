@@ -5,7 +5,7 @@
 [![C++](https://img.shields.io/badge/C++-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
 [![llama.cpp](https://img.shields.io/badge/llama.cpp-b9581-green.svg)](https://github.com/ggml-org/llama.cpp/releases/tag/b9581)
 
-**A kernel for Vertical Inference — turn prefix sharing into Git-like trees over live inference state.**
+**A kernel for Vertical Inference — Git-like tree ops for live inference state**
 
 A KV cache already holds everything the model has read. Git-like branching is what turns that into structure you can work with: fork a generation at any point, and the child inherits every token before it while diverging under its own sampler, seed, grammar and constraints. The shared prefix is never recomputed — only the divergence costs anything.
 
