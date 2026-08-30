@@ -104,7 +104,7 @@ constexpr uint32_t INDEX_MASK = 0xFFFF;     ///< Mask for slot index field
  * @brief Snapshot of KV cache pressure from BranchStore
  *
  * cells_used is incremented on every decode (decode_each, decode_scatter,
- * prefill_embd, add_cells_used) and reset to zero on bulk operations:
+ * decode_embd, add_cells_used) and reset to zero on bulk operations:
  * drain(), init_tenancy(), and when the last active branch is released.
  * retainOnly() resets it to the surviving branch's position plus its
  * embedding-row slack (img_slack_total).
@@ -283,7 +283,7 @@ struct BranchState {
   llama_pos position = 0;    ///< Current decode position in the sequence
   llama_pos fork_head = 0;   ///< Parent's position at fork time (0 for root branches)
 
-  /// Embedding-row slack: cells beyond position-delta from prefill_embd()
+  /// Embedding-row slack: cells beyond position-delta from decode_embd()
   /// (an M-RoPE image adds nx*ny cells but advances position by max(nx,ny)).
   /// `own` = slack accrued on THIS branch since its fork (release() adds it
   /// to the position-delta when subtracting unique cells); `total` =
@@ -360,6 +360,14 @@ struct DecodeEachItem {
 struct DecodeScatterItem {
   BranchHandle handle;
   std::span<const llama_token> tokens;
+};
+
+/// What a heterogeneous prefill consumed. `cells` is KV cells added (the
+/// pressure cost); `advance` is how far the branch position moved. They
+/// differ when an EMBD segment's n_pos < n_rows.
+struct DecodeSegmentsResult {
+  int64_t cells = 0;
+  llama_pos advance = 0;
 };
 
 // ===== BRANCH STORE (HANDLE TABLE) =====
@@ -1131,7 +1139,7 @@ public:
    *
    * A llama_batch is token-XOR-embd, so this is always its own dispatch —
    * a multimodal prefill interleaves sequential calls per branch:
-   * decode_scatter(text) → prefill_embd(rows) → decode_scatter(text).
+   * decode_scatter(text) → decode_embd(rows) → decode_scatter(text).
    *
    * @param handle          Branch to decode into (must be valid + leased)
    * @param rows            Embedding rows, n_tokens x n_embd_inp floats
@@ -1147,23 +1155,31 @@ public:
    * @see decode::embd() for the underlying primitive
    * @see decode_scatter() for the token rail
    */
-  void prefill_embd(BranchHandle handle,
+  void decode_embd(BranchHandle handle,
                     const float* rows, int32_t n_tokens, int32_t n_embd_inp,
                     llama_pos n_pos,
                     const llama_pos* pos, int32_t n_pos_per_embd,
                     bool non_causal, bool want_logits) {
     BranchState* state = get(handle);
     if (!state) {
-      throw std::runtime_error("BranchStore::prefill_embd - invalid handle");
+      throw std::runtime_error("BranchStore::decode_embd - invalid handle");
     }
     if (n_pos <= 0 || n_pos > n_tokens) {
-      throw std::runtime_error("BranchStore::prefill_embd - invalid n_pos");
+      throw std::runtime_error("BranchStore::decode_embd - invalid n_pos");
     }
 
-    if (decode::embd(state->ctx, rows, n_tokens, n_embd_inp,
-                     pos, n_pos_per_embd, state->seq_id,
-                     state->n_batch, non_causal, want_logits) != 0) {
-      throw std::runtime_error("BranchStore::prefill_embd - llama_decode failed");
+    decode::EmbdItem item;
+    item.rows           = rows;
+    item.n_rows         = n_tokens;
+    item.n_embd_inp     = n_embd_inp;
+    item.pos            = pos;
+    item.n_pos_per_embd = n_pos_per_embd;
+    item.seq_id         = state->seq_id;
+    item.non_causal     = non_causal;
+    item.output_logits  = want_logits;
+
+    if (decode::embd(state->ctx, item, state->n_batch, scratch_) != 0) {
+      throw std::runtime_error("BranchStore::decode_embd - llama_decode failed");
     }
 
     state->position += n_pos;
@@ -1175,13 +1191,84 @@ public:
     if (want_logits) {
       const float* raw_logits = logits::get(state->ctx, -1);  // throws if absent
       if (state->n_vocab <= 0) {
-        throw std::runtime_error("BranchStore::prefill_embd - invalid vocab size");
+        throw std::runtime_error("BranchStore::decode_embd - invalid vocab size");
       }
       assert(state->logits_snapshot.size() >= static_cast<size_t>(state->n_vocab));
       std::memcpy(state->logits_snapshot.data(), raw_logits,
                   state->n_vocab * sizeof(float));
       state->has_logits = true;
     }
+  }
+
+  /**
+   * @brief Prefill a heterogeneous segment sequence into ONE branch
+   *
+   * The composition of the two rails: TEXT segments dispatch through
+   * `decode_scatter`, EMBD segments through `decode_embd`, in the order the
+   * source yields them. Placement lives here because it is KV work —
+   * positions come from the branch's own state and never leave it, and the
+   * bookkeeping (cells, slack, logits) is already this class's job.
+   *
+   * Logits are captured on the FINAL segment only: every `llama_decode`
+   * resets the output buffer, so an interior segment's logits are dead. A
+   * trailing TEXT segment gets them via `decode_scatter`'s per-item capture;
+   * a trailing EMBD segment via `decode_embd`'s `want_logits`.
+   *
+   * Segments are requested and dispatched strictly in order — see
+   * SegmentSource's in-order contract; a source may reuse its row buffer
+   * between `at()` calls.
+   *
+   * @param handle Branch to prefill (must be valid + leased)
+   * @param source Yields the segments; owns production, not placement
+   * @return Cells added and position advance (they differ under M-RoPE)
+   * @throws std::runtime_error if the handle is invalid or a decode fails
+   *
+   * @see decode_scatter() for the token rail
+   * @see decode_embd() for the embedding rail
+   */
+  DecodeSegmentsResult decode_segments(BranchHandle handle, decode::SegmentSource& source) {
+    BranchState* state = get(handle);
+    if (!state) {
+      throw std::runtime_error("BranchStore::decode_segments - invalid handle");
+    }
+
+    const llama_pos start_pos = state->position;
+    DecodeSegmentsResult result;
+
+    const size_t n = source.size();
+    for (size_t i = 0; i < n; ++i) {
+      const decode::Segment seg = source.at(i);
+      const bool is_last = (i + 1 == n);
+
+      if (seg.kind == decode::Segment::Kind::Text) {
+        if (seg.tokens.empty()) continue;
+        DecodeScatterItem item{handle, seg.tokens};
+        decode_scatter(std::span<const DecodeScatterItem>(&item, 1));
+        result.cells += static_cast<int64_t>(seg.tokens.size());
+        continue;
+      }
+
+      if (!seg.rows || seg.n_rows <= 0) {
+        throw std::runtime_error(
+            "BranchStore::decode_segments - empty embedding segment at " +
+            std::to_string(i));
+      }
+
+      // The base never leaves this scope: the source is handed the position
+      // and applies its own model's rules to it.
+      const llama_pos base = state->position;
+      segment_pos_.assign(
+          static_cast<size_t>(seg.n_rows) * seg.n_pos_per_embd, 0);
+      source.positions(i, base, segment_pos_.data());
+
+      decode_embd(handle, seg.rows, seg.n_rows, seg.n_embd_inp, seg.n_pos,
+                   segment_pos_.data(), seg.n_pos_per_embd, seg.non_causal,
+                   /*want_logits*/ is_last);
+      result.cells += static_cast<int64_t>(seg.n_rows);
+    }
+
+    result.advance = state->position - start_pos;
+    return result;
   }
 
   /**
@@ -1359,6 +1446,10 @@ private:
   /// Reusable scratch buffers for batched decode. Safe without locking because
   /// BranchStore requires external synchronization (caller's mutex).
   decode::Scratch scratch_;
+
+  /// Section-major position buffer for decode_segments' EMBD dispatches.
+  /// Reused across segments; sized per segment (n_rows * n_pos_per_embd).
+  std::vector<llama_pos> segment_pos_;
 
   // ===== Handle registries (instance-scoped, not global static) =====
 

@@ -114,6 +114,20 @@ jobs:
         chmod +x .github/scripts/build-llama.sh
         LLAMA_DIR=llama.cpp .github/scripts/build-llama.sh
 
+    # mtmd is the multimodal codec behind <lloyal/mtmd.hpp>. build-llama.sh
+    # keeps LLAMA_BUILD_TOOLS=OFF, so tools/mtmd declares no targets; enabling
+    # it here and building ONLY the mtmd target adds the library without the
+    # tool CLIs. Same build tree as libllama — the integration runner links
+    # both, and two trees would mean two backend registries in one process.
+    - name: Build mtmd (multimodal codec)
+      run: |
+        cmake -B llama.cpp/build -S llama.cpp \
+          -DLLAMA_BUILD_TOOLS=ON \
+          -DMTMD_VIDEO=OFF
+        cmake --build llama.cpp/build --target mtmd -j$(nproc)
+        ls -lh llama.cpp/build/tools/mtmd/libmtmd.* 2>/dev/null || \
+          ls -lh llama.cpp/build/tools/mtmd/
+
     - name: Cache test models
       uses: actions/cache@v4
       with:
@@ -165,6 +179,30 @@ jobs:
           echo "✓ Using cached nomic-embed-text-v1.5.Q4_K_M.gguf"
         fi
 
+        # SmolVLM-256M + its projector (274MB) for the multimodal tests.
+        # This is the plain-position tier: it exercises the embedding rail,
+        # the cell/slack accounting and the fan-out, but not M-RoPE (which
+        # needs a Qwen-class VL model and runs locally / on the GPU rig).
+        for f in SmolVLM-256M-Instruct-Q8_0.gguf mmproj-SmolVLM-256M-Instruct-Q8_0.gguf; do
+          if [ ! -f "fixtures/$f" ]; then
+            echo "Downloading $f..."
+            curl -fsSL --retry 3 --retry-delay 2 \
+              "https://huggingface.co/ggml-org/SmolVLM-256M-Instruct-GGUF/resolve/main/$f" \
+              -o "fixtures/$f"
+
+            echo "Verifying $f..."
+            if ! head -c 4 "fixtures/$f" | grep -q "GGUF"; then
+              echo "ERROR: Downloaded file is not a valid GGUF file"
+              head -c 32 "fixtures/$f" | xxd
+              rm -f "fixtures/$f"
+              exit 1
+            fi
+            echo "✓ $f verified"
+          else
+            echo "✓ Using cached $f"
+          fi
+        done
+
         echo "All test models ready"
 
     - name: Configure CMake for integration tests
@@ -190,7 +228,7 @@ jobs:
         echo "Model path: $LLAMA_TEST_MODEL"
         ls -lh "$LLAMA_TEST_MODEL"
         ./build_integration/IntegrationRunner --success \
-          --test-case-exclude="*Embedding*" 2>&1 | tee test_output.txt
+          --test-case-exclude="*Embedding*,*multimodal*" 2>&1 | tee test_output.txt
         # Fail if no tests actually executed (all filtered/skipped)
         if grep -qE "test cases:.*\| 0 passed \| 0 failed \|" test_output.txt; then
           echo "::error::No tests executed — all were skipped or filtered out"
@@ -209,6 +247,29 @@ jobs:
         ls -lh "$LLAMA_EMBED_MODEL"
         ./build_integration/IntegrationRunner --success \
           --test-case="*Embedding*" 2>&1 | tee test_output.txt
+        # Fail if no tests actually executed (all filtered/skipped)
+        if grep -qE "test cases:.*\| 0 passed \| 0 failed \|" test_output.txt; then
+          echo "::error::No tests executed — all were skipped or filtered out"
+          exit 1
+        fi
+
+    - name: Run multimodal tests
+      working-directory: tests
+      env:
+        LLAMA_TEST_MODEL: ${{ github.workspace }}/tests/fixtures/SmolVLM-256M-Instruct-Q8_0.gguf
+        LLAMA_MMPROJ_MODEL: ${{ github.workspace }}/tests/fixtures/mmproj-SmolVLM-256M-Instruct-Q8_0.gguf
+        # Mechanics tier: SmolVLM-256M exercises the embedding rail, the
+        # cell/slack accounting and the fan-out, but is too small to be held
+        # to a grounded answer. Content assertions run on the Qwen tier.
+        LLOYAL_VL_STRICT: "0"
+      run: |
+        set -o pipefail
+        echo "Running multimodal tests with SmolVLM-256M..."
+        echo "Model path: $LLAMA_TEST_MODEL"
+        echo "Projector path: $LLAMA_MMPROJ_MODEL"
+        ls -lh "$LLAMA_TEST_MODEL" "$LLAMA_MMPROJ_MODEL"
+        ./build_integration/IntegrationRunner --success \
+          --test-case="*multimodal*" 2>&1 | tee test_output.txt
         # Fail if no tests actually executed (all filtered/skipped)
         if grep -qE "test cases:.*\| 0 passed \| 0 failed \|" test_output.txt; then
           echo "::error::No tests executed — all were skipped or filtered out"

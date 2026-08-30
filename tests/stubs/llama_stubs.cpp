@@ -257,6 +257,11 @@ int llama_decode(llama_context * /*ctx*/, llama_batch batch) {
   return g_stub_config.decode_result;
 }
 
+void llama_set_causal_attn(llama_context * /*ctx*/, bool causal) {
+  g_stub_config.causal_attn = causal;
+  g_stub_config.causal_attn_log.push_back(causal);
+}
+
 // ===== TOKENIZATION OPERATIONS =====
 
 int llama_tokenize(const llama_vocab *vocab, const char *text, int32_t text_len,

@@ -124,6 +124,9 @@ extern "C" {
     // Decode operations
     int llama_decode(llama_context* ctx, llama_batch batch);
 
+    // Attention mode (used by the embedding rail's non-causal bracket)
+    void llama_set_causal_attn(llama_context* ctx, bool causal);
+
     // Tokenization operations
     int llama_tokenize(
         const llama_vocab* vocab,
@@ -259,6 +262,13 @@ struct LlamaStubConfig {
     int decode_result = 0;                     // 0=success, <0=failure
     int decode_call_count = 0;                 // Track number of decode calls
     int batch_free_call_count = 0;             // Track RAII cleanup
+
+    // Causal-attention bracket (decode::embd for non-causal projectors).
+    // `causal_attn` is the live state; the log records every transition so a
+    // test can assert the bracket opened before the decode and closed after —
+    // including on the error path.
+    bool causal_attn = true;
+    std::vector<bool> causal_attn_log;
 
     // Sequence ID tracking (for multi-sequence tests)
     llama_seq_id last_batch_seq_id = -1;       // Last seq_id seen in batch (first token)

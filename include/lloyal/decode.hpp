@@ -27,7 +27,13 @@
  *    Single Token    │  decode::one    │  decode::each   │
  *                    ├─────────────────┼─────────────────┤
  *    Multi Token     │  decode::many   │  decode::scatter│
+ *                    ├─────────────────┼─────────────────┤
+ *    Embedding Rows  │  decode::embd   │        —        │
  *                    └─────────────────┴─────────────────┘
+ *
+ * Single-sequence primitives auto-chunk internally (many, embd); the
+ * multi-sequence ones do not — packing across sequences is a policy decision
+ * that lives in BranchStore (see bin_pack).
  *
  * Uses batch utilities from llama.cpp common (common_batch_clear, common_batch_add).
  *
@@ -296,9 +302,13 @@ struct Scratch {
   std::vector<llama_seq_id*> seq_id_ptrs_;
   std::vector<int8_t> logits_;
 
-  void resize(int32_t n) {
+  /// @param n Tokens (or embedding rows) in the batch
+  /// @param n_pos_per_embd Positions per entry — 1 for token batches, 4 for
+  ///        M-RoPE embedding batches, where `pos_` is section-major and holds
+  ///        `n * n_pos_per_embd` entries.
+  void resize(int32_t n, int32_t n_pos_per_embd = 1) {
     tokens_.resize(n);
-    pos_.resize(n);
+    pos_.resize(static_cast<size_t>(n) * n_pos_per_embd);
     n_seq_id_.resize(n);
     seq_id_single_.resize(n);
     seq_id_ptrs_.resize(n);
@@ -312,6 +322,23 @@ struct Scratch {
     batch.n_tokens = n_tokens;
     batch.token = tokens_.data();
     batch.embd = nullptr;
+    batch.pos = pos_.data();
+    batch.n_seq_id = n_seq_id_.data();
+    batch.seq_id = seq_id_ptrs_.data();
+    batch.logits = logits_.data();
+    return batch;
+  }
+
+  /// The embedding-rail twin of as_batch(): `embd` points at CALLER-owned
+  /// rows (never copied — that is the point), `token` is null. A llama_batch
+  /// is token-XOR-embd. `tokens_` is unused on this path.
+  ///
+  /// Same ABI sensitivity as as_batch() — audit together.
+  llama_batch as_embd_batch(int32_t n_tokens, const float* rows) {
+    llama_batch batch{};
+    batch.n_tokens = n_tokens;
+    batch.token = nullptr;
+    batch.embd = const_cast<float*>(rows);
     batch.pos = pos_.data();
     batch.n_seq_id = n_seq_id_.data();
     batch.seq_id = seq_id_ptrs_.data();
@@ -452,127 +479,179 @@ struct Scratch {
 // ============================================================================
 
 /**
+ * @brief Input item for decode::embd — embedding rows for one sequence
+ *
+ * The embedding-rail counterpart of ScatterItem. `rows` is CALLER-owned and
+ * never copied: an encoder's output buffer is pointed at directly.
+ */
+struct EmbdItem {
+  /// n_rows x n_embd_inp floats, caller-owned, valid for the call's duration
+  const float* rows = nullptr;
+  int32_t n_rows = 0;
+  /// Row width — llama_model_n_embd_inp(model), the INPUT dim (not n_embd)
+  int32_t n_embd_inp = 0;
+  /// Section-major positions: n_rows * n_pos_per_embd entries, laid out
+  /// [s0...][s1...]... Under M-RoPE the producer decides what each section
+  /// means; this layer only slices them.
+  const llama_pos* pos = nullptr;
+  /// 1 (plain positions) or 4 (M-RoPE)
+  int32_t n_pos_per_embd = 1;
+  llama_seq_id seq_id = 0;
+  /// Bracket the whole decode in non-causal attention (Gemma-class
+  /// projectors; requires n_ubatch >= n_rows since the block cannot split)
+  bool non_causal = false;
+  /// When true, compute logits for the LAST row of the last sub-chunk.
+  /// Rows are an interior prefix otherwise — a subsequent llama_decode
+  /// resets the output buffer, so only a rows-terminal prefill needs this.
+  bool output_logits = false;
+};
+
+/**
+ * @brief One run of input in a heterogeneous prefill
+ *
+ * A prefill is a sequence of segments, each entering the KV on one of two
+ * rails: TEXT via the token rail (`decode_scatter`), EMBD via the embedding
+ * rail (`decode_embd`). A `llama_batch` is token-XOR-embd, so the rails
+ * never share a dispatch — the segment sequence is what interleaves them.
+ *
+ * The store is deliberately blind to what produced an EMBD segment: rows are
+ * rows, whether they came from a vision projector, an audio encoder, or a
+ * cached embedding.
+ */
+struct Segment {
+  enum class Kind { Text, Embd };
+  Kind kind = Kind::Text;
+
+  /// Text: ready token ids (never re-tokenized by the store)
+  std::span<const llama_token> tokens;
+
+  /// Embd: n_rows x n_embd_inp floats. Valid only until the source's next
+  /// `at()` call — see SegmentSource's in-order contract.
+  const float* rows = nullptr;
+  int32_t n_rows = 0;
+  int32_t n_embd_inp = 0;
+  /// Position advance this segment costs (may be < n_rows under M-RoPE)
+  llama_pos n_pos = 0;
+  /// 1 (plain positions) or 4 (M-RoPE)
+  int32_t n_pos_per_embd = 1;
+  /// Bracket this segment's decode in non-causal attention
+  bool non_causal = false;
+};
+
+/**
+ * @brief Supplies the segment sequence for one branch's prefill
+ *
+ * The caller owns *placement* (which rail, at what position, which segment
+ * captures logits); the source owns *production* (decoding bytes, encoding
+ * rows, and the model-specific position geometry). Nothing about the
+ * producing format crosses this interface — an implementation may pull in
+ * llama.cpp's mtmd, a platform encoder, or nothing at all.
+ *
+ * **In-order contract.** Segments are consumed strictly in order, and each is
+ * dispatched before the next is requested. An implementation may therefore
+ * hand out a pointer into a buffer it reuses (mtmd's encode output is one),
+ * invalidating segment i-1 when `at(i)` is called. Callers must not hold a
+ * segment across an `at()` call, prefetch, or revisit.
+ */
+struct SegmentSource {
+  virtual ~SegmentSource() = default;
+
+  /// Number of segments in this prefill.
+  virtual size_t size() = 0;
+
+  /// Segment `i`. Invalidates any previously returned segment.
+  virtual Segment at(size_t i) = 0;
+
+  /**
+   * Fill positions for an EMBD segment, given the absolute base the store
+   * chose. `out` has `n_rows * n_pos_per_embd` entries, section-major:
+   * `[s0...][s1...]...`. Never called for a TEXT segment.
+   *
+   * The base is passed rather than exposed, because how it applies is
+   * model-specific — M-RoPE freezes one section and leaves another at zero,
+   * so a caller-side rebase would need the producer's model taxonomy.
+   */
+  virtual void positions(size_t i, llama_pos base, llama_pos* out) = 0;
+};
+
+/**
  * @brief Decode pre-computed embedding rows into one sequence's KV cache
  *
- * The embedding rail beside the token rail: rows (e.g. a clip-encoded image)
- * enter the KV via `batch.embd` with `batch.token = nullptr`. A llama_batch
- * is token-XOR-embd, so embedding rows can NEVER share a dispatch with
- * tokens — this is always its own llama_decode, distinct from scatter().
+ * The embedding rail beside the token rail: rows enter via `batch.embd` with
+ * `batch.token = nullptr`. A llama_batch is token-XOR-embd, so rows never
+ * share a dispatch with tokens — this is always its own llama_decode,
+ * distinct from scatter().
  *
- * Positions are SECTION-MAJOR: `n_tokens * n_pos_per_embd` entries laid out
- * `[s0...][s1...][s2...][s3...]`. For M-RoPE image rows the caller packs
- * t/y/x/z per mtmd's decoder-pos convention (y in section 1, x in section 2);
- * for plain-position models `n_pos_per_embd == 1` and `pos` is ordinary.
+ * Auto-chunks by n_batch like many() — and this is the MAIN path, not an
+ * edge: `image_min_tokens` metadata commonly puts an image above the default
+ * batch size. Each sub-chunk re-packs its positions section-major into the
+ * scratch buffers, so no view/slice buffer is needed.
  *
- * Sub-chunks internally by n_batch — the MAIN path, not an edge: image row
- * counts routinely exceed the default batch size. Each view re-packs the pos
- * sections for the visible rows (the decode_embd_batch::get_view semantics).
- *
- * Rows are an interior prefix and request no logits; `want_last_logits`
- * marks the final row of the final view for the rows-terminal case (a
- * subsequent llama_decode resets the output buffer, so a prefill whose LAST
- * dispatch is this one must request logits here or `logits::get(ctx, -1)`
- * has no output row).
- *
- * `non_causal` brackets the whole loop in llama_set_causal_attn(false/true),
- * restoring on error (Gemma-class projectors; requires n_ubatch >= n_tokens).
- *
- * Buffers are allocated per call: embedding decodes are low-frequency
- * relative to the per-tick token paths, so allocation cost is noise next to
- * the encode itself (no Scratch/thread_local reuse needed).
- *
- * ABI-sensitive: writes llama_batch fields directly, same as
- * Scratch::as_batch above. Audit on llama.cpp submodule bumps.
- *
- * @param ctx            Llama context (must not be null)
- * @param rows           Embedding rows, n_tokens x n_embd_inp floats
- * @param n_tokens       Number of rows
- * @param n_embd_inp     Row width — llama_model_n_embd_inp(model)
- * @param pos            Section-major positions, n_tokens * n_pos_per_embd
- * @param n_pos_per_embd 1 (plain) or 4 (M-RoPE)
- * @param seq_id         Target sequence ID
- * @param n_batch        Max rows per llama_decode (sub-chunk bound)
- * @param non_causal     Bracket the loop in non-causal attention
- * @param want_last_logits Request logits on the final row (rows-terminal)
+ * @param ctx     Llama context (must not be null)
+ * @param item    Rows, positions, sequence and flags
+ * @param n_batch Max rows per llama_decode (sub-chunk bound)
+ * @param scratch Reusable scratch buffers (shared with each()/scatter())
  * @return 0 on success, non-zero llama_decode rc on failure
- * @throws std::runtime_error if ctx/rows/pos are null or sizes non-positive
+ * @throws std::runtime_error on null ctx or malformed item
  *
  * @see scatter() for the multi-sequence token-rail primitive
- * @see BranchStore::prefill_embd for the branch-level wrapper (bookkeeping)
+ * @see BranchStore::decode_embd for the branch-level wrapper (bookkeeping)
  */
 [[nodiscard]] inline int embd(llama_context* ctx,
-                              const float* rows,
-                              int32_t n_tokens,
-                              int32_t n_embd_inp,
-                              const llama_pos* pos,
-                              int32_t n_pos_per_embd,
-                              llama_seq_id seq_id,
+                              const EmbdItem& item,
                               int32_t n_batch,
-                              bool non_causal,
-                              bool want_last_logits) {
+                              Scratch& scratch) {
   if (!ctx) {
     throw std::runtime_error("decode::embd - NULL context");
   }
-  if (!rows || n_tokens <= 0 || n_embd_inp <= 0) {
+  if (!item.rows || item.n_rows <= 0 || item.n_embd_inp <= 0) {
     throw std::runtime_error("decode::embd - invalid rows");
   }
-  if (!pos || (n_pos_per_embd != 1 && n_pos_per_embd != 4)) {
+  if (!item.pos || (item.n_pos_per_embd != 1 && item.n_pos_per_embd != 4)) {
     throw std::runtime_error("decode::embd - invalid positions");
   }
   if (n_batch <= 0) {
     throw std::runtime_error("decode::embd - n_batch must be positive");
   }
 
-  // Per-row metadata (full length; views index into these with an offset)
-  std::vector<int32_t> n_seq_id(n_tokens, 1);
-  llama_seq_id seq_id_single = seq_id;
-  std::vector<llama_seq_id*> seq_id_ptrs(
-      static_cast<size_t>(n_tokens) + 1, &seq_id_single);
-  seq_id_ptrs[n_tokens] = nullptr;
-  std::vector<int8_t> logits(n_tokens, 0);
-  if (want_last_logits) logits[n_tokens - 1] = 1;
+  const int32_t n    = item.n_rows;
+  const int32_t nppe = item.n_pos_per_embd;
 
-  // Per-view position buffer (re-packed section-major for the view)
-  std::vector<llama_pos> pos_view;
+  if (item.non_causal) llama_set_causal_attn(ctx, false);
 
   int32_t processed = 0;
-  if (non_causal) llama_set_causal_attn(ctx, false);
+  while (processed < n) {
+    const int32_t n_view = std::min(n - processed, n_batch);
+    scratch.resize(n_view, nppe);
 
-  while (processed < n_tokens) {
-    const int32_t n_view = std::min(n_tokens - processed, n_batch);
-
-    const llama_pos* view_pos;
-    if (n_pos_per_embd > 1) {
-      // Section-major re-pack: source section s spans
-      // pos[s*n_tokens + processed .. +n_view); view wants them contiguous
-      // per section over n_view rows.
-      pos_view.resize(static_cast<size_t>(n_view) * n_pos_per_embd);
-      for (int32_t s = 0; s < n_pos_per_embd; ++s) {
-        std::copy(pos + static_cast<size_t>(s) * n_tokens + processed,
-                  pos + static_cast<size_t>(s) * n_tokens + processed + n_view,
-                  pos_view.begin() + static_cast<size_t>(s) * n_view);
-      }
-      view_pos = pos_view.data();
-    } else {
-      view_pos = pos + processed;
+    // Section-major re-pack for this view: source section s spans
+    // [s*n + processed, +n_view); destination is contiguous per section.
+    for (int32_t s = 0; s < nppe; ++s) {
+      const llama_pos* src = item.pos + static_cast<size_t>(s) * n + processed;
+      std::copy(src, src + n_view,
+                scratch.pos_.begin() + static_cast<size_t>(s) * n_view);
     }
 
-    llama_batch batch{};
-    batch.n_tokens = n_view;
-    batch.token = nullptr;
-    batch.embd = const_cast<float*>(rows) +
-                 static_cast<size_t>(processed) * n_embd_inp;
-    batch.pos = const_cast<llama_pos*>(view_pos);
-    batch.n_seq_id = n_seq_id.data() + processed;
-    batch.seq_id = seq_id_ptrs.data() + processed;
-    batch.logits = logits.data() + processed;
+    for (int32_t i = 0; i < n_view; ++i) {
+      scratch.n_seq_id_[i]     = 1;
+      scratch.seq_id_single_[i] = item.seq_id;
+      scratch.seq_id_ptrs_[i]  = &scratch.seq_id_single_[i];
+      scratch.logits_[i]       = 0;
+    }
+    const bool is_last_view = (processed + n_view >= n);
+    if (item.output_logits && is_last_view) {
+      scratch.logits_[n_view - 1] = 1;
+    }
+
+    llama_batch batch = scratch.as_embd_batch(
+        n_view, item.rows + static_cast<size_t>(processed) * item.n_embd_inp);
 
     LLOYAL_LOG_DEBUG("[decode::embd] Submitting %d/%d rows (seq %d)",
-                     processed + n_view, n_tokens, seq_id);
+                     processed + n_view, n, item.seq_id);
 
     const int rc = llama_decode(ctx, batch);
     if (rc != 0) {
-      if (non_causal) llama_set_causal_attn(ctx, true);
+      if (item.non_causal) llama_set_causal_attn(ctx, true);
       LLOYAL_LOG_DEBUG("[decode::embd] ERROR: llama_decode failed (rc=%d)", rc);
       return rc;
     }
@@ -580,9 +659,9 @@ struct Scratch {
     processed += n_view;
   }
 
-  if (non_causal) llama_set_causal_attn(ctx, true);
+  if (item.non_causal) llama_set_causal_attn(ctx, true);
 
-  LLOYAL_LOG_DEBUG("[decode::embd] Decode complete (%d rows)", n_tokens);
+  LLOYAL_LOG_DEBUG("[decode::embd] Decode complete (%d rows)", n);
   return 0;
 }
 
