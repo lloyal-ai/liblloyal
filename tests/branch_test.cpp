@@ -1569,3 +1569,34 @@ TEST_CASE("branch: causal mode is restored even when the decode fails") {
 
   prune(h, ts.store);
 }
+
+TEST_CASE("branch: an unrollbackable decode_embd failure says so") {
+  resetStubConfig();
+  TestStore ts(8);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 512);
+  REQUIRE(h != INVALID_HANDLE);
+  ts.store.get(h)->position = 40;
+
+  llamaStubConfig().decode_result = -1;   // the decode fails
+  llamaStubConfig().rm_ok = false;        // ...and the rollback cannot rewind
+
+  const int32_t n_rows = 8, n_pos = 4, nppe = 1, n_embd = 2;
+  std::vector<float> rows(static_cast<size_t>(n_rows) * n_embd, 0.5f);
+  std::vector<llama_pos> pos(static_cast<size_t>(n_rows) * nppe, 0);
+
+  // A recurrent carrier has folded the committed rows into fixed-size state.
+  // Where llama.cpp keeps no per-token snapshot (rs_seq = 0, which is what
+  // Gated DeltaNet reports), seq_rm returns false and the branch cannot be
+  // restored. Saying "failed" while leaving it half-rolled-back would be a
+  // silent wrong answer, so the error names the condition and the remedy.
+  CHECK_THROWS_WITH(
+      ts.store.decode_embd(h, rows.data(), n_rows, n_embd, n_pos, pos.data(),
+                           nppe, false, false),
+      "BranchStore::decode_embd - llama_decode failed and this branch could "
+      "not be rolled back (recurrent state has no snapshot to rewind to); "
+      "prune it, it is unusable");
+
+  prune(h, ts.store);
+}

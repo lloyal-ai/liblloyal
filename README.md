@@ -17,7 +17,7 @@ So the operations are the ones you already know:
 | `prune()` / `pruneSubtree()` | `git branch -d` / `-D`, descendants included |
 | `retainOnly(winner)` | `git merge --ff-only` — the winner's KV *becomes* the trunk, in one pass |
 | `decode_scatter()` onto the parent | `git merge --squash` — **hard**: the child's KV is dropped, its output re-decoded onto the parent |
-| `fork()` + `decode_scatter()` | `git rebase` — the same tokens, replayed onto a different base |
+| `create()` + `decode_scatter()` — replay from content | `git rebase` — re-decodes onto a new base rather than moving cells, which is the only form that survives recurrent state |
 | `merge_logits(dst, experts, α)` | *no equivalent* — **soft**: distributions blend, both KVs stay live |
 
 **Hard costs the tokens twice** — the output is re-decoded, not moved — and what returns is an ordinary prefix every later fork inherits.
@@ -29,8 +29,6 @@ dst.logits[t] += α · Σᵢ experts[i].logits[t]
 ```
 
 Several KV histories steer one branch's next token, each keeping its own state — contrastive decoding, [DExperts](https://arxiv.org/abs/2105.03023)-style, `α < 0` for anti-experts. No dispatch, no KV write, identical on recurrent backends.
-
-**Rebase needs the tokens from you.** A branch stores its position, never what was decoded into it, so replaying onto a new base means supplying the content yourself. Deliberate rather than missing: content survives a context restart, a position does not.
 
 Two properties make a tree cheap enough to work this way.
 
