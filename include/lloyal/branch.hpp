@@ -1197,6 +1197,13 @@ public:
       std::memcpy(state->logits_snapshot.data(), raw_logits,
                   state->n_vocab * sizeof(float));
       state->has_logits = true;
+    } else {
+      // The position advanced but no logits were computed for it. Leaving the
+      // previous snapshot in place would let sample() read logits belonging to
+      // an EARLIER position — wrong, and silently so. decode_each and
+      // decode_scatter always recapture, so this is the one rail that can
+      // strand them.
+      state->has_logits = false;
     }
   }
 

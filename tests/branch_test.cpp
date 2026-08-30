@@ -1317,3 +1317,31 @@ TEST_CASE("branch: an oversized non-causal block is rejected, not split") {
 
   prune(h, ts.store);
 }
+
+TEST_CASE("branch: decode_embd without want_logits clears stale logits") {
+  resetStubConfig();
+  TestStore ts(8);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 512);
+  REQUIRE(h != INVALID_HANDLE);
+  BranchState* st = ts.store.get(h);
+  REQUIRE(st != nullptr);
+
+  // Stand in for an earlier decode that did capture logits.
+  st->has_logits = true;
+
+  const int32_t n_rows = 8, n_pos = 4, nppe = 1, n_embd = 2;
+  std::vector<float> rows(static_cast<size_t>(n_rows) * n_embd, 0.5f);
+  std::vector<llama_pos> pos(static_cast<size_t>(n_rows) * nppe, 0);
+  ts.store.decode_embd(h, rows.data(), n_rows, n_embd, n_pos, pos.data(),
+                       nppe, /*non_causal*/ false, /*want_logits*/ false);
+
+  // Position moved, so the old snapshot describes a position that is no
+  // longer current — sampling from it would be silently wrong.
+  CHECK(st->position == n_pos);
+  CHECK(st->has_logits == false);
+
+  prune(h, ts.store);
+}
