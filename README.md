@@ -13,24 +13,16 @@ So the operations are the ones you already know:
 
 | liblloyal | Git command |
 |---|---|
-| `fork()` | `git branch` — from the current commit |
+| `fork()` | `git branch` — from the current position |
 | `prune()` / `pruneSubtree()` | `git branch -d` / `-D`, descendants included |
-| `retainOnly(winner)` | `git merge --ff-only` — the winner becomes the trunk, the rest vaporize in one pass |
-| **hard merge** — fan-in | `git merge --squash` — a branch's *result* is written back onto the trunk as tokens |
-| **soft merge** — `merge_logits` | *no equivalent* — both lineages stay live; only the next-token distribution blends |
-| `decode_each()` | *no equivalent* — Git never advances every branch at once |
+| `retainOnly(winner)` | `git merge --ff-only` — the winner's KV *becomes* the trunk, in one pass |
+| `decode_scatter()` onto the parent | `git merge --squash` — **hard**: the child's KV is dropped, its output re-decoded onto the parent |
+| `fork()` + `decode_scatter()` | `git rebase` — the same tokens, replayed onto a different base |
+| `merge_logits(dst, experts, α)` | *no equivalent* — **soft**: distributions blend, both KVs stay live |
 
-The two rows Git can't express are the interesting ones.
+**Hard vs soft is a real distinction.** A hard merge discards a branch's KV and re-decodes its output onto the parent: you pay for those tokens twice, and what you get back is an ordinary shared prefix every later fork inherits. A soft merge writes nothing at all — `merge_logits` adds `α · Σ experts` to `dst`'s cached logits, so several KV histories steer one branch's next token while each keeps its own state. That is contrastive decoding, DExperts-style, with `α < 0` for anti-experts. No dispatch, no KV write, and identical on recurrent backends.
 
-A **hard merge** collapses a lineage into its parent: the agents runtime runs the whole turn on forks, then writes the chosen result back onto the shared line as an assistant turn — `ctx.extendSpine(userContent, agent.result)` — and the next generation forks from there. The divergence is gone; what survives is its outcome, now an ordinary prefix.
-
-A **soft merge** never touches the KV. `merge_logits(dst, experts, α)` accumulates in log-probability space —
-
-```text
-dst.logits[t] += α · Σᵢ experts[i].logits[t]
-```
-
-— so several KV histories of the same model shape one branch's next token while each keeps its own state. That is contrastive decoding (DExperts-style) expressed as a tree operation: `α > 0` pulls `dst` toward the experts, `α < 0` pushes it away. No dispatch, no KV write, and it works the same on recurrent backends.
+**Rebase composes from what is already here** — `fork()` the new base, `decode_scatter()` the same tokens onto it. A branch stores its *position*, never its content, so the caller supplies the tokens. That is deliberate rather than missing: content survives a context restart and a position does not.
 
 Two properties make a tree cheap enough to work this way.
 
