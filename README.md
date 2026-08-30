@@ -28,7 +28,7 @@ So the operations are the ones you already know:
 dst.logits[t] += α · Σᵢ experts[i].logits[t]
 ```
 
-Several KV histories steer one branch's next token, each keeping its own state — contrastive decoding, DExperts-style, `α < 0` for anti-experts. No dispatch, no KV write, identical on recurrent backends.
+Several KV histories steer one branch's next token, each keeping its own state — contrastive decoding, [DExperts](https://arxiv.org/abs/2105.03023)-style, `α < 0` for anti-experts. No dispatch, no KV write, identical on recurrent backends.
 
 **Rebase** already composes: `fork()` the new base, `decode_scatter()` the same tokens. A branch stores its position, never its content, so the caller supplies them — content survives a context restart, a position doesn't.
 

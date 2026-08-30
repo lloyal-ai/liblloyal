@@ -1341,9 +1341,11 @@ public:
    * Backend-agnostic: operates purely on cached logits buffers, no KV ops,
    * no GPU dispatch. Works identically for transformer and recurrent backends.
    *
-   * Inspired by DExperts-style contrastive decoding: experts are different
-   * KV states of the same model — their live logits_snapshot at each step
-   * reflect their own KV history, shaping `dst`'s next-token choice.
+   * Inspired by DExperts-style contrastive decoding (Liu et al., 2021 —
+   * https://arxiv.org/abs/2105.03023). Here the experts are different KV
+   * states of the SAME model rather than separate models: their live
+   * logits_snapshot at each step reflects their own KV history, shaping
+   * `dst`'s next-token choice. A negative alpha makes an anti-expert.
    *
    * @param dst_handle    Destination branch (must have captured logits)
    * @param expert_handles Span of expert branches (all must have captured logits)
