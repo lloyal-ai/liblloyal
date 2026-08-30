@@ -617,6 +617,32 @@ struct SegmentSource {
   const int32_t n    = item.n_rows;
   const int32_t nppe = item.n_pos_per_embd;
 
+  // A non-causal block is bidirectional: every row must be able to attend to
+  // every other row, which only holds if they share one forward pass. The
+  // chunk loop below would split an oversized block across separate
+  // llama_decode calls, and rows in an earlier call cannot see later ones —
+  // the block silently stops being bidirectional and the vision state is
+  // wrong with no error anywhere. Refuse the configuration instead.
+  if (item.non_causal) {
+    const int32_t n_ubatch = static_cast<int32_t>(llama_n_ubatch(ctx));
+    if (n > n_batch || n > n_ubatch) {
+      throw std::runtime_error(
+          "decode::embd - non-causal block of " + std::to_string(n) +
+          " rows exceeds n_batch (" + std::to_string(n_batch) +
+          ") or n_ubatch (" + std::to_string(n_ubatch) +
+          "); a bidirectional image must decode in a single dispatch");
+    }
+  }
+
+  // Causal mode is context-wide state, so a throw between here and the
+  // restore would leave every SUBSEQUENT text decode on this context
+  // non-causal. The guard makes the restore unconditional.
+  struct CausalGuard {
+    llama_context* ctx;
+    bool engaged;
+    ~CausalGuard() { if (engaged) llama_set_causal_attn(ctx, true); }
+  } causal_guard{ctx, item.non_causal};
+
   if (item.non_causal) llama_set_causal_attn(ctx, false);
 
   int32_t processed = 0;
@@ -651,15 +677,12 @@ struct SegmentSource {
 
     const int rc = llama_decode(ctx, batch);
     if (rc != 0) {
-      if (item.non_causal) llama_set_causal_attn(ctx, true);
       LLOYAL_LOG_DEBUG("[decode::embd] ERROR: llama_decode failed (rc=%d)", rc);
       return rc;
     }
 
     processed += n_view;
   }
-
-  if (item.non_causal) llama_set_causal_attn(ctx, true);
 
   LLOYAL_LOG_DEBUG("[decode::embd] Decode complete (%d rows)", n);
   return 0;

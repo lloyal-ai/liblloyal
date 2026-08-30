@@ -361,7 +361,11 @@ int llama_token_to_piece(const llama_vocab *vocab, llama_token /*token*/,
 static llama_vocab g_vocab_handle;
 
 uint32_t llama_n_batch(const llama_context * /*ctx*/) {
-  return 512;  // Default batch size
+  return g_stub_config.n_batch;
+}
+
+uint32_t llama_n_ubatch(const llama_context * /*ctx*/) {
+  return g_stub_config.n_ubatch;
 }
 
 float *llama_get_logits_ith(llama_context * /*ctx*/, int32_t /*i*/) {

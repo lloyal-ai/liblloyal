@@ -14,6 +14,7 @@
 #include <doctest/doctest.h>
 #include <lloyal/branch.hpp>
 #include <cmath>  // std::isnan, std::isinf
+#include <vector>
 
 using namespace lloyal::branch;
 
@@ -1171,4 +1172,148 @@ TEST_CASE("drain: idempotent") {
 
   ts.store.drain();
   ts.store.drain();  // Should not crash
+}
+
+// ============================================================================
+// Embedding rail — the cells/position split, on stubs
+//
+// The integration tier covers this against a real VL model, but its REQUIRED
+// CI tier is a plain-position model where n_pos == n_rows, so every slack
+// field stays zero and the accounting could be deleted without failing
+// anything. These cases force n_rows > n_pos deterministically.
+// ============================================================================
+
+TEST_CASE("branch: decode_embd advances position by n_pos, cells by n_rows") {
+  resetStubConfig();
+  TestStore ts(8);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+
+  // A SECOND branch stays alive throughout: release() zeroes cells_used_
+  // outright once the last branch goes, which would mask any arithmetic error
+  // in the slack accounting.
+  BranchHandle keeper = create(ts.ctx, fake_model, ts.store, 0, params, 512);
+  REQUIRE(keeper != INVALID_HANDLE);
+
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 512);
+  REQUIRE(h != INVALID_HANDLE);
+
+  // An M-RoPE image: 64 cells (8x8 patches) but only 8 positions (max(nx,ny)).
+  const int32_t n_rows = 64, n_pos = 8, nppe = 4, n_embd = 2;
+  std::vector<float> rows(static_cast<size_t>(n_rows) * n_embd, 0.5f);
+  std::vector<llama_pos> pos(static_cast<size_t>(n_rows) * nppe, 0);
+
+  const uint32_t cells_before = ts.store.kv_pressure().cells_used;
+  ts.store.decode_embd(h, rows.data(), n_rows, n_embd, n_pos, pos.data(),
+                       nppe, /*non_causal*/ false, /*want_logits*/ false);
+
+  BranchState* st = ts.store.get(h);
+  REQUIRE(st != nullptr);
+  CHECK(st->position == n_pos);                                   // NOT n_rows
+  CHECK(ts.store.kv_pressure().cells_used == cells_before + n_rows);
+
+  // The slack itself, asserted directly — no gauge arithmetic to mask it.
+  CHECK(st->img_slack_own   == static_cast<uint32_t>(n_rows - n_pos));
+  CHECK(st->img_slack_total == static_cast<uint32_t>(n_rows - n_pos));
+
+  // Release recovers the CELLS, not the position delta. Position-delta alone
+  // strands (n_rows - n_pos) == 56 cells; keeper keeps auto-reset from hiding it.
+  ts.store.release(h);
+  CHECK(ts.store.kv_pressure().cells_used == cells_before);
+
+  prune(keeper, ts.store);
+}
+
+TEST_CASE("branch: retainOnly promotes inherited embedding slack") {
+  resetStubConfig();
+  TestStore ts(8);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+
+  BranchHandle root = create(ts.ctx, fake_model, ts.store, 0, params, 512);
+  REQUIRE(root != INVALID_HANDLE);
+
+  const int32_t n_rows = 32, n_pos = 6, nppe = 4, n_embd = 2;
+  std::vector<float> rows(static_cast<size_t>(n_rows) * n_embd, 0.25f);
+  std::vector<llama_pos> pos(static_cast<size_t>(n_rows) * nppe, 0);
+  ts.store.decode_embd(root, rows.data(), n_rows, n_embd, n_pos, pos.data(),
+                       nppe, false, false);
+  const uint32_t slack = static_cast<uint32_t>(n_rows - n_pos);
+
+  BranchHandle winner = fork(root, ts.store);
+  REQUIRE(winner != INVALID_HANDLE);
+
+  // The fork inherits the slack as TOTAL but owns none of it.
+  BranchState* ws = ts.store.get(winner);
+  REQUIRE(ws != nullptr);
+  CHECK(ws->img_slack_total == slack);
+  CHECK(ws->img_slack_own   == 0u);
+
+  // retainOnly promotes the winner to root. The inherited slack must become
+  // its OWN, or a later release under-subtracts by exactly `slack`.
+  ts.store.retainOnly(winner);
+  // Re-fetch: retainOnly releases the other slots, so a BranchState* taken
+  // before the call must not be trusted afterwards.
+  BranchState* promoted = ts.store.get(winner);
+  REQUIRE(promoted != nullptr);
+  CHECK(get_fork_head(winner, ts.store) == 0);
+  CHECK(promoted->img_slack_own == slack);
+  CHECK(ts.store.kv_pressure().cells_used ==
+        static_cast<uint32_t>(promoted->position) + slack);
+
+  prune(winner, ts.store);
+}
+
+TEST_CASE("branch: decode_embd brackets a non-causal block and restores it") {
+  resetStubConfig();
+  TestStore ts(8);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 512);
+  const int32_t n_rows = 16, n_pos = 4, nppe = 1, n_embd = 2;
+  std::vector<float> rows(static_cast<size_t>(n_rows) * n_embd, 1.0f);
+  std::vector<llama_pos> pos(static_cast<size_t>(n_rows) * nppe, 0);
+
+  ts.store.decode_embd(h, rows.data(), n_rows, n_embd, n_pos, pos.data(),
+                       nppe, /*non_causal*/ true, false);
+
+  // false on entry, true on exit — and back to causal when it returns.
+  const auto& log = llamaStubConfig().causal_attn_log;
+  REQUIRE(log.size() >= 2);
+  CHECK(log.front() == false);
+  CHECK(log.back() == true);
+  CHECK(llamaStubConfig().causal_attn == true);
+
+  prune(h, ts.store);
+}
+
+TEST_CASE("branch: an oversized non-causal block is rejected, not split") {
+  resetStubConfig();
+  // A bidirectional block cannot span dispatches: rows in an earlier decode
+  // cannot attend to later ones. Splitting it would silently corrupt the
+  // vision state, so the configuration must fail loud.
+  llamaStubConfig().n_batch  = 8;
+  llamaStubConfig().n_ubatch = 8;
+
+  TestStore ts(8);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, /*n_batch*/ 8);
+
+  const int32_t n_rows = 64, n_pos = 8, nppe = 1, n_embd = 2;
+  std::vector<float> rows(static_cast<size_t>(n_rows) * n_embd, 1.0f);
+  std::vector<llama_pos> pos(static_cast<size_t>(n_rows) * nppe, 0);
+
+  CHECK_THROWS_AS(
+      ts.store.decode_embd(h, rows.data(), n_rows, n_embd, n_pos, pos.data(),
+                           nppe, /*non_causal*/ true, false),
+      std::runtime_error);
+
+  // A causal block of the same size chunks happily.
+  CHECK_NOTHROW(
+      ts.store.decode_embd(h, rows.data(), n_rows, n_embd, n_pos, pos.data(),
+                           nppe, /*non_causal*/ false, false));
+
+  prune(h, ts.store);
 }

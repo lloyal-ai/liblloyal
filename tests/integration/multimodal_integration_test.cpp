@@ -20,6 +20,7 @@
  * Gated on LLAMA_TEST_MODEL + LLAMA_MMPROJ_MODEL naming a matched VL pair.
  */
 
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -171,7 +172,11 @@ static bool contains_any(const std::string& haystack,
                          const std::vector<std::string>& needles) {
   std::string lower;
   lower.reserve(haystack.size());
-  for (char c : haystack) lower += static_cast<char>(std::tolower(c));
+  // unsigned char: std::tolower is UB for negative values, and model
+  // output is UTF-8, so continuation bytes (>= 0x80) reach here.
+  for (unsigned char c : haystack) {
+    lower += static_cast<char>(std::tolower(c));
+  }
   for (const auto& n : needles) {
     if (lower.find(n) != std::string::npos) return true;
   }

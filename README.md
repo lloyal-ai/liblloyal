@@ -55,7 +55,7 @@ dispatch — they never bin-pack with text). Positions are section-major and
 carry M-RoPE's 4-wide layout when the model needs it; sub-chunking by
 `n_batch` is built in.
 
-`BranchStore::prefill_embd` is the branch-level wrapper with the one
+`BranchStore::decode_embd` is the branch-level wrapper with the one
 multimodal bookkeeping difference: cells grow by `n_tokens` (every row is a
 KV cell) while position advances by `n_pos` (`max(nx, ny)` under M-RoPE).
 The gap is tracked as embedding-row slack so `release()`/`retainOnly()`
@@ -64,7 +64,7 @@ recover exact cell counts.
 ```cpp
 // A multimodal prefill interleaves sequential calls per branch:
 store.decode_scatter({{h, text_before}});          // token rail
-store.prefill_embd(h, rows, n_tokens, n_embd_inp,  // embedding rail
+store.decode_embd(h, rows, n_tokens, n_embd_inp,   // embedding rail
                    n_pos, pos_section_major, /*n_pos_per_embd*/ 4,
                    /*non_causal*/ false, /*want_logits*/ false);
 store.decode_scatter({{h, text_after}});           // token rail

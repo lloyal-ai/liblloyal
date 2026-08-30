@@ -1209,10 +1209,12 @@ public:
    * positions come from the branch's own state and never leave it, and the
    * bookkeeping (cells, slack, logits) is already this class's job.
    *
-   * Logits are captured on the FINAL segment only: every `llama_decode`
-   * resets the output buffer, so an interior segment's logits are dead. A
-   * trailing TEXT segment gets them via `decode_scatter`'s per-item capture;
-   * a trailing EMBD segment via `decode_embd`'s `want_logits`.
+   * Only the FINAL segment's logits survive: every `llama_decode` resets the
+   * output buffer, so an interior segment's snapshot is immediately dead.
+   * TEXT segments go through `decode_scatter`, which captures on every
+   * dispatch — the interior captures happen and are simply overwritten. EMBD
+   * segments request output explicitly, so only a trailing one passes
+   * `want_logits`. Either way the branch ends holding the last segment's.
    *
    * Segments are requested and dispatched strictly in order — see
    * SegmentSource's in-order contract; a source may reuse its row buffer
@@ -1252,6 +1254,28 @@ public:
         throw std::runtime_error(
             "BranchStore::decode_segments - empty embedding segment at " +
             std::to_string(i));
+      }
+      // SegmentSource is a public extension point, so this geometry is
+      // untrusted input. It must be checked BEFORE it sizes the buffer or
+      // reaches positions(): n_pos_per_embd of -1 wraps the size_t multiply
+      // into an enormous allocation, and 0 hands positions() a zero-length
+      // buffer to write into. decode_embd's own checks come too late.
+      if (seg.n_pos_per_embd != 1 && seg.n_pos_per_embd != 4) {
+        throw std::runtime_error(
+            "BranchStore::decode_segments - segment " + std::to_string(i) +
+            " has n_pos_per_embd " + std::to_string(seg.n_pos_per_embd) +
+            " (expected 1 or 4)");
+      }
+      if (seg.n_embd_inp <= 0) {
+        throw std::runtime_error(
+            "BranchStore::decode_segments - segment " + std::to_string(i) +
+            " has non-positive n_embd_inp");
+      }
+      if (seg.n_pos <= 0 || seg.n_pos > seg.n_rows) {
+        throw std::runtime_error(
+            "BranchStore::decode_segments - segment " + std::to_string(i) +
+            " has n_pos " + std::to_string(seg.n_pos) +
+            " outside (0, n_rows=" + std::to_string(seg.n_rows) + "]");
       }
 
       // The base never leaves this scope: the source is handed the position

@@ -159,6 +159,7 @@ extern "C" {
 
     // Context parameters
     uint32_t llama_n_batch(const llama_context* ctx);
+    uint32_t llama_n_ubatch(const llama_context* ctx);
 
     // Sampling operations
     float* llama_get_logits_ith(llama_context* ctx, int32_t i);
@@ -269,6 +270,12 @@ struct LlamaStubConfig {
     // including on the error path.
     bool causal_attn = true;
     std::vector<bool> causal_attn_log;
+
+    // Batch geometry reported by llama_n_batch / llama_n_ubatch. Settable so a
+    // test can force an oversized non-causal block, which decode::embd must
+    // reject rather than silently split across dispatches.
+    uint32_t n_batch = 512;
+    uint32_t n_ubatch = 512;
 
     // Sequence ID tracking (for multi-sequence tests)
     llama_seq_id last_batch_seq_id = -1;       // Last seq_id seen in batch (first token)
