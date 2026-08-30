@@ -90,15 +90,13 @@ Slots are how many branches can **exist**; leases are how many can **decode**. T
 ### Lifecycle
 
 ```mermaid
-stateDiagram-v2
-    [*] --> Live: create()
-    Live --> Live: prefill / step
-    Live --> Forked: fork()
-    Forked --> Live: independent decode
-    Forked --> [*]: prune() — RESTRICT
-    Live --> Promoted: retainOnly(winner)
-    Promoted --> Live: winner becomes trunk
-    Live --> [*]: prune()
+flowchart LR
+    C["create()"] --> L["Live<br/>prefill · step"]
+    L --> F["fork()<br/>children share the prefix"]
+    F --> D["decode_each<br/>independent divergence"]
+    D --> P["prune() losers<br/>RESTRICT"]
+    P --> R["retainOnly(winner)<br/>one seq_keep"]
+    R --> L
 ```
 
 Search is **surgical** (N × `prune()`); promotion is **nuclear** (1 × `retainOnly()`, a single `seq_keep` pass that vaporizes every loser).
