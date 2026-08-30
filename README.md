@@ -11,7 +11,7 @@ A KV cache already holds everything the model has read. Git-like branching is wh
 
 So the operations are the ones you already know:
 
-| Git command&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; | liblloyal composition |
+| Git command&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; | liblloyal composition |
 |---|---|
 | `git branch` | `fork()` — from the current position |
 | `git branch -d` / `-D` | `prune()` / `pruneSubtree()`, descendants included |
@@ -20,9 +20,9 @@ So the operations are the ones you already know:
 | `git rebase` | `create()` + `decode_scatter()` — **replay from content**; re-decodes onto a new base rather than moving cells, the only form that survives recurrent state |
 | *no equivalent* | `merge_logits(dst, experts, α)` — **soft**: distributions blend, both KVs stay live |
 
-**Hard costs the tokens twice** — the output is re-decoded, not moved — and what returns is an ordinary prefix every later fork inherits.
+**A hard merge costs the tokens twice** — the output is re-decoded, not moved — and what returns is an ordinary prefix every later fork inherits.
 
-**Soft costs nothing:**
+**A soft merge costs nothing:**
 
 ```text
 dst.logits[t] += α · Σᵢ experts[i].logits[t]
