@@ -1183,29 +1183,26 @@ public:
     item.non_causal     = non_causal;
     item.output_logits  = want_logits;
 
-    // decode::embd chunks by n_batch, so a failure on a later chunk leaves
-    // EARLIER chunks already committed to the sequence while position,
-    // cells_used_ and slack below have not moved. A caller that caught this
-    // and retried would decode over rows already in the KV.
+    // NOT atomic, and deliberately not made so. decode::embd chunks by
+    // n_batch, so a failure on a later chunk leaves EARLIER chunks committed
+    // while the counters below never move. Rolling those rows back is not
+    // available: seq_rm can only rewind a recurrent carrier where the model
+    // keeps per-token snapshots, and Gated DeltaNet reports rs_seq = 0, so a
+    // rollback there silently restores attention and not the carrier.
     //
-    // Attention cells can be stripped. A RECURRENT carrier generally cannot:
-    // it has already folded the committed rows into fixed-size state, and
-    // llama.cpp can only rewind that when the model keeps per-token snapshots
-    // (n_rs_seq). Qwen3.5's Gated DeltaNet reports rs_seq = 0, so seq_rm
-    // returns false there and the branch is NOT clean. Never discard that
-    // result — a half-rolled-back branch that reports success is the worst
-    // failure available here.
-    const llama_pos rollback_from = state->position;
+    // The branch is therefore poisoned on failure — prune it and replay onto
+    // a fresh one, which is the portable correction regardless of layer type.
+    // Its own accounting stays CONSISTENT for that prune: neither position
+    // nor cells_used_ moved, so release() subtracts what the branch legitimately
+    // owned and whole-sequence eviction reclaims the orphaned rows.
+    //
+    // Admission is the better place to spend effort: MtmdSource::cells()
+    // reports this prefill's cost before anything decodes, so a caller can
+    // refuse rather than half-commit.
     if (decode::embd(state->ctx, item, state->n_batch, scratch_) != 0) {
-      const bool restored =
-          kv::remove_range(state->ctx, state->seq_id, rollback_from, -1);
-      if (!restored) {
-        throw std::runtime_error(
-            "BranchStore::decode_embd - llama_decode failed and this branch "
-            "could not be rolled back (recurrent state has no snapshot to "
-            "rewind to); prune it, it is unusable");
-      }
-      throw std::runtime_error("BranchStore::decode_embd - llama_decode failed");
+      throw std::runtime_error(
+          "BranchStore::decode_embd - llama_decode failed; this branch is "
+          "poisoned, prune it and replay onto a fresh one");
     }
 
     state->position += n_pos;

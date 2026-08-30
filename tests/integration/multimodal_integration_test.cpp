@@ -222,7 +222,19 @@ TEST_CASE("multimodal: image prefill decouples position from cells") {
   std::vector<std::vector<uint8_t>> images{image};
   MtmdSource source(mtmd, prompt, images, std::span<const llama_token>(),
                     llama_model_n_embd_inp(model.get()));
+
+  // Cost is known BEFORE anything decodes — counted at construction, after
+  // mtmd_tokenize and before any clip encode. This is what lets a caller
+  // admit or refuse media against a context budget the way it already can
+  // for text, whose length it can measure by tokenizing.
+  const size_t predicted = source.cells();
+  CHECK(predicted > 0);
+
   const auto r = store.decode_segments(root, source);
+
+  // The prediction must be exact, or an admission gate built on it is a lie.
+  CHECK_MESSAGE(static_cast<int64_t>(predicted) == r.cells,
+                "pre-decode cell estimate must match what was decoded");
 
   CHECK(r.cells > 0);
   CHECK(r.advance > 0);

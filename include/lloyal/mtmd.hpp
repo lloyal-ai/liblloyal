@@ -161,6 +161,7 @@ public:
     // the error means decode_segments may already have committed preceding
     // text or image chunks, handing the caller a failure with a partially
     // advanced branch.
+    cells_ = sep_.size();
     for (size_t k = 0; k < n_chunks_; ++k) {
       const mtmd_input_chunk* ch = mtmd_input_chunks_get(chunks_.get(), k);
       const auto kind = mtmd_input_chunk_get_type(ch);
@@ -168,10 +169,29 @@ public:
           kind != MTMD_INPUT_CHUNK_TYPE_IMAGE) {
         throw std::runtime_error("MtmdSource - audio input is not supported");
       }
+      cells_ += mtmd_input_chunk_get_n_tokens(ch);
     }
   }
 
   size_t size() override { return lead_ + n_chunks_; }
+
+  /**
+   * @brief KV cells this prefill will consume, known BEFORE anything decodes
+   *
+   * Counted during construction, after `mtmd_tokenize` and before any clip
+   * encode — image row counts are fixed at tokenize time, which is what the
+   * placeholder-bitmap counting flow in `mtmd.h` relies on.
+   *
+   * Exists so a caller can decide ADMISSION before touching a branch. Text
+   * suffixes can already be measured by tokenizing them; an image cannot,
+   * because the caller holds bytes and the row count depends on the
+   * projector's geometry. Without this, media is the one input that bypasses
+   * a context-pressure gate.
+   *
+   * Cells, not positions: a KV budget is spent in cells, and under M-RoPE an
+   * image costs far more cells than it advances position.
+   */
+  size_t cells() const { return cells_; }
 
   decode::Segment at(size_t i) override {
     decode::Segment seg;
@@ -265,6 +285,7 @@ private:
   bool   mrope_    = false;
   size_t n_chunks_ = 0;
   size_t lead_     = 0;
+  size_t cells_    = 0;
 };
 
 } // namespace lloyal
