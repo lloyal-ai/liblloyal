@@ -20,9 +20,9 @@ So the operations are the ones you already know:
 | `fork()` + `decode_scatter()` | `git rebase` — the same tokens, replayed onto a different base |
 | `merge_logits(dst, experts, α)` | *no equivalent* — **soft**: distributions blend, both KVs stay live |
 
-**Hard** throws the child's KV away and re-decodes its output onto the parent. You pay the tokens twice and get a shared prefix every later fork inherits.
+**Hard costs the tokens twice** — the output is re-decoded, not moved — and what returns is an ordinary prefix every later fork inherits.
 
-**Soft** writes nothing:
+**Soft costs nothing:**
 
 ```text
 dst.logits[t] += α · Σᵢ experts[i].logits[t]
@@ -30,7 +30,7 @@ dst.logits[t] += α · Σᵢ experts[i].logits[t]
 
 Several KV histories steer one branch's next token, each keeping its own state — contrastive decoding, [DExperts](https://arxiv.org/abs/2105.03023)-style, `α < 0` for anti-experts. No dispatch, no KV write, identical on recurrent backends.
 
-**Rebase** already composes: `fork()` the new base, `decode_scatter()` the same tokens. A branch stores its position, never its content, so the caller supplies them — content survives a context restart, a position doesn't.
+**Rebase needs the tokens from you.** A branch stores its position, never what was decoded into it, so replaying onto a new base means supplying the content yourself. Deliberate rather than missing: content survives a context restart, a position does not.
 
 Two properties make a tree cheap enough to work this way.
 
