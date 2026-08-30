@@ -88,8 +88,12 @@ llama_memory_t llama_get_memory(llama_context * /*ctx*/) {
   return g_memory_handle;
 }
 
-bool llama_memory_seq_rm(llama_memory_t /*mem*/, llama_seq_id /*seq*/,
-                         llama_pos /*p0*/, llama_pos /*p1*/) {
+bool llama_memory_seq_rm(llama_memory_t /*mem*/, llama_seq_id seq,
+                         llama_pos p0, llama_pos p1) {
+  g_stub_config.seq_rm_called = true;
+  g_stub_config.seq_rm_seq = seq;
+  g_stub_config.seq_rm_p0 = p0;
+  g_stub_config.seq_rm_p1 = p1;
   return g_stub_config.rm_ok;
 }
 

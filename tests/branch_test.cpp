@@ -1377,3 +1377,72 @@ TEST_CASE("branch: decode_embd rejects a row width the model does not use") {
 
   prune(h, ts.store);
 }
+
+TEST_CASE("branch: decode_scatter allows an empty span beside a real one") {
+  resetStubConfig();
+  TestStore ts(8);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 512);
+  REQUIRE(h != INVALID_HANDLE);
+
+  // decode_scatter captures logits per item, so the stub needs some.
+  llamaStubConfig().vocab_size_value = 8;
+  llamaStubConfig().logits.assign(8, 0.0f);
+
+  std::vector<llama_token> toks = {1, 2, 3};
+  std::vector<llama_token> none;
+
+  // bin_pack skips empty spans, so they occupy no cells and cannot collide
+  // on start_pos — pairing one with a real span is not a duplicate.
+  DecodeScatterItem mixed[2] = {{h, std::span<const llama_token>(none)},
+                                {h, std::span<const llama_token>(toks)}};
+  CHECK_NOTHROW(ts.store.decode_scatter(std::span<const DecodeScatterItem>(mixed, 2)));
+
+  // Two spans that both decode DO collide, and still throw.
+  DecodeScatterItem both[2] = {{h, std::span<const llama_token>(toks)},
+                               {h, std::span<const llama_token>(toks)}};
+  CHECK_THROWS_AS(ts.store.decode_scatter(std::span<const DecodeScatterItem>(both, 2)),
+                  std::runtime_error);
+
+  prune(h, ts.store);
+}
+
+TEST_CASE("branch: a failed decode_embd rolls back what it committed") {
+  resetStubConfig();
+  TestStore ts(8);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 512);
+  REQUIRE(h != INVALID_HANDLE);
+
+  BranchState* st = ts.store.get(h);
+  REQUIRE(st != nullptr);
+  st->position = 40;                       // stand in for an earlier prefill
+  const uint32_t cells_before = ts.store.kv_pressure().cells_used;
+
+  llamaStubConfig().decode_result = -1;    // llama_decode fails
+
+  const int32_t n_rows = 16, n_pos = 4, nppe = 1, n_embd = 2;
+  std::vector<float> rows(static_cast<size_t>(n_rows) * n_embd, 0.5f);
+  std::vector<llama_pos> pos(static_cast<size_t>(n_rows) * nppe, 0);
+
+  CHECK_THROWS_AS(
+      ts.store.decode_embd(h, rows.data(), n_rows, n_embd, n_pos, pos.data(),
+                           nppe, false, false),
+      std::runtime_error);
+
+  // decode::embd chunks by n_batch, so earlier chunks can already be in the
+  // KV while the counters below never moved. The rollback strips them, so a
+  // caller that retries does not decode over rows already resident.
+  CHECK(llamaStubConfig().seq_rm_called == true);
+  CHECK(llamaStubConfig().seq_rm_seq == st->seq_id);
+  CHECK(llamaStubConfig().seq_rm_p0 == 40);   // from where this call started
+  CHECK(llamaStubConfig().seq_rm_p1 == -1);   // to the end
+
+  CHECK(st->position == 40);                  // bookkeeping untouched
+  CHECK(ts.store.kv_pressure().cells_used == cells_before);
+  CHECK(st->img_slack_own == 0u);
+
+  prune(h, ts.store);
+}

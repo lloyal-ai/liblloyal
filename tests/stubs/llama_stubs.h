@@ -240,6 +240,13 @@ struct LlamaStubConfig {
     llama_pos pos_max = -1;                    // Max position in KV cache (-1 = empty)
     bool rm_ok = true;                         // Whether llama_memory_seq_rm succeeds
 
+    // Sequence removal tracking — mirrors the seq_cp fields below, so a test
+    // can assert that a failed decode rolled back exactly what it wrote.
+    bool seq_rm_called = false;
+    llama_seq_id seq_rm_seq = -1;
+    llama_pos seq_rm_p0 = -1;
+    llama_pos seq_rm_p1 = -1;
+
     // Sequence copy tracking (System 2)
     bool seq_cp_called = false;
     llama_seq_id seq_cp_src = -1;

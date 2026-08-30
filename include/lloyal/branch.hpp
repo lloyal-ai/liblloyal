@@ -1042,12 +1042,17 @@ public:
       // dispatch, so two items for one branch could bin-pack into the same
       // chunk and collide on start_pos (overlapping KV positions). Callers
       // with multiple runs for one branch must issue sequential calls.
-      for (int32_t j = 0; j < i; ++j) {
-        if (items[j].handle == items[i].handle) {
-          throw std::runtime_error(
-              "BranchStore::decode_scatter - duplicate handle at indices " +
-              std::to_string(j) + " and " + std::to_string(i) +
-              " (sequential calls required for multiple runs per branch)");
+      // Empty spans are excluded: bin_pack skips them, so they occupy no
+      // cells and cannot collide with anything. Only two spans that both
+      // DECODE can overlap.
+      if (!items[i].tokens.empty()) {
+        for (int32_t j = 0; j < i; ++j) {
+          if (items[j].handle == items[i].handle && !items[j].tokens.empty()) {
+            throw std::runtime_error(
+                "BranchStore::decode_scatter - duplicate handle at indices " +
+                std::to_string(j) + " and " + std::to_string(i) +
+                " (sequential calls required for multiple runs per branch)");
+          }
         }
       }
     }
@@ -1178,7 +1183,14 @@ public:
     item.non_causal     = non_causal;
     item.output_logits  = want_logits;
 
+    // decode::embd chunks by n_batch, so a failure on a later chunk leaves
+    // EARLIER chunks already committed to the sequence while position,
+    // cells_used_ and slack below have not moved. A caller that caught this
+    // and retried would decode over rows already in the KV. Strip everything
+    // this call wrote so the branch is left exactly as it was found.
+    const llama_pos rollback_from = state->position;
     if (decode::embd(state->ctx, item, state->n_batch, scratch_) != 0) {
+      kv::remove_range(state->ctx, state->seq_id, rollback_from, -1);
       throw std::runtime_error("BranchStore::decode_embd - llama_decode failed");
     }
 
