@@ -634,12 +634,17 @@ struct SegmentSource {
     }
   }
 
-  // Causal mode is context-wide state, so a throw between here and the
-  // restore would leave every SUBSEQUENT text decode on this context
-  // non-causal. The guard makes the restore unconditional.
+  /// Restores causal attention on every exit path, including a throw.
+  ///
+  /// Causal mode is CONTEXT-WIDE, not per-batch: leaving it off would make
+  /// every subsequent TEXT decode on this context non-causal, so the damage
+  /// outlives this call. `scratch.resize()` can throw between the disable
+  /// below and the end of the loop, which is why restoring at the return
+  /// points is not enough.
   struct CausalGuard {
-    llama_context* ctx;
-    bool engaged;
+    llama_context* ctx = nullptr;
+    /// False for causal items — the guard is then inert
+    bool engaged = false;
     ~CausalGuard() { if (engaged) llama_set_causal_attn(ctx, true); }
   } causal_guard{ctx, item.non_causal};
 
