@@ -184,7 +184,8 @@ Downstream of the KV, everything is modality-agnostic: a cell does not remember 
 The embedding rail enforces what keeps that lineage valid:
 
 - embedding width must match the **resident model's** input width — `llama_batch` carries no width, so a wrong one reads past the caller's buffer;
-- segment geometry is validated **before** allocation or any source callback;
+- segment geometry is validated **before** the position buffer is sized and
+  before `positions()` runs — `at()` has necessarily already returned by then;
 - a non-causal block must fit one batch **and** micro-batch — splitting it would silently stop it being bidirectional;
 - causal attention is restored by RAII on every exit, including a throw;
 - empty segments are rejected, so terminal-logit selection stays unambiguous;
@@ -373,7 +374,7 @@ s.source_files = "liblloyal/include/**/*.{hpp,h}"
 
 ## Testing
 
-262 unit tests (stubbed — tenancy, topology, tree batching, RESTRICT/CASCADE, registries, embedding-rail accounting) and 167 integration tests against real llama.cpp, plus ASan / UBSan / LeakSan.
+Unit tests (stubbed — tenancy, topology, tree batching, RESTRICT/CASCADE, registries, embedding-rail accounting) and integration tests against real llama.cpp, plus ASan / UBSan / LeakSan. The runners report their own totals; this page deliberately does not restate them.
 
 ```bash
 # Unit — no model required

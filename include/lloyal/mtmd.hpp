@@ -65,10 +65,12 @@ namespace lloyal {
  * puts a spurious BOS around the image and desynchronizes the KV from what
  * the model was trained to see.
  *
- * **Lifetime.** Owns its bitmaps and chunk list. `sep` and the byte vectors
- * are borrowed — the caller must outlive this object. Satisfies
- * SegmentSource's in-order contract: an Embd segment's `rows` point into
- * mtmd's context-owned encode buffer, which the *next* `at()` overwrites.
+ * **Lifetime.** Owns its bitmaps and chunk list. The image bytes are decoded
+ * into those bitmaps during construction and never retained, so the caller may
+ * release them as soon as the constructor returns. `ctx` and `sep` ARE retained
+ * and must outlive this object. Satisfies SegmentSource's in-order contract:
+ * an Embd segment's `rows` point into mtmd's context-owned encode buffer,
+ * which the *next* `at()` overwrites.
  *
  * @code
  *   MtmdSource src(mtmd, prompt, imageBytes, sepTokens, n_embd_inp);
