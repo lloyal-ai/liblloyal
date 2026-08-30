@@ -1225,7 +1225,14 @@ public:
    *
    * Segments are requested and dispatched strictly in order — see
    * SegmentSource's in-order contract; a source may reuse its row buffer
-   * between `at()` calls.
+   * between `at()` calls. Every segment must be material: an empty one is
+   * rejected, because terminality is positional and a trailing empty segment
+   * would leave the real last one without logits.
+   *
+   * @warning NOT atomic. Once the first segment is dispatched the branch has
+   * been mutated, so a later throw — from the source or from a decode — leaves
+   * it partially advanced. The branch is poisoned at that point: prune it and
+   * rebuild rather than continuing from it.
    *
    * @param handle Branch to prefill (must be valid + leased)
    * @param source Yields the segments; owns production, not placement
@@ -1250,7 +1257,15 @@ public:
       const bool is_last = (i + 1 == n);
 
       if (seg.kind == decode::Segment::Kind::Text) {
-        if (seg.tokens.empty()) continue;
+        // Terminality comes from the index, so an empty trailing segment would
+        // make the real final one non-terminal: [EMBD, empty TEXT] would decode
+        // the image with want_logits=false, skip the tail, and hand back a
+        // branch with no logits to sample. Reject rather than silently skip.
+        if (seg.tokens.empty()) {
+          throw std::runtime_error(
+              "BranchStore::decode_segments - empty TEXT segment at " +
+              std::to_string(i) + "; a source must not yield empty segments");
+        }
         DecodeScatterItem item{handle, seg.tokens};
         decode_scatter(std::span<const DecodeScatterItem>(&item, 1));
         result.cells += static_cast<int64_t>(seg.tokens.size());

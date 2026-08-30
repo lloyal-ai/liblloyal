@@ -524,6 +524,23 @@ TEST_CASE("multimodal: MtmdSource rejects bad input") {
         "MtmdSource - media marker count (1) does not match image count (0)");
   }
 
+  // --- A bare marker: the shape most likely to yield an empty TEXT chunk,
+  // since there is no surrounding text. decode_segments REJECTS empty
+  // segments (terminality is positional), so mtmd must not produce one. ---
+  {
+    std::vector<std::vector<uint8_t>> images{image};
+    MtmdSource bare(mtmd, marker, images, std::span<const llama_token>(),
+                    n_embd_inp);
+    REQUIRE(bare.size() > 0);
+    for (size_t i = 0; i < bare.size(); ++i) {
+      auto seg = bare.at(i);
+      if (seg.kind == decode::Segment::Kind::Text) {
+        CHECK_MESSAGE(!seg.tokens.empty(),
+                      "mtmd must not emit an empty TEXT segment");
+      }
+    }
+  }
+
   // --- A leading sep run becomes segment 0, ahead of the chunk walk ---
   {
     const auto sep = chat_in::get_turn_separator(model.get());

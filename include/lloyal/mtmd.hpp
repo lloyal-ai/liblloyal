@@ -117,9 +117,9 @@ public:
           ")");
     }
 
-    // Bytes → bitmaps. The helper sniffs audio by magic bytes and routes it
-    // automatically, so audio arrives as an AUDIO chunk and is rejected in
-    // at(); video fails to decode with MTMD_VIDEO off. Both fail loud.
+    // Bytes → bitmaps. Video fails to decode with MTMD_VIDEO off; audio is
+    // sniffed by magic bytes and routed to an AUDIO chunk, rejected in the
+    // scan after tokenization below. Both fail loud.
     std::vector<const mtmd_bitmap*> ptrs;
     ptrs.reserve(images.size());
     for (const auto& bytes : images) {
@@ -155,6 +155,20 @@ public:
     mrope_    = mtmd_decode_use_mrope(ctx_);
     n_chunks_ = mtmd_input_chunks_size(chunks_.get());
     lead_     = sep_.empty() ? 0 : 1;
+
+    // Reject audio HERE, not in at(). The helper sniffs audio by magic bytes
+    // and routes it automatically, so it arrives as an AUDIO chunk; deferring
+    // the error means decode_segments may already have committed preceding
+    // text or image chunks, handing the caller a failure with a partially
+    // advanced branch.
+    for (size_t k = 0; k < n_chunks_; ++k) {
+      const mtmd_input_chunk* ch = mtmd_input_chunks_get(chunks_.get(), k);
+      const auto kind = mtmd_input_chunk_get_type(ch);
+      if (kind != MTMD_INPUT_CHUNK_TYPE_TEXT &&
+          kind != MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+        throw std::runtime_error("MtmdSource - audio input is not supported");
+      }
+    }
   }
 
   size_t size() override { return lead_ + n_chunks_; }

@@ -1345,3 +1345,35 @@ TEST_CASE("branch: decode_embd without want_logits clears stale logits") {
 
   prune(h, ts.store);
 }
+
+TEST_CASE("branch: decode_embd rejects a row width the model does not use") {
+  resetStubConfig();
+  // llama_batch carries no row-width metadata: llama_decode consumes rows at
+  // the MODEL's input width while decode::embd strides by the caller's. A
+  // wrong-but-positive width reads past the caller's allocation.
+  llamaStubConfig().n_embd_inp = 512;
+
+  TestStore ts(8);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 512);
+  REQUIRE(h != INVALID_HANDLE);
+
+  const int32_t n_rows = 4, n_pos = 4, nppe = 1;
+  std::vector<llama_pos> pos(static_cast<size_t>(n_rows) * nppe, 0);
+
+  // Positive but wrong — accepted before, out of bounds at decode time.
+  std::vector<float> narrow(static_cast<size_t>(n_rows) * 64, 0.5f);
+  CHECK_THROWS_AS(
+      ts.store.decode_embd(h, narrow.data(), n_rows, /*n_embd_inp*/ 64, n_pos,
+                           pos.data(), nppe, false, false),
+      std::runtime_error);
+
+  // Matching the resident width is accepted.
+  std::vector<float> wide(static_cast<size_t>(n_rows) * 512, 0.5f);
+  CHECK_NOTHROW(
+      ts.store.decode_embd(h, wide.data(), n_rows, /*n_embd_inp*/ 512, n_pos,
+                           pos.data(), nppe, false, false));
+
+  prune(h, ts.store);
+}

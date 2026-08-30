@@ -613,6 +613,21 @@ struct SegmentSource {
   if (n_batch <= 0) {
     throw std::runtime_error("decode::embd - n_batch must be positive");
   }
+  // The row width must match the RESIDENT model, not merely be positive.
+  // llama_batch carries no width metadata: llama_decode consumes rows at the
+  // model's own input width while the chunk loop below strides by this one.
+  // A wrong-but-positive width therefore starts later chunks mid-row and reads
+  // past the caller's allocation — corrupt vision state, or an out-of-bounds
+  // native read, with nothing to signal it.
+  if (const llama_model* m = llama_get_model(ctx)) {
+    const int32_t expected = llama_model_n_embd_inp(m);
+    if (expected > 0 && item.n_embd_inp != expected) {
+      throw std::runtime_error(
+          "decode::embd - n_embd_inp " + std::to_string(item.n_embd_inp) +
+          " does not match the model's input width " +
+          std::to_string(expected));
+    }
+  }
 
   const int32_t n    = item.n_rows;
   const int32_t nppe = item.n_pos_per_embd;

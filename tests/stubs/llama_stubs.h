@@ -210,6 +210,7 @@ extern "C" {
 
     // Model introspection (for vendored common_sampler)
     const llama_model* llama_get_model(const llama_context* ctx);
+    int32_t llama_model_n_embd_inp(const llama_model* model);
 
     // Embedding operations
     int32_t llama_model_n_embd(const llama_model* model);
@@ -276,6 +277,11 @@ struct LlamaStubConfig {
     // reject rather than silently split across dispatches.
     uint32_t n_batch = 512;
     uint32_t n_ubatch = 512;
+
+    // Row width the resident model expects, as reported by
+    // llama_model_n_embd_inp. 0 means "no opinion" — decode::embd then skips
+    // the width check, which is what most stub tests want.
+    int32_t n_embd_inp = 0;
 
     // Sequence ID tracking (for multi-sequence tests)
     llama_seq_id last_batch_seq_id = -1;       // Last seq_id seen in batch (first token)

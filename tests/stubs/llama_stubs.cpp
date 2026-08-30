@@ -368,6 +368,10 @@ uint32_t llama_n_ubatch(const llama_context * /*ctx*/) {
   return g_stub_config.n_ubatch;
 }
 
+int32_t llama_model_n_embd_inp(const llama_model * /*model*/) {
+  return g_stub_config.n_embd_inp;
+}
+
 float *llama_get_logits_ith(llama_context * /*ctx*/, int32_t /*i*/) {
   if (g_stub_config.logits.empty()) {
     return nullptr;
