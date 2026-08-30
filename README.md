@@ -9,17 +9,11 @@
 
 Composable C++ primitives for forkable decode state and shared-prefix (KV) branching. Fork a generation into a tree — branches share a prefix while keeping independent machinery (sampler chain, seed, grammar, logits snapshot, perplexity tracker) for controlled divergence at decode time.
 
-```mermaid
-flowchart LR
-    P["Shared prefix<br/>(text or image)"] --> A["Branch A"]
-    P --> B["Branch B"]
-    P --> C["Branch C"]
-    A & B & C --> D["One llama_decode()<br/>per tick"]
-```
-
 ## Continuous Tree Batching
 
-Tree search with N branches normally means N calls to `llama_decode()`, each paying dispatch overhead, memory barriers and PCIe round-trips. `BranchStore` packs tokens from N branches — each at a **different position**, on a **different seq_id**, each needing **independent logits** — into one `llama_batch`.
+Tree search with N branches normally means N calls to `llama_decode()`, each paying dispatch and synchronization overhead. `BranchStore` packs tokens from N branches — each at a **different position**, on a **different seq_id**, each needing **independent logits** — into one `llama_batch`.
+
+When one row per active branch fits the configured batch, `decode_each()` advances them all in a single `llama_decode()`. It submits one batch and does not chunk — sizing the active set against `n_batch` is the caller's.
 
 ```mermaid
 flowchart LR
@@ -43,13 +37,6 @@ store.decode_each({{child1.handle(), tok1},
 ### Two packing strategies
 
 `decode_each` is one token per branch. `decode_scatter` takes **variable-length** runs and greedy bin-packs them to fill `n_batch`:
-
-```mermaid
-flowchart TD
-    I["A: 200 tok · B: 12 tok · C: 800 tok"] --> BP["bin_pack (n_batch = 512)"]
-    BP --> D1["dispatch 1<br/>A 200 + B 12"]
-    BP --> D2["dispatch 2 · 3<br/>C chunked"]
-```
 
 ```cpp
 store.decode_scatter({
@@ -78,33 +65,27 @@ Two tables and three registries, all instance-scoped — no global state.
 
 ```mermaid
 flowchart TD
-    H["BranchHandle<br/>generation (16 bits) + slot index (16 bits)"] --> S["Slot table — 65,535<br/>cheap CPU state"]
-    S --> L["KV lease — n_seq_max (≤ 256)<br/>scarce residency"]
-    S --> R1["sampler chain"]
-    S --> R2["grammar"]
-    S --> R3["metrics"]
+    A["create() / fork()"] --> AL["allocate()"]
+    AL --> L["KV lease<br/>n_seq_max (≤ 256) — the real bound"]
+    AL --> S["slot<br/>65,535 namespace, generation-checked"]
+    L & S --> B["one live branch<br/>KV-resident"]
+    B --> R["sampler chain · grammar · metrics"]
+    B --> P["prune() releases both"]
 ```
 
-Slots are how many branches can **exist**; leases are how many can **decode**. The generation counter in the upper 16 bits makes a stale handle detectable after slot reuse, so a freed branch's handle fails loudly instead of aliasing a new one.
+`BranchStore` keeps a large generation-checked slot namespace and a smaller KV lease pool. `create()` and `fork()` acquire **one of each, atomically** — the lease first, rolled back if the slot allocation fails — so every live branch is KV-resident and the number of simultaneous branches is bounded by `n_seq_max`, not by the slot table. The larger namespace is what makes reuse cheap, while the generation counter in the upper 16 bits stops a freed branch's handle from aliasing a newly allocated one.
 
 ### Lifecycle
-
-```mermaid
-flowchart LR
-    C["create()"] --> L["Live<br/>prefill · step"]
-    L --> F["fork()<br/>children share the prefix"]
-    F --> D["decode_each<br/>independent divergence"]
-    D --> P["prune() losers<br/>RESTRICT"]
-    P --> R["retainOnly(winner)<br/>one seq_keep"]
-    R --> L
-```
 
 Search is **surgical** (N × `prune()`); promotion is **nuclear** (1 × `retainOnly()`, a single `seq_keep` pass that vaporizes every loser).
 
 **`fork()` clones:** KV sequence, sampler chain (penalties, PRNG, filters), grammar state, metrics, logits snapshot, logit bias, cached sampler params.
 **`fork()` does not clone:** the steer callback — it captures references, so copying it is unsafe. Call `set_steer()` on the child if needed.
 
-> Logits are cloned by **default** (`clone_logits = true`), not left empty — a child can sample immediately. Pass `false` to skip the copy (~`n_vocab × 4` bytes; ~600 KB at 150k vocab) when the child will prefill before sampling.
+> Logits are cloned by **default** (`clone_logits = true`), not left empty — a child can sample immediately. To skip that copy (~`n_vocab × 4` bytes; ~600 KB at 150k vocab) when the child will prefill before sampling, use the free function, which takes options; the RAII `Branch::fork()` takes none:
+> ```cpp
+> auto child = branch::fork(parent, store, ForkOpts{.clone_logits = false});
+> ```
 
 ## The Embedding Rail (Multimodal)
 
@@ -120,8 +101,10 @@ Three responsibilities, deliberately separated:
 
 ```mermaid
 flowchart TD
-    A["Prompt + media"] --> S["SegmentSource"]
-    M["MtmdSource<br/>(optional adapter)"] --> S
+    A["Prompt + media"] --> M["MtmdSource"]
+    C["Platform encoder<br/>or cached rows"] --> X["Custom source"]
+    M -. implements .-> S["SegmentSource contract"]
+    X -. implements .-> S
     S --> B["BranchStore::decode_segments"]
     B --> T["token rail<br/>decode_scatter"]
     B --> E["embedding rail<br/>decode_embd"]
@@ -143,13 +126,6 @@ auto result = store.decode_segments(branch.handle(), source);
 Consumers that neither include the header nor link `mtmd` carry no multimodal dependency.
 
 ### One ordered prefill, two rails
-
-```mermaid
-flowchart LR
-    T1["text tokens"] --> I["image embeddings"]
-    I --> T2["text tokens"]
-    T2 --> L["terminal logits"]
-```
 
 `decode_segments()` walks the sequence strictly in order, sending TEXT through `decode_scatter` and EMBD through `decode_embd`. Both advance the same branch. Placement stays in the store: the source describes how a segment is positioned *relative to a base*, and the store supplies the absolute base — so branch position never crosses into a binding or a codec.
 
@@ -202,18 +178,7 @@ Handles free automatically on `prune()`.
 
 ## KV Tenancy
 
-```mermaid
-flowchart LR
-    subgraph abundant["Slots — 65,535"]
-        S1["exist"]
-    end
-    subgraph scarce["Leases — ≤ 256"]
-        L1["decode"]
-    end
-    S1 -->|"create() / fork()"| L1
-    L1 -->|"prune()"| S1
-    L1 -->|"retainOnly()"| L1
-```
+`kv::tenancy` owns the lease pool. A lease is acquired on `create()` / `fork()` and released on `prune()`; `retainOnly()` keeps the winner's and rebuilds vacancy in one pass. Because a lease is taken with the slot, `available()` is the real budget for how wide or deep a search can go.
 
 ```cpp
 store.available();        // leases left — your width/depth budget
@@ -224,13 +189,6 @@ store.drain();             // explicit teardown before llama_free(ctx)
 Consumers never see raw seq_ids.
 
 ## Topology
-
-```mermaid
-flowchart TD
-    R["root"] --> A["child A"]
-    R --> B["child B"]
-    B --> B1["grandchild"]
-```
 
 ```cpp
 store.parent(handle);    store.children(handle);
@@ -360,7 +318,7 @@ for (int turn = 0; turn < max_turns; turn++) {
 ## Integration
 
 ```bash
-git submodule add -b v0.1.0 https://github.com/lloyal-ai/liblloyal.git
+git submodule add https://github.com/lloyal-ai/liblloyal.git
 ```
 
 ```cmake
