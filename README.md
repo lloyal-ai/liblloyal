@@ -11,14 +11,14 @@ A KV cache already holds everything the model has read. Git-like branching is wh
 
 So the operations are the ones you already know:
 
-| liblloyal | Git command |
+| Git command | liblloyal composition |
 |---|---|
-| `fork()` | `git branch` — from the current position |
-| `prune()` / `pruneSubtree()` | `git branch -d` / `-D`, descendants included |
-| `retainOnly(winner)` | `git merge --ff-only` — the winner's KV *becomes* the trunk, in one pass |
-| `decode_scatter()` onto the parent | `git merge --squash` — **hard**: the child's KV is dropped, its output re-decoded onto the parent |
-| `create()` + `decode_scatter()` — replay from content | `git rebase` — re-decodes onto a new base rather than moving cells, which is the only form that survives recurrent state |
-| `merge_logits(dst, experts, α)` | *no equivalent* — **soft**: distributions blend, both KVs stay live |
+| `git branch` | `fork()` — from the current position |
+| `git branch -d` / `-D` | `prune()` / `pruneSubtree()`, descendants included |
+| `git merge --ff-only` | `retainOnly(winner)` — the winner's KV *becomes* the trunk, in one pass |
+| `git merge --squash` | `decode_scatter()` onto the parent — **hard**: the child's KV is dropped, its output re-decoded |
+| `git rebase` | `create()` + `decode_scatter()` — **replay from content**; re-decodes onto a new base rather than moving cells, the only form that survives recurrent state |
+| *no equivalent* | `merge_logits(dst, experts, α)` — **soft**: distributions blend, both KVs stay live |
 
 **Hard costs the tokens twice** — the output is re-decoded, not moved — and what returns is an ordinary prefix every later fork inherits.
 

@@ -1157,6 +1157,34 @@ public:
    * @param want_logits     Capture the final row's logits (rows-terminal)
    * @throws std::runtime_error if the handle is invalid or decode fails
    *
+   * ## Handling a failed prefill
+   *
+   * This is NOT atomic. Rows chunk by n_batch — an image larger than the
+   * batch is the normal case, not an edge — so a failure on a later chunk
+   * leaves earlier ones committed while the counters here never move.
+   *
+   * There is no rollback to reach for. Rewinding the committed rows means a
+   * partial-range seq_rm, which cannot restore a recurrent carrier (see
+   * kv::remove_range's warning). Attempting it rolls attention back, leaves
+   * the carrier folded, and looks like it worked — worse than not trying.
+   *
+   * In order of preference:
+   *
+   * 1. PREVENT. Exhausting the KV is the likeliest cause and the only one
+   *    knowable in advance. A source can report its cost before anything
+   *    decodes — see MtmdSource::cells() — so admit or refuse the prefill
+   *    against your own budget instead of discovering it midway.
+   * 2. CONTAIN. If it throws anyway the branch is poisoned: prune it. Its OWN
+   *    accounting is still consistent for that prune, because neither
+   *    position nor cells_used_ advanced — release() subtracts exactly what
+   *    the branch legitimately owned, and whole-sequence eviction reclaims
+   *    the orphaned rows. Siblings are untouched.
+   * 3. RECOVER. Replay the content onto a fresh branch. A branch stores its
+   *    position and never what was decoded into it, so the content comes from
+   *    you — the same reason replay is the portable correction at all: it
+   *    re-runs the folds rather than trying to undo them.
+   *
+   * @see kv::remove_range() for why rewinding is not an option
    * @see decode::embd() for the underlying primitive
    * @see decode_scatter() for the token rail
    */
