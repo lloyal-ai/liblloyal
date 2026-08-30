@@ -11,16 +11,30 @@ A KV cache already holds everything the model has read. Git-style branching is w
 
 So the operations are the ones you already know:
 
-| liblloyal | the Git move it mirrors |
+| liblloyal | Git command |
 |---|---|
-| `fork()` | branch from the current commit |
-| `decode_each()` | advance every branch one step |
-| `prune()` / `pruneSubtree()` | delete a branch, or a branch and its descendants |
-| `retainOnly()` | keep the winner, discard the rest |
+| `fork()` | `git branch` — from the current commit |
+| `prune()` / `pruneSubtree()` | `git branch -d` / `-D`, descendants included |
+| `retainOnly(winner)` | `git merge --ff-only` — the winner becomes the trunk, the rest vaporize in one pass |
+| **hard merge** — fan-in | `git merge --squash` — a branch's *result* is written back onto the trunk as tokens |
+| **soft merge** — `merge_logits` | *no equivalent* — both lineages stay live; only the next-token distribution blends |
+| `decode_each()` | *no equivalent* — Git never advances every branch at once |
 
-Two things make this more than an analogy.
+The two rows Git can't express are the interesting ones.
 
-**The tree is batched, not walked.** Every live branch advances in a single dispatch — N branches at N different positions on N sequences, packed into one `llama_batch`. Depth costs you time; width mostly doesn't.
+A **hard merge** collapses a lineage into its parent: the agents runtime runs the whole turn on forks, then writes the chosen result back onto the shared line as an assistant turn — `ctx.extendSpine(userContent, agent.result)` — and the next generation forks from there. The divergence is gone; what survives is its outcome, now an ordinary prefix.
+
+A **soft merge** never touches the KV. `merge_logits(dst, experts, α)` accumulates in log-probability space —
+
+```text
+dst.logits[t] += α · Σᵢ experts[i].logits[t]
+```
+
+— so several KV histories of the same model shape one branch's next token while each keeps its own state. That is contrastive decoding (DExperts-style) expressed as a tree operation: `α > 0` pulls `dst` toward the experts, `α < 0` pushes it away. No dispatch, no KV write, and it works the same on recurrent backends.
+
+Two properties make a tree cheap enough to work this way.
+
+**It is batched, not walked.** Every live branch advances in a single dispatch — N branches at N different positions on N sequences, packed into one `llama_batch`. Depth costs you time; width mostly doesn't.
 
 **A prefix is not only text.** An image encoded once becomes a prefix like any other, so N branches can interrogate the same picture with no re-encode. After the KV, nothing downstream knows or cares which rail a cell arrived on.
 
