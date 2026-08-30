@@ -5,9 +5,28 @@
 [![C++](https://img.shields.io/badge/C++-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
 [![llama.cpp](https://img.shields.io/badge/llama.cpp-b9581-green.svg)](https://github.com/ggml-org/llama.cpp/releases/tag/b9581)
 
-**Covalent Inference for llama.cpp**
+**The Vertical Inference runtime — turning prefix sharing into Git-style trees for inference.**
 
-Composable C++ primitives for forkable decode state and shared-prefix (KV) branching. Fork a generation into a tree — branches share a prefix while keeping independent machinery (sampler chain, seed, grammar, logits snapshot, perplexity tracker) for controlled divergence at decode time.
+A KV cache already holds everything the model has read. Git-style branching is what turns that into structure you can work with: fork a generation at any point, and the child inherits every token before it while diverging under its own sampler, seed, grammar and constraints. The shared prefix is never recomputed — only the divergence costs anything.
+
+So the operations are the ones you already know:
+
+| liblloyal | the Git move it mirrors |
+|---|---|
+| `fork()` | branch from the current commit |
+| `decode_each()` | advance every branch one step |
+| `prune()` / `pruneSubtree()` | delete a branch, or a branch and its descendants |
+| `retainOnly()` | keep the winner, discard the rest |
+
+Two things make this more than an analogy.
+
+**The tree is batched, not walked.** Every live branch advances in a single dispatch — N branches at N different positions on N sequences, packed into one `llama_batch`. Depth costs you time; width mostly doesn't.
+
+**A prefix is not only text.** An image encoded once becomes a prefix like any other, so N branches can interrogate the same picture with no re-encode. After the KV, nothing downstream knows or cares which rail a cell arrived on.
+
+That combination is what the library is for: search, best-of-N, speculative decoding and multimodal agents stop being N separate generations and become one tree you fork, score and prune.
+
+→ [Continuous tree batching](#continuous-tree-batching) for how N branches become one GPU call · [the embedding rail](#the-embedding-rail-multimodal) for how images join the same lineage.
 
 ## Continuous Tree Batching
 
