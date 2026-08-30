@@ -1171,9 +1171,9 @@ public:
    * In order of preference:
    *
    * 1. PREVENT. Exhausting the KV is the likeliest cause and the only one
-   *    knowable in advance. A source can report its cost before anything
-   *    decodes — see MtmdSource::cells() — so admit or refuse the prefill
-   *    against your own budget instead of discovering it midway.
+   *    knowable in advance. A source reports its cost before anything
+   *    decodes — see decode::SegmentSource::cells() — so admit or refuse the
+   *    prefill against your own budget instead of discovering it midway.
    * 2. CONTAIN. If it throws anyway the branch is poisoned: prune it. Its OWN
    *    accounting is still consistent for that prune, because neither
    *    position nor cells_used_ advanced — release() subtracts exactly what
@@ -1224,7 +1224,7 @@ public:
     // nor cells_used_ moved, so release() subtracts what the branch legitimately
     // owned and whole-sequence eviction reclaims the orphaned rows.
     //
-    // Admission is the better place to spend effort: MtmdSource::cells()
+    // Admission is the better place to spend effort: SegmentSource::cells()
     // reports this prefill's cost before anything decodes, so a caller can
     // refuse rather than half-commit.
     if (decode::embd(state->ctx, item, state->n_batch, scratch_) != 0) {

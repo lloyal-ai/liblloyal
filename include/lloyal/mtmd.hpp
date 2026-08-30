@@ -176,22 +176,14 @@ public:
   size_t size() override { return lead_ + n_chunks_; }
 
   /**
-   * @brief KV cells this prefill will consume, known BEFORE anything decodes
+   * @brief KV cells this prefill will consume — see decode::SegmentSource::cells
    *
-   * Counted during construction, after `mtmd_tokenize` and before any clip
-   * encode — image row counts are fixed at tokenize time, which is what the
-   * placeholder-bitmap counting flow in `mtmd.h` relies on.
-   *
-   * Exists so a caller can decide ADMISSION before touching a branch. Text
-   * suffixes can already be measured by tokenizing them; an image cannot,
-   * because the caller holds bytes and the row count depends on the
-   * projector's geometry. Without this, media is the one input that bypasses
-   * a context-pressure gate.
-   *
-   * Cells, not positions: a KV budget is spent in cells, and under M-RoPE an
-   * image costs far more cells than it advances position.
+   * Knowable here, and never an estimate: counted during construction, after
+   * `mtmd_tokenize` and before any clip encode. Image row counts are fixed at
+   * tokenize time, which is what the placeholder-bitmap counting flow in
+   * `mtmd.h` relies on.
    */
-  size_t cells() const { return cells_; }
+  size_t cells() const override { return cells_; }
 
   decode::Segment at(size_t i) override {
     decode::Segment seg;

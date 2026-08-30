@@ -604,3 +604,98 @@ TEST_CASE("multimodal: MtmdSource rejects bad input") {
     CHECK(seg.tokens.size() == sep.size());
   }
 }
+
+// ============================================================================
+// cells() is a SegmentSource contract, not an MtmdSource extra. An admission
+// gate holds the base reference — it knows it has segments to place, not that
+// a vision projector produced them — so the quote has to be reachable and
+// exact through that view.
+// ============================================================================
+
+TEST_CASE("multimodal: SegmentSource prices a prefill before it decodes") {
+  REQUIRE_VL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+  mtmd_context* mtmd = acquire_mtmd(model.get());
+  REQUIRE_MESSAGE(mtmd, "mmproj failed to load — is it matched to the model?");
+
+  auto image = read_fixture("cat.jpg");
+  REQUIRE_MESSAGE(!image.empty(), "fixtures/cat.jpg missing");
+
+  const int32_t n_embd_inp = llama_model_n_embd_inp(model.get());
+  const std::string prompt = image_prompt(model.get(), "Describe this image.");
+  const auto sep = chat_in::get_turn_separator(model.get());
+  REQUIRE(!sep.empty());
+
+  // --- The quote is the contract's arithmetic: the sum over the segments the
+  // source will yield, sep run included. Walked on its OWN instance, because
+  // SegmentSource forbids revisiting — a source that has been walked can no
+  // longer be handed to decode_segments. ---
+  {
+    std::vector<std::vector<uint8_t>> images{image};
+    MtmdSource walked(mtmd, prompt, images,
+                      std::span<const llama_token>(sep), n_embd_inp);
+    decode::SegmentSource& src = walked;
+
+    const size_t quoted = src.cells();
+    size_t summed = 0;
+    for (size_t i = 0; i < src.size(); ++i) {
+      const auto seg = src.at(i);
+      summed += seg.kind == decode::Segment::Kind::Text
+                    ? seg.tokens.size()
+                    : static_cast<size_t>(seg.n_rows);
+    }
+    CHECK_MESSAGE(quoted == summed,
+                  "cells() must equal the sum of the segments at() yields");
+    CHECK_MESSAGE(quoted > sep.size(),
+                  "the quote covers the image rows, not just the sep run");
+  }
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx     = 4096;
+  cparams.n_batch   = 512;
+  cparams.n_seq_max = 4;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+  TestParams params;
+
+  BranchHandle h = create(ctx, model.get(), store, 0, params, 512);
+  REQUIRE(h != INVALID_HANDLE);
+  const uint32_t cells_before = store.kv_pressure().cells_used;
+
+  std::vector<std::vector<uint8_t>> images{image};
+  MtmdSource source(mtmd, prompt, images,
+                    std::span<const llama_token>(sep), n_embd_inp);
+  decode::SegmentSource& gate = source;
+
+  // --- Refusing costs nothing. A caller with less headroom than the quote
+  // declines HERE, and the branch is still exactly as it was found: the
+  // expensive part (bitmap decode + mtmd_tokenize) happened in the source's
+  // constructor, which touches no KV. That is the property the quote buys —
+  // decode_segments is not atomic, so discovering the overflow midway would
+  // poison the branch instead of merely refusing it. ---
+  const size_t quote = gate.cells();
+  CHECK(quote > 0);
+
+  BranchState* st = store.get(h);
+  REQUIRE(st);
+  CHECK_MESSAGE(st->position == 0, "quoting must not touch the branch");
+  CHECK_MESSAGE(store.kv_pressure().cells_used == cells_before,
+                "quoting must not spend cells");
+
+  // --- Admitted, the charge equals the quote exactly. An admission gate built
+  // on an approximation would mis-commit the context on every image. ---
+  const auto r = store.decode_segments(h, source);
+  CHECK_MESSAGE(static_cast<int64_t>(quote) == r.cells,
+                "charge must equal the quote taken through SegmentSource");
+  CHECK(store.kv_pressure().cells_used == cells_before + r.cells);
+
+  prune(h, store);
+  store.drain();
+  llama_free(ctx);
+}

@@ -559,6 +559,31 @@ struct SegmentSource {
   /// Number of segments in this prefill.
   virtual size_t size() = 0;
 
+  /**
+   * KV cells this whole sequence will consume, known BEFORE anything decodes.
+   *
+   * Exists so a caller can decide ADMISSION before touching a branch.
+   * `decode_segments` is not atomic: once the first segment dispatches the
+   * branch is mutated, so discovering mid-walk that the sequence does not fit
+   * costs the branch. Refusing up front costs nothing.
+   *
+   * Text can already be measured by tokenizing it, but a source that encodes —
+   * a vision projector, an audio tower — knows a row count its caller cannot
+   * derive from the bytes it holds. Without this, such input is the one thing
+   * that bypasses a context-pressure gate.
+   *
+   * Cells, not positions: a KV budget is spent in cells, and under M-RoPE a
+   * segment costs far more cells than it advances position. The unit matches
+   * `DecodeSegmentsResult::cells`, so a caller can compare what it was quoted
+   * against what it was charged.
+   *
+   * Must equal the sum over `at(0 .. size()-1)` of `tokens.size()` for TEXT
+   * and `n_rows` for EMBD. A source that cannot know the count before
+   * encoding must not estimate: this is a budget promise, and an under-quote
+   * is spent out of someone else's budget.
+   */
+  virtual size_t cells() const = 0;
+
   /// Segment `i`. Invalidates any previously returned segment.
   virtual Segment at(size_t i) = 0;
 

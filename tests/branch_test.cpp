@@ -1421,6 +1421,17 @@ struct TestSource : lloyal::decode::SegmentSource {
   bool positions_called = false;
 
   size_t size() override { return segs.size(); }
+  /// The contract's sum: tokens for TEXT, rows for EMBD. Kept honest so a
+  /// geometry the store rejects is still priced the way a real source would.
+  size_t cells() const override {
+    size_t n = 0;
+    for (const auto& s : segs) {
+      n += s.kind == lloyal::decode::Segment::Kind::Text
+               ? s.tokens.size()
+               : static_cast<size_t>(s.n_rows);
+    }
+    return n;
+  }
   lloyal::decode::Segment at(size_t i) override { return segs[i]; }
   void positions(size_t, llama_pos, llama_pos* out) override {
     positions_called = true;
