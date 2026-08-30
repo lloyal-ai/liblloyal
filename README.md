@@ -20,9 +20,17 @@ So the operations are the ones you already know:
 | `fork()` + `decode_scatter()` | `git rebase` — the same tokens, replayed onto a different base |
 | `merge_logits(dst, experts, α)` | *no equivalent* — **soft**: distributions blend, both KVs stay live |
 
-**Hard vs soft is a real distinction.** A hard merge discards a branch's KV and re-decodes its output onto the parent: you pay for those tokens twice, and what you get back is an ordinary shared prefix every later fork inherits. A soft merge writes nothing at all — `merge_logits` adds `α · Σ experts` to `dst`'s cached logits, so several KV histories steer one branch's next token while each keeps its own state. That is contrastive decoding, DExperts-style, with `α < 0` for anti-experts. No dispatch, no KV write, and identical on recurrent backends.
+**Hard** throws the child's KV away and re-decodes its output onto the parent. You pay the tokens twice and get a shared prefix every later fork inherits.
 
-**Rebase composes from what is already here** — `fork()` the new base, `decode_scatter()` the same tokens onto it. A branch stores its *position*, never its content, so the caller supplies the tokens. That is deliberate rather than missing: content survives a context restart and a position does not.
+**Soft** writes nothing:
+
+```text
+dst.logits[t] += α · Σᵢ experts[i].logits[t]
+```
+
+Several KV histories steer one branch's next token, each keeping its own state — contrastive decoding, DExperts-style, `α < 0` for anti-experts. No dispatch, no KV write, identical on recurrent backends.
+
+**Rebase** already composes: `fork()` the new base, `decode_scatter()` the same tokens. A branch stores its position, never its content, so the caller supplies them — content survives a context restart, a position doesn't.
 
 Two properties make a tree cheap enough to work this way.
 
