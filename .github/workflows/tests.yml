@@ -47,10 +47,18 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y cmake build-essential nlohmann-json3-dev
+        sudo apt-get install -y cmake build-essential clang nlohmann-json3-dev
 
+    # Clang, deliberately. tests/CMakeLists.txt adds -fsanitize=integer and
+    # -fsanitize=float-divide-by-zero only for Clang, because `integer` is a
+    # Clang group alias GCC rejects. Under the default GCC this job ran
+    # address+undefined only, so the unsigned-overflow and implicit-truncation
+    # checks the run step advertises were never actually enabled.
     - name: Configure CMake with sanitizers
       working-directory: tests
+      env:
+        CC: clang
+        CXX: clang++
       run: |
         cmake -S . -B build_san \
           -DCMAKE_BUILD_TYPE=Debug \
@@ -212,6 +220,7 @@ jobs:
           -DLLOYAL_BUILD_INTEGRATION_TESTS=ON \
           -DLLAMA_CPP_DIR=${{ github.workspace }}/llama.cpp \
           -DNLOHMANN_JSON_DIR=/usr/include \
+          -DLLOYAL_ENABLE_UBSAN_INTEGRATION=ON \
           -DCMAKE_BUILD_TYPE=Release
 
     - name: Build integration tests

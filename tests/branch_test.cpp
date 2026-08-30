@@ -1446,3 +1446,126 @@ TEST_CASE("branch: a failed decode_embd rolls back what it committed") {
 
   prune(h, ts.store);
 }
+
+// ============================================================================
+// SegmentSource contract — it is a PUBLIC extension point, so whatever it
+// returns is untrusted input the kernel must validate before acting on.
+// ============================================================================
+
+namespace {
+
+/// A source under test control, recording whether positions() was reached.
+struct TestSource : lloyal::decode::SegmentSource {
+  std::vector<lloyal::decode::Segment> segs;
+  bool positions_called = false;
+
+  size_t size() override { return segs.size(); }
+  lloyal::decode::Segment at(size_t i) override { return segs[i]; }
+  void positions(size_t, llama_pos, llama_pos* out) override {
+    positions_called = true;
+    if (out) *out = 0;  // a real source would fill n_rows * n_pos_per_embd
+  }
+};
+
+lloyal::decode::Segment embd_seg(const float* rows, int32_t n_rows,
+                                 int32_t n_embd_inp, llama_pos n_pos,
+                                 int32_t nppe) {
+  lloyal::decode::Segment s;
+  s.kind = lloyal::decode::Segment::Kind::Embd;
+  s.rows = rows; s.n_rows = n_rows; s.n_embd_inp = n_embd_inp;
+  s.n_pos = n_pos; s.n_pos_per_embd = nppe;
+  return s;
+}
+
+}  // namespace
+
+TEST_CASE("branch: decode_segments validates geometry BEFORE the callback") {
+  resetStubConfig();
+  TestStore ts(8);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 512);
+  REQUIRE(h != INVALID_HANDLE);
+
+  std::vector<float> rows(64, 0.5f);
+
+  // n_pos_per_embd = -1 would wrap the size_t multiply into an enormous
+  // allocation; 0 would hand positions() a zero-length buffer to write into.
+  for (int32_t bad_nppe : {-1, 0, 2, 3, 5}) {
+    TestSource src;
+    src.segs = {embd_seg(rows.data(), 8, 2, 4, bad_nppe)};
+    CHECK_THROWS_AS(ts.store.decode_segments(h, src), std::runtime_error);
+    CHECK_MESSAGE(src.positions_called == false,
+                  "validation must precede the source callback");
+  }
+
+  { // non-positive row width
+    TestSource src;
+    src.segs = {embd_seg(rows.data(), 8, 0, 4, 1)};
+    CHECK_THROWS_AS(ts.store.decode_segments(h, src), std::runtime_error);
+    CHECK(src.positions_called == false);
+  }
+
+  { // n_pos outside (0, n_rows]
+    TestSource src;
+    src.segs = {embd_seg(rows.data(), 8, 2, 0, 1)};
+    CHECK_THROWS_AS(ts.store.decode_segments(h, src), std::runtime_error);
+    TestSource src2;
+    src2.segs = {embd_seg(rows.data(), 8, 2, 9, 1)};
+    CHECK_THROWS_AS(ts.store.decode_segments(h, src2), std::runtime_error);
+    CHECK(src2.positions_called == false);
+  }
+
+  // Nothing was dispatched, so the branch is untouched.
+  BranchState* st = ts.store.get(h);
+  REQUIRE(st != nullptr);
+  CHECK(st->position == 0);
+  CHECK(ts.store.kv_pressure().cells_used == 0);
+
+  prune(h, ts.store);
+}
+
+TEST_CASE("branch: decode_segments rejects an empty segment") {
+  resetStubConfig();
+  TestStore ts(8);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 512);
+
+  // Terminality is positional: a trailing empty segment would make the real
+  // final one non-terminal, so it would decode with want_logits=false and
+  // hand back a branch with nothing to sample.
+  TestSource src;
+  lloyal::decode::Segment empty;   // Text, no tokens
+  src.segs = {empty};
+  CHECK_THROWS_AS(ts.store.decode_segments(h, src), std::runtime_error);
+
+  prune(h, ts.store);
+}
+
+TEST_CASE("branch: causal mode is restored even when the decode fails") {
+  resetStubConfig();
+  TestStore ts(8);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 512);
+
+  llamaStubConfig().decode_result = -1;          // llama_decode fails
+
+  const int32_t n_rows = 8, n_pos = 4, nppe = 1, n_embd = 2;
+  std::vector<float> rows(static_cast<size_t>(n_rows) * n_embd, 1.0f);
+  std::vector<llama_pos> pos(static_cast<size_t>(n_rows) * nppe, 0);
+
+  CHECK_THROWS_AS(
+      ts.store.decode_embd(h, rows.data(), n_rows, n_embd, n_pos, pos.data(),
+                           nppe, /*non_causal*/ true, false),
+      std::runtime_error);
+
+  // Causal mode is context-wide: leaving it off would make every SUBSEQUENT
+  // text decode on this context non-causal. The RAII guard restores it on
+  // the failure path too, not just on the happy one.
+  CHECK(llamaStubConfig().causal_attn == true);
+  CHECK(llamaStubConfig().causal_attn_log.back() == true);
+
+  prune(h, ts.store);
+}

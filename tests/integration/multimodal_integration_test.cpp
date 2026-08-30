@@ -524,6 +524,41 @@ TEST_CASE("multimodal: MtmdSource rejects bad input") {
         "MtmdSource - media marker count (1) does not match image count (0)");
   }
 
+  // --- Audio must be rejected by the CONSTRUCTOR, before decode_segments can
+  // commit any preceding chunk. mtmd sniffs audio by magic bytes, so a WAV
+  // header is enough to route it. ---
+  {
+    auto u32 = [](std::vector<uint8_t>& v, uint32_t x) {
+      v.push_back(x & 0xff); v.push_back((x >> 8) & 0xff);
+      v.push_back((x >> 16) & 0xff); v.push_back((x >> 24) & 0xff);
+    };
+    auto u16 = [](std::vector<uint8_t>& v, uint16_t x) {
+      v.push_back(x & 0xff); v.push_back((x >> 8) & 0xff);
+    };
+    std::vector<uint8_t> wav;
+    const uint32_t n_samples = 160, data_bytes = n_samples * 2;
+    for (char c : std::string("RIFF")) wav.push_back(static_cast<uint8_t>(c));
+    u32(wav, 36 + data_bytes);
+    for (char c : std::string("WAVEfmt ")) wav.push_back(static_cast<uint8_t>(c));
+    u32(wav, 16); u16(wav, 1); u16(wav, 1);
+    u32(wav, 16000); u32(wav, 32000); u16(wav, 2); u16(wav, 16);
+    for (char c : std::string("data")) wav.push_back(static_cast<uint8_t>(c));
+    u32(wav, data_bytes);
+    wav.insert(wav.end(), data_bytes, 0);
+
+    // Which layer rejects it depends on the projector. This mmproj is
+    // vision-only, so mtmd_support_audio() is false and the helper refuses to
+    // build an audio bitmap at all — rejection lands at decode, EARLIER than
+    // the constructor's chunk scan. That scan is the second line of defence,
+    // reachable only with an audio-capable mmproj. Either way the branch is
+    // untouched, which is the property that matters.
+    std::vector<std::vector<uint8_t>> audio{wav};
+    CHECK_THROWS_WITH(
+        MtmdSource(mtmd, one_marker, audio,
+                   std::span<const llama_token>(), n_embd_inp),
+        "MtmdSource - unsupported media bytes at image 0 (expected jpg/png/bmp/gif)");
+  }
+
   // --- A bare marker: the shape most likely to yield an empty TEXT chunk,
   // since there is no surrounding text. decode_segments REJECTS empty
   // segments (terminality is positional), so mtmd must not produce one. ---
