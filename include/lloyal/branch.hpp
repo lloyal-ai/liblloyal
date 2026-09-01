@@ -977,8 +977,8 @@ public:
     }
 
     // Single GPU dispatch
-    if (decode::each(states[0]->ctx, decode_items.data(), n, scratch_) != 0) {
-      throw std::runtime_error("BranchStore::decode_each - llama_decode failed");
+    if (const int32_t rc = decode::each(states[0]->ctx, decode_items.data(), n, scratch_); rc != 0) {
+      throw decode::DecodeError(rc, "BranchStore::decode_each - llama_decode failed");
     }
 
     // Capture logits and update positions
@@ -1098,10 +1098,10 @@ public:
         scatter_items[k].output_logits = true;
       }
 
-      if (decode::scatter(ctx, scatter_items.data(),
-                          static_cast<int32_t>(scatter_items.size()),
-                          scratch_) != 0) {
-        throw std::runtime_error("BranchStore::decode_scatter - decode::scatter failed");
+      if (const int32_t rc = decode::scatter(ctx, scatter_items.data(),
+                                             static_cast<int32_t>(scatter_items.size()),
+                                             scratch_); rc != 0) {
+        throw decode::DecodeError(rc, "BranchStore::decode_scatter - decode::scatter failed");
       }
 
       // Capture logits for each item in the chunk
@@ -1227,8 +1227,8 @@ public:
     // Admission is the better place to spend effort: SegmentSource::cells()
     // reports this prefill's cost before anything decodes, so a caller can
     // refuse rather than half-commit.
-    if (decode::embd(state->ctx, item, state->n_batch, scratch_) != 0) {
-      throw std::runtime_error(
+    if (const int32_t rc = decode::embd(state->ctx, item, state->n_batch, scratch_); rc != 0) {
+      throw decode::DecodeError(rc,
           "BranchStore::decode_embd - llama_decode failed; this branch is "
           "poisoned, prune it and replay onto a fresh one");
     }
@@ -2114,9 +2114,9 @@ inline void prefill(
   }
 
   // Pass raw pointer directly - no vector copy needed
-  if (decode::many(state->ctx, tokens, static_cast<int32_t>(n_tokens),
-                   state->position, state->n_batch, state->seq_id) != 0) {
-    throw std::runtime_error("prefill: llama_decode failed");
+  if (const int32_t rc = decode::many(state->ctx, tokens, static_cast<int32_t>(n_tokens),
+                                      state->position, state->n_batch, state->seq_id); rc != 0) {
+    throw decode::DecodeError(rc, "prefill: llama_decode failed");
   }
 
   state->position += static_cast<llama_pos>(n_tokens);
@@ -2157,8 +2157,8 @@ inline void step(
     throw std::runtime_error("step: invalid branch handle");
   }
 
-  if (decode::one(state->ctx, token, state->position, state->seq_id, true) != 0) {
-    throw std::runtime_error("step: llama_decode failed");
+  if (const int32_t rc = decode::one(state->ctx, token, state->position, state->seq_id, true); rc != 0) {
+    throw decode::DecodeError(rc, "step: llama_decode failed");
   }
   state->position += 1;
   s.add_cells_used(1);

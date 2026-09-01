@@ -79,6 +79,29 @@
 namespace lloyal::decode {
 
 /**
+ * @brief llama_decode failure carrying the raw return code
+ *
+ * The rc is the classification a caller acts on (llama.h): `1` = no KV slot,
+ * state restored — the branch is intact; `-1` = invalid batch, state
+ * restored; `2` = aborted and `< -1` = fatal — partial ubatches REMAIN, the
+ * branch is poisoned. The rc must travel as DATA: the binding catches this
+ * type in C++ and forwards `rc` structurally; the exception itself never
+ * crosses N-API.
+ *
+ * Visibility caveat: safe while liblloyal is header-only (thrower and
+ * catcher compile into one TU). If liblloyal ever becomes a separate shared
+ * library, typed catches can miss under -fvisibility=hidden — attach the rc
+ * some other way before making that move.
+ *
+ * The message also carries `rc=N` for humans reading logs; nothing parses it.
+ */
+struct DecodeError : std::runtime_error {
+  int32_t rc;
+  DecodeError(int32_t rc_, const std::string& msg)
+      : std::runtime_error(msg + " (rc=" + std::to_string(rc_) + ")"), rc(rc_) {}
+};
+
+/**
  * @brief Decode multiple tokens into the KV cache with auto-chunking
  *
  * Orchestration logic:
