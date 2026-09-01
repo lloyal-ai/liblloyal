@@ -1073,10 +1073,11 @@ public:
         int32_t idx = chunk.indices[0];
         int32_t tc = static_cast<int32_t>(items[idx].tokens.size());
 
-        if (decode::many(ctx, items[idx].tokens.data(), tc,
-                         states[idx]->position, batch_limit,
-                         states[idx]->seq_id) != 0) {
-          throw std::runtime_error("BranchStore::decode_scatter - decode::many failed for oversized item " + std::to_string(idx));
+        if (const int32_t rc = decode::many(ctx, items[idx].tokens.data(), tc,
+                                            states[idx]->position, batch_limit,
+                                            states[idx]->seq_id); rc != 0) {
+          throw decode::DecodeError(rc,
+              "BranchStore::decode_scatter - decode::many failed for oversized item " + std::to_string(idx));
         }
 
         const float* raw_logits = logits::get(ctx, -1);
