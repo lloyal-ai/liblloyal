@@ -814,6 +814,24 @@ TEST_CASE("branch: decode_each with empty span is no-op") {
   CHECK_NOTHROW(ts.store.decode_each(empty));
 }
 
+TEST_CASE("branch: decode_each refuses a repeated handle before anything is dispatched") {
+  // Two items for one branch would both read its position at build time and
+  // land two tokens on one cell — decode_scatter has always refused this;
+  // decode_each stated no rule at all.
+  TestStore ts(4);
+  llamaStubConfig().logits.assign(8, 0.0f);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 4);
+  REQUIRE(h != INVALID_HANDLE);
+  DecodeEachItem items[] = {{h, 1}, {h, 2}};
+  CHECK_THROWS_WITH(ts.store.decode_each(items),
+                    doctest::Contains("decode_each - duplicate handle at indices 0 and 1"));
+  CHECK(llamaStubConfig().decode_call_count == 0);
+  CHECK(get_position(h, ts.store) == 0);
+  prune(h, ts.store);
+}
+
 TEST_CASE("branch: decode_each with invalid handle throws") {
   TestStore ts(4);
 

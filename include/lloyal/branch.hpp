@@ -77,6 +77,7 @@
 #include <span>       // std::span (C++20)
 #include <stdexcept>  // std::runtime_error
 #include <string>     // std::to_string
+#include <unordered_map>
 #include <utility>    // std::pair, std::exchange
 #include <vector>
 
@@ -385,6 +386,32 @@ struct DecodeSegmentsResult {
   int64_t cells = 0;
   llama_pos advance = 0;
 };
+
+/**
+ * A handle may appear at most once per batched call: each item's start
+ * position is read from its branch when the batch is built and advances only
+ * after dispatch, so two items for one branch would collide on position —
+ * two tokens on one cell, or overlapping runs. The rule is stated here once
+ * for every path that batches by handle (decode_each, decode_scatter, and a
+ * binding's cohort that dispatches one branch at a time). One pass; a cohort
+ * is at most n_seq_max wide. INVALID_HANDLE entries are skipped — an empty
+ * item occupies no cells and cannot collide with anything.
+ *
+ * @throws std::runtime_error naming both indices of the first repeat
+ */
+inline void require_distinct_handles(std::span<const BranchHandle> handles, const char* who) {
+  std::unordered_map<BranchHandle, size_t> first;
+  first.reserve(handles.size());
+  for (size_t i = 0; i < handles.size(); ++i) {
+    if (handles[i] == INVALID_HANDLE) continue;
+    const auto [it, inserted] = first.emplace(handles[i], i);
+    if (!inserted) {
+      throw std::runtime_error(std::string(who) + " - duplicate handle at indices " +
+                               std::to_string(it->second) + " and " + std::to_string(i) +
+                               " (sequential calls required for multiple runs per branch)");
+    }
+  }
+}
 
 // ===== BRANCH STORE (HANDLE TABLE) =====
 
@@ -983,6 +1010,12 @@ public:
       }
     }
 
+    {
+      std::vector<BranchHandle> handles(n);
+      for (int32_t i = 0; i < n; ++i) handles[i] = items[i].handle;
+      require_distinct_handles(handles, "BranchStore::decode_each");
+    }
+
     // Build EachItem array from branch states
     std::vector<decode::EachItem> decode_items(n);
     for (int32_t i = 0; i < n; ++i) {
@@ -1050,24 +1083,15 @@ public:
       if (i > 0 && states[i]->ctx != states[0]->ctx) {
         throw std::runtime_error("BranchStore::decode_scatter - all branches must share the same context");
       }
-      // A handle may appear at most once per call: start_pos is read from
-      // states[]->position at chunk-build time and advances only after
-      // dispatch, so two items for one branch could bin-pack into the same
-      // chunk and collide on start_pos (overlapping KV positions). Callers
-      // with multiple runs for one branch must issue sequential calls.
-      // Empty spans are excluded: bin_pack skips them, so they occupy no
-      // cells and cannot collide with anything. Only two spans that both
-      // DECODE can overlap.
-      if (!items[i].tokens.empty()) {
-        for (int32_t j = 0; j < i; ++j) {
-          if (items[j].handle == items[i].handle && !items[j].tokens.empty()) {
-            throw std::runtime_error(
-                "BranchStore::decode_scatter - duplicate handle at indices " +
-                std::to_string(j) + " and " + std::to_string(i) +
-                " (sequential calls required for multiple runs per branch)");
-          }
-        }
+    }
+    {
+      // Only spans that DECODE can collide: an empty item is skipped by
+      // bin_pack and occupies no cells, so it is INVALID_HANDLE to the rule.
+      std::vector<BranchHandle> material(n);
+      for (int32_t i = 0; i < n; ++i) {
+        material[i] = items[i].tokens.empty() ? INVALID_HANDLE : items[i].handle;
       }
+      require_distinct_handles(material, "BranchStore::decode_scatter");
     }
 
     llama_context* ctx = states[0]->ctx;
