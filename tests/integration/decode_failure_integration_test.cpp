@@ -328,6 +328,67 @@ TEST_CASE("decode failure: a segment after a landed one reports partial even whe
   llama_free(ctx);
 }
 
+TEST_CASE("decode failure: a repeated handle is refused before anything is dispatched, in both cohorts") {
+  // One rule for every path that batches by handle (require_distinct_handles):
+  // decode_each used to state none and put two tokens on one cell; the KV is
+  // the witness that nothing moves now, and that the branch is intact after.
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  llama_context* ctx = small_ctx(model.get(), 256, 64, 4);
+  REQUIRE(ctx);
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+  TestParams params;
+  const auto* vocab = llama_model_get_vocab(model.get());
+  const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+  auto prompt = tokenizer::tokenize(vocab, "Hello", true, false);
+  REQUIRE(!prompt.empty());
+
+  BranchHandle h = create(ctx, model.get(), store, 0, params, 64);
+  REQUIRE(h != INVALID_HANDLE);
+  prefill(h, prompt.data(), prompt.size(), store);
+  const llama_pos p = get_position(h, store);
+  const llama_seq_id seq = store.get(h)->seq_id;
+  const uint32_t cells0 = store.kv_pressure().cells_used;
+
+  // decode_each: two tokens for one branch would share a cell.
+  DecodeEachItem each[] = {{h, 42}, {h, 43}};
+  CHECK_THROWS_WITH(store.decode_each(each),
+                    doctest::Contains("decode_each - duplicate handle at indices 0 and 1"));
+  CHECK(get_position(h, store) == p);
+  CHECK(kv::pos_max(ctx, seq) == p - 1);
+  CHECK(store.kv_pressure().cells_used == cells0);
+
+  // decode_scatter: two runs for one branch would overlap.
+  const auto a = filler(5, 1000, n_vocab);
+  const auto b = filler(6, 2000, n_vocab);
+  DecodeScatterItem twice[] = {{h, a}, {h, b}};
+  CHECK_THROWS_WITH(store.decode_scatter(twice),
+                    doctest::Contains("decode_scatter - duplicate handle at indices 0 and 1"));
+  CHECK(get_position(h, store) == p);
+  CHECK(kv::pos_max(ctx, seq) == p - 1);
+
+  // An empty span beside a real one is not a repeat: it occupies no cells.
+  DecodeScatterItem mixed[] = {{h, std::span<const llama_token>()}, {h, a}};
+  CHECK_NOTHROW(store.decode_scatter(mixed));
+  CHECK(get_position(h, store) == p + 5);
+  CHECK(kv::pos_max(ctx, seq) == p + 5 - 1);
+
+  // Refused, not poisoned: the branch keeps working.
+  DecodeEachItem one[] = {{h, 44}};
+  CHECK_NOTHROW(store.decode_each(one));
+  CHECK(get_position(h, store) == p + 6);
+  CHECK(store.kv_pressure().cells_used == cells0 + 6);
+
+  prune(h, store);
+  CHECK(store.kv_pressure().cells_used == 0);
+  store.drain();
+  llama_free(ctx);
+}
+
 // ============================================================================
 // Embedding rail — a real projector, rows chunked by the branch's n_batch
 // ============================================================================
