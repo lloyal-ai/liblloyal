@@ -277,8 +277,10 @@ jobs:
         echo "Model path: $LLAMA_TEST_MODEL"
         echo "Projector path: $LLAMA_MMPROJ_MODEL"
         ls -lh "$LLAMA_TEST_MODEL" "$LLAMA_MMPROJ_MODEL"
+        # The embedding-rail failure case needs the projector too; the plain
+        # run above skips it, so this run must select it by name.
         ./build_integration/IntegrationRunner --success \
-          --test-case="*multimodal*" 2>&1 | tee test_output.txt
+          --test-case="*multimodal*,decode failure: an image*" 2>&1 | tee test_output.txt
         # Fail if no tests actually executed (all filtered/skipped)
         if grep -qE "test cases:.*\| 0 passed \| 0 failed \|" test_output.txt; then
           echo "::error::No tests executed — all were skipped or filtered out"

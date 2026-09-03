@@ -994,6 +994,28 @@ TEST_CASE("branch: create refuses a model with no vocab, and leaks nothing") {
   CHECK(llamaStubConfig().decode_call_count == 0);  // nothing was dispatched
 }
 
+TEST_CASE("branch: a refused create leaves the pressure gauge exactly where it was") {
+  // A refusal must own no cells. With a live sibling on the books and a
+  // start_pos > 0, an unwind through release() would subtract a range this
+  // never-created branch never decoded.
+  TestStore ts(4);
+  llamaStubConfig().logits.assign(8, 0.0f);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+  BranchHandle live = create(ts.ctx, fake_model, ts.store, 0, params, 4);
+  REQUIRE(live != INVALID_HANDLE);
+  llama_token toks[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+  prefill(live, toks, 10, ts.store);
+  REQUIRE(ts.store.kv_pressure().cells_used == 10);
+  const size_t leases = ts.store.available();
+
+  llamaStubConfig().vocab_size_value = 0;
+  CHECK_THROWS_AS(create(ts.ctx, fake_model, ts.store, /*start_pos*/ 7, params, 4), std::runtime_error);
+  CHECK(ts.store.kv_pressure().cells_used == 10);
+  CHECK(ts.store.available() == leases);
+  prune(live, ts.store);
+}
+
 TEST_CASE("branch: capture_logits refuses a state with no vocab before it copies") {
   TestStore ts(4);
   llamaStubConfig().logits.assign(8, 0.0f);  // logits exist ...
@@ -1443,17 +1465,16 @@ TEST_CASE("branch: decode_embd brackets a non-causal block and restores it") {
 }
 
 TEST_CASE("branch: an oversized non-causal block is rejected, not split") {
-  resetStubConfig();
   // A bidirectional block cannot span dispatches: rows in an earlier decode
   // cannot attend to later ones. Splitting it would silently corrupt the
-  // vision state, so the configuration must fail loud.
-  llamaStubConfig().n_batch  = 8;
-  llamaStubConfig().n_ubatch = 8;
-
+  // vision state, so the configuration must fail loud. The block FITS the
+  // batch here and only the micro-batch refuses it — the n_ubatch path.
   TestStore ts(8);
+  llamaStubConfig().n_batch  = 64;
+  llamaStubConfig().n_ubatch = 8;
   TestSamplingParams params;
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
-  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, /*n_batch*/ 8);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, /*n_batch*/ 64);
 
   const int32_t n_rows = 64, n_pos = 8, nppe = 1, n_embd = 2;
   std::vector<float> rows(static_cast<size_t>(n_rows) * n_embd, 1.0f);
