@@ -258,6 +258,10 @@ int llama_decode(llama_context * /*ctx*/, llama_batch batch) {
     // If already -2 (mixed), leave it as -2
   }
 
+  if (g_stub_config.decode_fail_on_call > 0 &&
+      g_stub_config.decode_call_count == g_stub_config.decode_fail_on_call) {
+    return g_stub_config.decode_fail_rc;
+  }
   return g_stub_config.decode_result;
 }
 

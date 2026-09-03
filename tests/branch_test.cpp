@@ -45,6 +45,9 @@ struct TestStore {
     : store(capacity)
     , ctx(reinterpret_cast<llama_context*>(0x1000))
   {
+    // The stub is process-global: every case starts from a known state, so
+    // no case depends on what an earlier one left behind.
+    resetStubConfig();
     store.init_tenancy(ctx);
   }
 };
@@ -778,9 +781,8 @@ TEST_CASE("branch: RAII Branch self-move-assign is safe") {
 }
 
 TEST_CASE("branch: RAII Branch is_eog detects stop tokens") {
-  llamaStubConfig().eog_tokens = {2, 151645};  // EOS + ChatML EOT
-
   TestStore ts(4);
+  llamaStubConfig().eog_tokens = {2, 151645};  // EOS + ChatML EOT
   TestSamplingParams params;
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
 
@@ -791,8 +793,6 @@ TEST_CASE("branch: RAII Branch is_eog detects stop tokens") {
   CHECK(b.is_eog(151645));   // ChatML EOT
   CHECK_FALSE(b.is_eog(42)); // regular token
   CHECK_FALSE(b.is_eog(0));  // BOS is not EOG
-
-  llamaStubConfig().eog_tokens.clear();
 }
 
 TEST_CASE("branch: RAII Branch is_eog returns false when invalid") {
@@ -850,6 +850,138 @@ TEST_CASE("branch: decode_scatter with zero-length tokens span skips item") {
   prune(h, ts.store);
 }
 
+// ── Partial commits are data ────────────────────────────────────────────────
+// llama_decode restores state only for THE CALL that fails (llama.h). Every
+// chunked operation may have landed earlier calls before a later one fails,
+// and the branch's own books never move on failure. The caller cannot infer
+// that from `rc`; the error must SAY it. The rule the field carries:
+// intact ⇔ rc == 1 && !partial — anything else ⇒ prune and replay.
+
+TEST_CASE("prefill: a failure on a later chunk reports partial") {
+  TestStore ts(4);
+  llamaStubConfig().vocab_size_value = 8;
+  llamaStubConfig().logits.assign(8, 0.0f);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, /*n_batch*/ 4);
+  REQUIRE(h != INVALID_HANDLE);
+  const uint32_t cells_before = ts.store.kv_pressure().cells_used;
+  llama_token tokens[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};   // 3 chunks of 4,4,2
+
+  SUBCASE("second chunk fails: the first landed, so the branch is not intact") {
+    llamaStubConfig().decode_fail_on_call = 2;
+    llamaStubConfig().decode_fail_rc = 1;                    // "no KV slot"
+    bool threw = false;
+    try {
+      prefill(h, tokens, 10, ts.store);
+    } catch (const lloyal::decode::DecodeError& e) {
+      threw = true;
+      CHECK(e.rc == 1);
+      CHECK(e.partial == true);
+    }
+    CHECK(threw);
+  }
+  SUBCASE("first chunk fails: nothing landed, the branch is intact") {
+    llamaStubConfig().decode_fail_on_call = 1;
+    llamaStubConfig().decode_fail_rc = 1;
+    bool threw = false;
+    try {
+      prefill(h, tokens, 10, ts.store);
+    } catch (const lloyal::decode::DecodeError& e) {
+      threw = true;
+      CHECK(e.rc == 1);
+      CHECK(e.partial == false);
+    }
+    CHECK(threw);
+  }
+  // Either way the books did not move — the prune contract.
+  CHECK(get_position(h, ts.store) == 0);
+  CHECK(ts.store.kv_pressure().cells_used == cells_before);
+  prune(h, ts.store);
+}
+
+TEST_CASE("decode_scatter: a failure on a later chunk reports partial and keeps landed branches consistent") {
+  TestStore ts(4);
+  llamaStubConfig().vocab_size_value = 8;
+  llamaStubConfig().logits.assign(8, 0.0f);
+  llamaStubConfig().n_batch = 4;                             // two 3-token items → two chunks
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+  BranchHandle h1 = create(ts.ctx, fake_model, ts.store, 0, params, 512);
+  BranchHandle h2 = create(ts.ctx, fake_model, ts.store, 0, params, 512);
+  llama_token a[] = {1, 2, 3};
+  llama_token b[] = {4, 5, 6};
+  DecodeScatterItem items[] = {{h1, a}, {h2, b}};
+  const uint32_t cells_before = ts.store.kv_pressure().cells_used;
+  llamaStubConfig().decode_fail_on_call = 2;
+  llamaStubConfig().decode_fail_rc = 1;
+  bool threw = false;
+  try {
+    ts.store.decode_scatter(items);
+  } catch (const lloyal::decode::DecodeError& e) {
+    threw = true;
+    CHECK(e.rc == 1);
+    CHECK(e.partial == true);
+  }
+  CHECK(threw);
+  // The first chunk landed and its branch advanced; the second was restored
+  // by llama_decode and its branch did not move. Re-running the whole call
+  // would decode h1's tokens twice — which is exactly why partial is data.
+  CHECK(get_position(h1, ts.store) == 3);
+  CHECK(get_position(h2, ts.store) == 0);
+  CHECK(ts.store.kv_pressure().cells_used == cells_before + 3);
+  prune(h1, ts.store);
+  prune(h2, ts.store);
+}
+
+TEST_CASE("decode_embd: a failure on a later chunk reports partial") {
+  TestStore ts(4);
+  llamaStubConfig().vocab_size_value = 8;
+  llamaStubConfig().logits.assign(8, 0.0f);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, /*n_batch*/ 4);
+  const int32_t n_rows = 8, n_pos = 8, nppe = 1, n_embd = 2;  // 2 chunks of 4
+  std::vector<float> rows(static_cast<size_t>(n_rows) * n_embd, 0.5f);
+  std::vector<llama_pos> pos(static_cast<size_t>(n_rows) * nppe, 0);
+  llamaStubConfig().decode_fail_on_call = 2;
+  llamaStubConfig().decode_fail_rc = 1;
+  bool threw = false;
+  try {
+    ts.store.decode_embd(h, rows.data(), n_rows, n_embd, n_pos, pos.data(), nppe, false, false);
+  } catch (const lloyal::decode::DecodeError& e) {
+    threw = true;
+    CHECK(e.rc == 1);
+    CHECK(e.partial == true);
+  }
+  CHECK(threw);
+  CHECK(get_position(h, ts.store) == 0);
+  prune(h, ts.store);
+}
+
+TEST_CASE("branch: decode_scatter refuses a branch with no vocab") {
+  // A branch whose model reports no vocabulary has an EMPTY logits snapshot;
+  // capturing into it must be refused, never copied. (The other decode rails
+  // already refuse; the scatter rails copied into a null destination — UB.)
+  TestStore ts(4);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+  llamaStubConfig().logits.assign(8, 0.0f);       // logits exist ...
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 4);
+  REQUIRE(h != INVALID_HANDLE);
+  REQUIRE(ts.store.get(h)->n_vocab == 0);         // ... but the branch has nowhere to put them
+  SUBCASE("normal chunk") {
+    llama_token tokens[] = {1, 2, 3};
+    DecodeScatterItem items[] = {{h, tokens}};
+    CHECK_THROWS_AS(ts.store.decode_scatter(items), std::runtime_error);
+  }
+  SUBCASE("oversized item") {
+    llama_token tokens[] = {1, 2, 3, 4, 5, 6};    // > n_batch → decode::many path
+    DecodeScatterItem items[] = {{h, tokens}};
+    CHECK_THROWS_AS(ts.store.decode_scatter(items), std::runtime_error);
+  }
+  prune(h, ts.store);
+}
 TEST_CASE("branch: decode_scatter all items zero-length is no-op") {
   TestStore ts(8);
   TestSamplingParams params;
@@ -980,10 +1112,10 @@ TEST_CASE("tenancy: BranchStore available tracks leases") {
 }
 
 TEST_CASE("tenancy: allocate returns INVALID when leases exhausted") {
-  // Use stub config with small n_seq_max
-  llamaStubConfig().n_seq_max = 2;
+  // Two leases, eight slots: the store must run out of leases first.
   TestStore ts(8);
-  llamaStubConfig().n_seq_max = 8;  // Reset for other tests
+  llamaStubConfig().n_seq_max = 2;
+  ts.store.init_tenancy(ts.ctx);
 
   auto [h1, s1] = ts.store.allocate();
   CHECK(h1 != INVALID_HANDLE);
@@ -1351,9 +1483,8 @@ TEST_CASE("branch: decode_embd rejects a row width the model does not use") {
   // llama_batch carries no row-width metadata: llama_decode consumes rows at
   // the MODEL's input width while decode::embd strides by the caller's. A
   // wrong-but-positive width reads past the caller's allocation.
-  llamaStubConfig().n_embd_inp = 512;
-
   TestStore ts(8);
+  llamaStubConfig().n_embd_inp = 512;
   TestSamplingParams params;
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
   BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 512);
@@ -1381,14 +1512,13 @@ TEST_CASE("branch: decode_embd rejects a row width the model does not use") {
 TEST_CASE("branch: decode_scatter allows an empty span beside a real one") {
   resetStubConfig();
   TestStore ts(8);
+  // decode_scatter captures logits per item, so the branch needs a vocab at create time.
+  llamaStubConfig().vocab_size_value = 8;
+  llamaStubConfig().logits.assign(8, 0.0f);
   TestSamplingParams params;
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
   BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 512);
   REQUIRE(h != INVALID_HANDLE);
-
-  // decode_scatter captures logits per item, so the stub needs some.
-  llamaStubConfig().vocab_size_value = 8;
-  llamaStubConfig().logits.assign(8, 0.0f);
 
   std::vector<llama_token> toks = {1, 2, 3};
   std::vector<llama_token> none;
@@ -1450,6 +1580,44 @@ lloyal::decode::Segment embd_seg(const float* rows, int32_t n_rows,
 }
 
 }  // namespace
+
+TEST_CASE("branch: decode_segments reports partial when an EARLIER segment landed") {
+  // A prefill is ONE operation to its caller, so a failure in segment 2 is
+  // partial even when that segment's own first call is what failed: segment 1
+  // already moved the branch. The SDK's media path gates "intact" on this —
+  // without it a retry would decode the sep twice.
+  TestStore ts(8);
+  llamaStubConfig().vocab_size_value = 8;
+  llamaStubConfig().logits.assign(8, 0.0f);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 512);
+  REQUIRE(h != INVALID_HANDLE);
+  const uint32_t cells_before = ts.store.kv_pressure().cells_used;
+
+  llama_token sep[] = {1, 2, 3};
+  llama_token tail[] = {4, 5};
+  TestSource src;
+  src.segs.resize(2);
+  src.segs[0].kind = lloyal::decode::Segment::Kind::Text; src.segs[0].tokens = sep;
+  src.segs[1].kind = lloyal::decode::Segment::Kind::Text; src.segs[1].tokens = tail;
+
+  llamaStubConfig().decode_fail_on_call = 2;  // segment 1 is call 1; segment 2's only call fails
+  llamaStubConfig().decode_fail_rc = 1;
+  bool threw = false;
+  try {
+    ts.store.decode_segments(h, src);
+  } catch (const lloyal::decode::DecodeError& e) {
+    threw = true;
+    CHECK(e.rc == 1);
+    CHECK(e.partial == true);
+  }
+  CHECK(threw);
+  // Segment 1 landed and its books moved; segment 2 was restored.
+  CHECK(get_position(h, ts.store) == 3);
+  CHECK(ts.store.kv_pressure().cells_used == cells_before + 3);
+  prune(h, ts.store);
+}
 
 TEST_CASE("branch: decode_segments validates geometry BEFORE the callback") {
   resetStubConfig();
@@ -1568,7 +1736,7 @@ TEST_CASE("branch: a failed decode_embd poisons the branch but keeps its books")
       ts.store.decode_embd(h, rows.data(), n_rows, n_embd, n_pos, pos.data(),
                            nppe, false, false),
       "BranchStore::decode_embd - llama_decode failed; this branch is "
-      "poisoned, prune it and replay onto a fresh one");
+      "poisoned, prune it and replay onto a fresh one (rc=-1)");
 
   // The branch's OWN accounting stays consistent, which is what makes the
   // prune correct: neither counter moved, so release() subtracts exactly what

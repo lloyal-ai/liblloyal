@@ -308,7 +308,23 @@ struct BranchState {
   std::vector<llama_token_data> last_candidates; ///< Filtered candidates from last sample()
 
   std::vector<float> logits_snapshot;  ///< Captured logit distribution (n_vocab floats)
-  bool has_logits = false;             ///< True only after force_snapshot_logits(), prefill(), or step()
+  bool has_logits = false;             ///< True once logits_snapshot holds a live distribution: capture_logits(), set_logits(), or a fork that cloned it
+
+  /**
+   * Copy the logits at batch row `index` into this branch's private snapshot.
+   * The context's buffer is shared and overwritten by the next llama_decode;
+   * the snapshot is what sample()/get_logits() read. A branch with no vocab
+   * has nowhere to put them — refused loud, never copied into an empty buffer.
+   */
+  void capture_logits(int32_t index) {
+    const float* raw = logits::get(ctx, index);  // throws if ctx is null or no logits at index
+    if (n_vocab <= 0 || logits_snapshot.size() < static_cast<size_t>(n_vocab)) {
+      throw std::runtime_error("branch: cannot capture logits, branch has no vocab (n_vocab=" +
+                               std::to_string(n_vocab) + ")");
+    }
+    std::memcpy(logits_snapshot.data(), raw, static_cast<size_t>(n_vocab) * sizeof(float));
+    has_logits = true;
+  }
 
   /// Reusable scratch buffer for sampling (avoids O(n_vocab) allocs per sample call).
   ///
@@ -978,20 +994,12 @@ public:
 
     // Single GPU dispatch
     if (const int32_t rc = decode::each(states[0]->ctx, decode_items.data(), n, scratch_); rc != 0) {
-      throw decode::DecodeError(rc, "BranchStore::decode_each - llama_decode failed");
+      throw decode::DecodeError(rc, /*partial*/ false, "BranchStore::decode_each - llama_decode failed");
     }
 
     // Capture logits and update positions
-    llama_context* ctx = states[0]->ctx;
     for (int32_t i = 0; i < n; ++i) {
-      const float* raw_logits = logits::get(ctx, i);  // throws on null
-      if (states[i]->n_vocab <= 0) {
-        throw std::runtime_error("BranchStore::decode_each - invalid vocab size at index " + std::to_string(i));
-      }
-      assert(states[i]->logits_snapshot.size() >= static_cast<size_t>(states[i]->n_vocab));
-      std::memcpy(states[i]->logits_snapshot.data(), raw_logits,
-                  states[i]->n_vocab * sizeof(float));
-      states[i]->has_logits = true;
+      states[i]->capture_logits(i);
       states[i]->position += 1;
     }
     cells_used_ += static_cast<uint32_t>(items.size());
@@ -1014,9 +1022,14 @@ public:
    * @note Uses an internal scratch buffer. Since BranchStore requires external
    *       synchronization (caller's mutex), no concurrent access is possible.
    *
+   * The books move as each chunk lands, so a failure on a later chunk leaves
+   * the landed branches consistent (position and cells agree) and the rest
+   * untouched; the error's `partial` says which case the caller is in.
+   *
    * @param items    Span of {handle, tokens} pairs (all handles must be valid)
-   * @throws std::runtime_error if any handle is invalid, contexts don't match,
-   *         or decode fails
+   * @throws std::runtime_error if any handle is invalid or contexts don't match
+   * @throws decode::DecodeError if a chunk fails — `partial` set when an
+   *         earlier chunk landed
    *
    * @see decode::scatter() for the underlying single-batch primitive
    * @see decode::many() for the oversized-item fallback
@@ -1068,24 +1081,24 @@ public:
 
     auto chunks = decode::bin_pack(spans.data(), n, batch_limit);
 
+    int32_t landed = 0;  // chunks whose llama_decode returned 0
     for (const auto& chunk : chunks) {
       if (chunk.oversized) {
         int32_t idx = chunk.indices[0];
         int32_t tc = static_cast<int32_t>(items[idx].tokens.size());
 
+        int32_t committed = 0;
         if (const int32_t rc = decode::many(ctx, items[idx].tokens.data(), tc,
                                             states[idx]->position, batch_limit,
-                                            states[idx]->seq_id); rc != 0) {
-          throw decode::DecodeError(rc,
+                                            states[idx]->seq_id, &committed); rc != 0) {
+          throw decode::DecodeError(rc, landed > 0 || committed > 0,
               "BranchStore::decode_scatter - decode::many failed for oversized item " + std::to_string(idx));
         }
 
-        const float* raw_logits = logits::get(ctx, -1);
-        assert(states[idx]->logits_snapshot.size() >= static_cast<size_t>(states[idx]->n_vocab));
-        std::memcpy(states[idx]->logits_snapshot.data(), raw_logits,
-                    states[idx]->n_vocab * sizeof(float));
-        states[idx]->has_logits = true;
+        states[idx]->capture_logits(-1);
         states[idx]->position += tc;
+        cells_used_ += static_cast<uint32_t>(tc);
+        ++landed;
         continue;
       }
 
@@ -1102,29 +1115,22 @@ public:
       if (const int32_t rc = decode::scatter(ctx, scatter_items.data(),
                                              static_cast<int32_t>(scatter_items.size()),
                                              scratch_); rc != 0) {
-        throw decode::DecodeError(rc, "BranchStore::decode_scatter - decode::scatter failed");
+        throw decode::DecodeError(rc, landed > 0, "BranchStore::decode_scatter - decode::scatter failed");
       }
 
-      // Capture logits for each item in the chunk
+      // Capture logits and move the books for each item in the chunk
       int32_t cursor = 0;
       for (size_t k = 0; k < scatter_items.size(); ++k) {
         int32_t idx = chunk.indices[k];
         int32_t item_n = static_cast<int32_t>(scatter_items[k].tokens.size());
 
-        const float* raw_logits = logits::get(ctx, cursor + item_n - 1);
-        assert(states[idx]->logits_snapshot.size() >= static_cast<size_t>(states[idx]->n_vocab));
-        std::memcpy(states[idx]->logits_snapshot.data(), raw_logits,
-                    states[idx]->n_vocab * sizeof(float));
-        states[idx]->has_logits = true;
-        states[idx]->position += static_cast<int32_t>(items[idx].tokens.size());
+        states[idx]->capture_logits(cursor + item_n - 1);
+        states[idx]->position += item_n;
+        cells_used_ += static_cast<uint32_t>(item_n);
 
         cursor += item_n;
       }
-    }
-
-    // Accumulate total tokens decoded across all items
-    for (int32_t i = 0; i < n; ++i) {
-      cells_used_ += static_cast<uint32_t>(items[i].tokens.size());
+      ++landed;
     }
   }
 
@@ -1221,6 +1227,7 @@ public:
     //
     // The branch is therefore poisoned on failure — prune it and replay onto
     // a fresh one, which is the portable correction regardless of layer type.
+    // The error's `partial` says whether any chunk landed (see DecodeError).
     // Its own accounting stays CONSISTENT for that prune: neither position
     // nor cells_used_ moved, so release() subtracts what the branch legitimately
     // owned and whole-sequence eviction reclaims the orphaned rows.
@@ -1228,8 +1235,9 @@ public:
     // Admission is the better place to spend effort: SegmentSource::cells()
     // reports this prefill's cost before anything decodes, so a caller can
     // refuse rather than half-commit.
-    if (const int32_t rc = decode::embd(state->ctx, item, state->n_batch, scratch_); rc != 0) {
-      throw decode::DecodeError(rc,
+    int32_t committed = 0;
+    if (const int32_t rc = decode::embd(state->ctx, item, state->n_batch, scratch_, &committed); rc != 0) {
+      throw decode::DecodeError(rc, committed > 0,
           "BranchStore::decode_embd - llama_decode failed; this branch is "
           "poisoned, prune it and replay onto a fresh one");
     }
@@ -1241,14 +1249,7 @@ public:
     state->img_slack_total += slack;
 
     if (want_logits) {
-      const float* raw_logits = logits::get(state->ctx, -1);  // throws if absent
-      if (state->n_vocab <= 0) {
-        throw std::runtime_error("BranchStore::decode_embd - invalid vocab size");
-      }
-      assert(state->logits_snapshot.size() >= static_cast<size_t>(state->n_vocab));
-      std::memcpy(state->logits_snapshot.data(), raw_logits,
-                  state->n_vocab * sizeof(float));
-      state->has_logits = true;
+      state->capture_logits(-1);
     } else {
       // The position advanced but no logits were computed for it. Leaving the
       // previous snapshot in place would let sample() read logits belonging to
@@ -1284,7 +1285,9 @@ public:
    * @warning NOT atomic. Once the first segment is dispatched the branch has
    * been mutated, so a later throw — from the source or from a decode — leaves
    * it partially advanced. The branch is poisoned at that point: prune it and
-   * rebuild rather than continuing from it.
+   * rebuild rather than continuing from it. A DecodeError from any segment
+   * after the first carries `partial = true` for that reason, whichever of
+   * its calls failed — the prefill is one operation to the caller.
    *
    * @param handle Branch to prefill (must be valid + leased)
    * @param source Yields the segments; owns production, not placement
@@ -1304,65 +1307,73 @@ public:
     DecodeSegmentsResult result;
 
     const size_t n = source.size();
-    for (size_t i = 0; i < n; ++i) {
-      const decode::Segment seg = source.at(i);
-      const bool is_last = (i + 1 == n);
+    try {
+      for (size_t i = 0; i < n; ++i) {
+        const decode::Segment seg = source.at(i);
+        const bool is_last = (i + 1 == n);
 
-      if (seg.kind == decode::Segment::Kind::Text) {
-        // Terminality comes from the index, so an empty trailing segment would
-        // make the real final one non-terminal: [EMBD, empty TEXT] would decode
-        // the image with want_logits=false, skip the tail, and hand back a
-        // branch with no logits to sample. Reject rather than silently skip.
-        if (seg.tokens.empty()) {
-          throw std::runtime_error(
-              "BranchStore::decode_segments - empty TEXT segment at " +
-              std::to_string(i) + "; a source must not yield empty segments");
+        if (seg.kind == decode::Segment::Kind::Text) {
+          // Terminality comes from the index, so an empty trailing segment would
+          // make the real final one non-terminal: [EMBD, empty TEXT] would decode
+          // the image with want_logits=false, skip the tail, and hand back a
+          // branch with no logits to sample. Reject rather than silently skip.
+          if (seg.tokens.empty()) {
+            throw std::runtime_error(
+                "BranchStore::decode_segments - empty TEXT segment at " +
+                std::to_string(i) + "; a source must not yield empty segments");
+          }
+          DecodeScatterItem item{handle, seg.tokens};
+          decode_scatter(std::span<const DecodeScatterItem>(&item, 1));
+          result.cells += static_cast<int64_t>(seg.tokens.size());
+          continue;
         }
-        DecodeScatterItem item{handle, seg.tokens};
-        decode_scatter(std::span<const DecodeScatterItem>(&item, 1));
-        result.cells += static_cast<int64_t>(seg.tokens.size());
-        continue;
-      }
 
-      if (!seg.rows || seg.n_rows <= 0) {
-        throw std::runtime_error(
-            "BranchStore::decode_segments - empty embedding segment at " +
-            std::to_string(i));
-      }
-      // SegmentSource is a public extension point, so this geometry is
-      // untrusted input. It must be checked BEFORE it sizes the buffer or
-      // reaches positions(): n_pos_per_embd of -1 wraps the size_t multiply
-      // into an enormous allocation, and 0 hands positions() a zero-length
-      // buffer to write into. decode_embd's own checks come too late.
-      if (seg.n_pos_per_embd != 1 && seg.n_pos_per_embd != 4) {
-        throw std::runtime_error(
-            "BranchStore::decode_segments - segment " + std::to_string(i) +
-            " has n_pos_per_embd " + std::to_string(seg.n_pos_per_embd) +
-            " (expected 1 or 4)");
-      }
-      if (seg.n_embd_inp <= 0) {
-        throw std::runtime_error(
-            "BranchStore::decode_segments - segment " + std::to_string(i) +
-            " has non-positive n_embd_inp");
-      }
-      if (seg.n_pos <= 0 || seg.n_pos > seg.n_rows) {
-        throw std::runtime_error(
-            "BranchStore::decode_segments - segment " + std::to_string(i) +
-            " has n_pos " + std::to_string(seg.n_pos) +
-            " outside (0, n_rows=" + std::to_string(seg.n_rows) + "]");
-      }
+        if (!seg.rows || seg.n_rows <= 0) {
+          throw std::runtime_error(
+              "BranchStore::decode_segments - empty embedding segment at " +
+              std::to_string(i));
+        }
+        // SegmentSource is a public extension point, so this geometry is
+        // untrusted input. It must be checked BEFORE it sizes the buffer or
+        // reaches positions(): n_pos_per_embd of -1 wraps the size_t multiply
+        // into an enormous allocation, and 0 hands positions() a zero-length
+        // buffer to write into. decode_embd's own checks come too late.
+        if (seg.n_pos_per_embd != 1 && seg.n_pos_per_embd != 4) {
+          throw std::runtime_error(
+              "BranchStore::decode_segments - segment " + std::to_string(i) +
+              " has n_pos_per_embd " + std::to_string(seg.n_pos_per_embd) +
+              " (expected 1 or 4)");
+        }
+        if (seg.n_embd_inp <= 0) {
+          throw std::runtime_error(
+              "BranchStore::decode_segments - segment " + std::to_string(i) +
+              " has non-positive n_embd_inp");
+        }
+        if (seg.n_pos <= 0 || seg.n_pos > seg.n_rows) {
+          throw std::runtime_error(
+              "BranchStore::decode_segments - segment " + std::to_string(i) +
+              " has n_pos " + std::to_string(seg.n_pos) +
+              " outside (0, n_rows=" + std::to_string(seg.n_rows) + "]");
+        }
 
-      // The base never leaves this scope: the source is handed the position
-      // and applies its own model's rules to it.
-      const llama_pos base = state->position;
-      segment_pos_.assign(
-          static_cast<size_t>(seg.n_rows) * seg.n_pos_per_embd, 0);
-      source.positions(i, base, segment_pos_.data());
+        // The base never leaves this scope: the source is handed the position
+        // and applies its own model's rules to it.
+        const llama_pos base = state->position;
+        segment_pos_.assign(
+            static_cast<size_t>(seg.n_rows) * seg.n_pos_per_embd, 0);
+        source.positions(i, base, segment_pos_.data());
 
-      decode_embd(handle, seg.rows, seg.n_rows, seg.n_embd_inp, seg.n_pos,
-                   segment_pos_.data(), seg.n_pos_per_embd, seg.non_causal,
-                   /*want_logits*/ is_last);
-      result.cells += static_cast<int64_t>(seg.n_rows);
+        decode_embd(handle, seg.rows, seg.n_rows, seg.n_embd_inp, seg.n_pos,
+                     segment_pos_.data(), seg.n_pos_per_embd, seg.non_causal,
+                     /*want_logits*/ is_last);
+        result.cells += static_cast<int64_t>(seg.n_rows);
+      }
+    } catch (const decode::DecodeError& e) {
+      // One operation to the caller: a failure after an earlier segment
+      // landed is partial even when the failing call restored its own
+      // chunks. Every segment is material, so a moved position is proof.
+      if (e.partial || state->position == start_pos) throw;
+      throw e.as_partial();
     }
 
     result.advance = state->position - start_pos;
@@ -2074,16 +2085,7 @@ inline void force_snapshot_logits(BranchHandle handle, BranchStore& s) {
     throw std::runtime_error("force_snapshot_logits: invalid branch handle");
   }
 
-  // logits::get() throws if ctx is null or logits unavailable
-  const float* raw_logits = logits::get(state->ctx, -1);
-
-  if (state->n_vocab <= 0) {
-    throw std::runtime_error("force_snapshot_logits: invalid vocab size");
-  }
-
-  std::memcpy(state->logits_snapshot.data(), raw_logits,
-              state->n_vocab * sizeof(float));
-  state->has_logits = true;
+  state->capture_logits(-1);
 }
 
 /**
@@ -2115,24 +2117,16 @@ inline void prefill(
   }
 
   // Pass raw pointer directly - no vector copy needed
+  int32_t committed = 0;
   if (const int32_t rc = decode::many(state->ctx, tokens, static_cast<int32_t>(n_tokens),
-                                      state->position, state->n_batch, state->seq_id); rc != 0) {
-    throw decode::DecodeError(rc, "prefill: llama_decode failed");
+                                      state->position, state->n_batch, state->seq_id,
+                                      &committed); rc != 0) {
+    throw decode::DecodeError(rc, committed > 0, "prefill: llama_decode failed");
   }
 
   state->position += static_cast<llama_pos>(n_tokens);
   s.add_cells_used(static_cast<uint32_t>(n_tokens));
-
-  // logits::get() throws if logits unavailable
-  const float* raw_logits = logits::get(state->ctx, -1);
-
-  if (state->n_vocab <= 0) {
-    throw std::runtime_error("prefill: invalid vocab size");
-  }
-
-  std::memcpy(state->logits_snapshot.data(), raw_logits,
-              state->n_vocab * sizeof(float));
-  state->has_logits = true;
+  state->capture_logits(-1);
 }
 
 /**
@@ -2159,21 +2153,11 @@ inline void step(
   }
 
   if (const int32_t rc = decode::one(state->ctx, token, state->position, state->seq_id, true); rc != 0) {
-    throw decode::DecodeError(rc, "step: llama_decode failed");
+    throw decode::DecodeError(rc, /*partial*/ false, "step: llama_decode failed");
   }
   state->position += 1;
   s.add_cells_used(1);
-
-  // logits::get() throws if logits unavailable
-  const float* raw_logits = logits::get(state->ctx, -1);
-
-  if (state->n_vocab <= 0) {
-    throw std::runtime_error("step: invalid vocab size");
-  }
-
-  std::memcpy(state->logits_snapshot.data(), raw_logits,
-              state->n_vocab * sizeof(float));
-  state->has_logits = true;
+  state->capture_logits(-1);
 }
 
 /**

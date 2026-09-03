@@ -81,24 +81,46 @@ namespace lloyal::decode {
 /**
  * @brief llama_decode failure carrying the raw return code
  *
- * The rc is the classification a caller acts on (llama.h): `1` = no KV slot,
- * state restored — the branch is intact; `-1` = invalid batch, state
- * restored; `2` = aborted and `< -1` = fatal — partial ubatches REMAIN, the
- * branch is poisoned. The rc must travel as DATA: the binding catches this
- * type in C++ and forwards `rc` structurally; the exception itself never
- * crosses N-API.
+ * Two facts travel as DATA, because the caller acts on them and can infer
+ * neither from the message:
+ *
+ * - `rc` classifies the FAILING CALL (llama.h): `1` = no KV slot, state
+ *   restored for that call; `-1` = invalid batch, state restored; `2` =
+ *   aborted and `< -1` = fatal — partial ubatches remain.
+ * - `partial` says whether EARLIER calls of the same operation landed. Every
+ *   chunked path (many, embd, BranchStore::decode_scatter) may have committed
+ *   chunks before the one that failed; llama_decode restores only the call it
+ *   rejected, and the branch's books never move on failure.
+ *
+ * The rule, true at every throw site: the branch is intact iff
+ * `rc == 1 && !partial` — retry once the KV has room. Anything else ⇒ prune
+ * the branch and replay onto a fresh one.
+ *
+ * The binding catches this type in C++ and forwards both fields structurally;
+ * the exception itself never crosses N-API.
  *
  * Visibility caveat: safe while liblloyal is header-only (thrower and
  * catcher compile into one TU). If liblloyal ever becomes a separate shared
  * library, typed catches can miss under -fvisibility=hidden — attach the rc
  * some other way before making that move.
  *
- * The message also carries `rc=N` for humans reading logs; nothing parses it.
+ * The message also carries `rc=N` (and `partial` when set) for humans reading
+ * logs; nothing parses it.
  */
 struct DecodeError : std::runtime_error {
   int32_t rc;
-  DecodeError(int32_t rc_, const std::string& msg)
-      : std::runtime_error(msg + " (rc=" + std::to_string(rc_) + ")"), rc(rc_) {}
+  bool partial;
+  DecodeError(int32_t rc_, bool partial_, const std::string& msg)
+      : std::runtime_error(msg + " (rc=" + std::to_string(rc_) +
+                           (partial_ ? ", partial)" : ")")),
+        rc(rc_), partial(partial_), msg_(msg) {}
+
+  /// The same failure as an ENCLOSING operation reports it once work before
+  /// the failing call has landed — decode_segments over its segments.
+  DecodeError as_partial() const { return DecodeError(rc, true, msg_); }
+
+private:
+  std::string msg_;
 };
 
 /**
@@ -143,6 +165,8 @@ struct DecodeError : std::runtime_error {
  * @param n_past Position to start decoding from (KV cache position)
  * @param n_batch Batch size for chunking
  * @param seq_id Sequence ID to update in KV cache (default: 0)
+ * @param n_committed Optional out: tokens landed before return — `n_tokens`
+ *        on success, fewer when a later chunk failed (see DecodeError::partial)
  * @return 0 on success, non-zero on decode failure
  * @throws std::runtime_error if ctx is NULL or tokens are invalid (validation errors)
  *
@@ -153,7 +177,8 @@ struct DecodeError : std::runtime_error {
  */
 [[nodiscard]] inline int many(llama_context *ctx, const llama_token *tokens,
                                int32_t n_tokens, int32_t n_past, int32_t n_batch,
-                               llama_seq_id seq_id = 0) {
+                               llama_seq_id seq_id = 0,
+                               int32_t* n_committed = nullptr) {
   LLOYAL_LOG_DEBUG(
       "[decode::many] Processing %d tokens at position %d", n_tokens,
       n_past);
@@ -218,6 +243,7 @@ struct DecodeError : std::runtime_error {
       LLOYAL_LOG_DEBUG(
           "[decode::many] ERROR: llama_decode failed at position %d (rc=%d)",
           n_past, rc);
+      if (n_committed) *n_committed = processed;
       return rc;
     }
 
@@ -229,6 +255,7 @@ struct DecodeError : std::runtime_error {
   }
 
   LLOYAL_LOG_DEBUG("[decode::many] Decode complete");
+  if (n_committed) *n_committed = n_tokens;
   return 0;
 }
 
@@ -639,6 +666,8 @@ struct SegmentSource {
  * @param item    Rows, positions, sequence and flags
  * @param n_batch Max rows per llama_decode (sub-chunk bound)
  * @param scratch Reusable scratch buffers (shared with each()/scatter())
+ * @param n_committed Optional out: rows landed before return — `n_rows` on
+ *        success, fewer when a later chunk failed (see DecodeError::partial)
  * @return 0 on success, non-zero llama_decode rc on failure
  * @throws std::runtime_error on null ctx or malformed item
  *
@@ -648,7 +677,8 @@ struct SegmentSource {
 [[nodiscard]] inline int embd(llama_context* ctx,
                               const EmbdItem& item,
                               int32_t n_batch,
-                              Scratch& scratch) {
+                              Scratch& scratch,
+                              int32_t* n_committed = nullptr) {
   if (!ctx) {
     throw std::runtime_error("decode::embd - NULL context");
   }
@@ -746,6 +776,7 @@ struct SegmentSource {
     const int rc = llama_decode(ctx, batch);
     if (rc != 0) {
       LLOYAL_LOG_DEBUG("[decode::embd] ERROR: llama_decode failed (rc=%d)", rc);
+      if (n_committed) *n_committed = processed;
       return rc;
     }
 
@@ -753,6 +784,7 @@ struct SegmentSource {
   }
 
   LLOYAL_LOG_DEBUG("[decode::embd] Decode complete (%d rows)", n);
+  if (n_committed) *n_committed = n;
   return 0;
 }
 

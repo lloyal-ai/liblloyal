@@ -268,8 +268,13 @@ struct LlamaStubConfig {
 
     // Batch/Decode operations
     bool batch_init_succeeds = true;           // Controls if llama_batch_init succeeds
-    int decode_result = 0;                     // 0=success, <0=failure
+    int decode_result = 0;                     // 0=success, <0=failure (every call)
     int decode_call_count = 0;                 // Track number of decode calls
+    // Fail exactly ONE call — the Nth (1-based) — with `decode_fail_rc`, so a
+    // test can put the failure on a LATER chunk of a chunked operation and
+    // assert what the earlier chunks left behind. 0 = disabled.
+    int decode_fail_on_call = 0;
+    int decode_fail_rc = 1;                    // llama.h: 1 = no KV slot for the batch
     int batch_free_call_count = 0;             // Track RAII cleanup
 
     // Causal-attention bracket (decode::embd for non-causal projectors).
