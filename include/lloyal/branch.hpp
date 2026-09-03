@@ -1631,6 +1631,14 @@ inline BranchHandle create(
 
   const llama_vocab* vocab = llama_model_get_vocab(model);
   state->n_vocab = llama_vocab_n_tokens(vocab);
+  if (state->n_vocab <= 0) {
+    // The invariant every logits capture stands on is established here, at
+    // birth: a live branch has somewhere to put its logits. Refusing now
+    // means no decode can ever be dispatched for a branch that does not.
+    s.release(handle);
+    throw std::runtime_error("branch::create - model has no vocab (n_vocab=" +
+                             std::to_string(state->n_vocab) + "); nothing to sample");
+  }
   state->logits_snapshot.resize(state->n_vocab);
   state->has_logits = false;
   state->candidates_buffer.resize(state->n_vocab);

@@ -48,6 +48,9 @@ struct TestStore {
     // The stub is process-global: every case starts from a known state, so
     // no case depends on what an earlier one left behind.
     resetStubConfig();
+    // A live branch has a vocab (create refuses a model without one), so the
+    // fixture's model has a small one; a case about the refusal sets it to 0.
+    llamaStubConfig().vocab_size_value = 8;
     store.init_tenancy(ctx);
   }
 };
@@ -959,29 +962,30 @@ TEST_CASE("decode_embd: a failure on a later chunk reports partial") {
   prune(h, ts.store);
 }
 
-TEST_CASE("branch: decode_scatter refuses a branch with no vocab") {
-  // A branch whose model reports no vocabulary has an EMPTY logits snapshot;
-  // capturing into it must be refused, never copied. (The other decode rails
-  // already refuse; the scatter rails copied into a null destination — UB.)
+TEST_CASE("branch: create refuses a model with no vocab, and leaks nothing") {
+  // The invariant every capture relies on is established where a branch is
+  // born: nothing downstream needs to re-check it, and no decode can ever be
+  // dispatched for a branch that has nowhere to put its logits.
   TestStore ts(4);
+  llamaStubConfig().vocab_size_value = 0;
   TestSamplingParams params;
   auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
-  llamaStubConfig().logits.assign(8, 0.0f);       // logits exist ...
-  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 4);
-  REQUIRE(h != INVALID_HANDLE);
-  REQUIRE(ts.store.get(h)->n_vocab == 0);         // ... but the branch has nowhere to put them
-  SUBCASE("normal chunk") {
-    llama_token tokens[] = {1, 2, 3};
-    DecodeScatterItem items[] = {{h, tokens}};
-    CHECK_THROWS_AS(ts.store.decode_scatter(items), std::runtime_error);
-  }
-  SUBCASE("oversized item") {
-    llama_token tokens[] = {1, 2, 3, 4, 5, 6};    // > n_batch → decode::many path
-    DecodeScatterItem items[] = {{h, tokens}};
-    CHECK_THROWS_AS(ts.store.decode_scatter(items), std::runtime_error);
-  }
-  prune(h, ts.store);
+  const size_t leases = ts.store.available();
+  CHECK_THROWS_AS(create(ts.ctx, fake_model, ts.store, 0, params, 4), std::runtime_error);
+  CHECK(ts.store.available() == leases);            // slot and lease went back
+  CHECK(llamaStubConfig().decode_call_count == 0);  // nothing was dispatched
 }
+
+TEST_CASE("branch: capture_logits refuses a state with no vocab before it copies") {
+  TestStore ts(4);
+  llamaStubConfig().logits.assign(8, 0.0f);  // logits exist ...
+  BranchState st;
+  st.ctx = ts.ctx;
+  st.n_vocab = 0;                              // ... but there is nowhere to put them
+  CHECK_THROWS_AS(st.capture_logits(-1), std::runtime_error);
+  CHECK(st.has_logits == false);
+}
+
 TEST_CASE("branch: decode_scatter all items zero-length is no-op") {
   TestStore ts(8);
   TestSamplingParams params;

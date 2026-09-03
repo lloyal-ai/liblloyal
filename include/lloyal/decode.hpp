@@ -84,17 +84,19 @@ namespace lloyal::decode {
  * Two facts travel as DATA, because the caller acts on them and can infer
  * neither from the message:
  *
- * - `rc` classifies the FAILING CALL (llama.h): `1` = no KV slot, state
- *   restored for that call; `-1` = invalid batch, state restored; `2` =
- *   aborted and `< -1` = fatal — partial ubatches remain.
+ * - `rc` classifies the FAILING CALL (llama.h): `1` = no KV slot and `-1` =
+ *   invalid batch both leave the memory as it was before that call; `2` =
+ *   aborted and `< -1` = fatal leave partial ubatches behind.
  * - `partial` says whether EARLIER calls of the same operation landed. Every
- *   chunked path (many, embd, BranchStore::decode_scatter) may have committed
- *   chunks before the one that failed; llama_decode restores only the call it
- *   rejected, and the branch's books never move on failure.
+ *   chunked path (many, embd, BranchStore::decode_scatter, decode_segments)
+ *   may have committed chunks before the one that failed, and the branch's
+ *   books never move on failure.
  *
- * The rule, true at every throw site: the branch is intact iff
- * `rc == 1 && !partial` — retry once the KV has room. Anything else ⇒ prune
- * the branch and replay onto a fresh one.
+ * The rule, true at every throw site: the branch is INTACT iff the failing
+ * call restored state (rc is 1 or -1) and nothing before it landed
+ * (!partial). Intact with rc 1 is a capacity wait — retry when the KV has
+ * room; intact with rc -1 is the caller's input — do not resend the same
+ * batch. Anything else ⇒ prune the branch and replay onto a fresh one.
  *
  * The binding catches this type in C++ and forwards both fields structurally;
  * the exception itself never crosses N-API.
