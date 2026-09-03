@@ -126,6 +126,22 @@ private:
 };
 
 /**
+ * The context's batch is a hard limit: the pinned llama.cpp asserts
+ * `n_tokens <= n_batch` inside llama_decode — an abort, not an rc. Chunk
+ * sizes come from the caller (a branch's n_batch, a free function's
+ * argument), so every primitive below checks the batch it is about to build
+ * against the context first. An oversize chunk is a clear error; it is never
+ * a dead process.
+ */
+inline void require_fits_batch(llama_context* ctx, int32_t n_tokens, const char* who) {
+  const int32_t limit = static_cast<int32_t>(llama_n_batch(ctx));
+  if (n_tokens > limit) {
+    throw std::runtime_error(std::string(who) + " - a batch of " + std::to_string(n_tokens) +
+                             " tokens exceeds the context's n_batch (" + std::to_string(limit) + ")");
+  }
+}
+
+/**
  * @brief Decode multiple tokens into the KV cache with auto-chunking
  *
  * Orchestration logic:
@@ -198,6 +214,7 @@ private:
   if (n_batch <= 0) {
     throw std::runtime_error("decode::many - n_batch must be positive");
   }
+  require_fits_batch(ctx, std::min(n_batch, n_tokens), "decode::many");
 
   // Thread-local batch avoids per-call allocation. Grows if needed, never shrinks.
   struct ThreadLocalBatch {
@@ -427,6 +444,7 @@ struct Scratch {
     throw std::runtime_error("decode::each - negative item count");
   }
   if (n == 0) return 0;
+  require_fits_batch(ctx, n, "decode::each");
 
   scratch.resize(n);
 
@@ -466,7 +484,8 @@ struct Scratch {
  * @return 0 on success, non-zero on failure
  * @throws std::runtime_error if ctx is NULL or items are invalid
  *
- * @note Does NOT auto-chunk. Total tokens must fit in n_batch.
+ * @note Does NOT auto-chunk. A total beyond the context's n_batch is refused
+ *       (require_fits_batch), never dispatched.
  *
  * @see many() for single-sequence multi-token decode with auto-chunking
  * @see each() for single-token-per-sequence variant
@@ -488,6 +507,7 @@ struct Scratch {
     total += static_cast<int32_t>(items[i].tokens.size());
   }
   if (total == 0) return 0;
+  require_fits_batch(ctx, total, "decode::scatter");
 
   scratch.resize(total);
 
@@ -711,6 +731,7 @@ struct SegmentSource {
 
   const int32_t n    = item.n_rows;
   const int32_t nppe = item.n_pos_per_embd;
+  require_fits_batch(ctx, std::min(n_batch, n), "decode::embd");
 
   // A non-causal block is bidirectional: every row must be able to attend to
   // every other row, which only holds if they share one forward pass. The

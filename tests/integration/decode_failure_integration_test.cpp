@@ -328,6 +328,41 @@ TEST_CASE("decode failure: a segment after a landed one reports partial even whe
   llama_free(ctx);
 }
 
+TEST_CASE("decode failure: a chunk larger than the context's batch is refused, never dispatched") {
+  // The pinned llama.cpp asserts n_tokens <= n_batch inside llama_decode — an
+  // abort, not an rc. Chunk sizes come from the caller (a branch's n_batch,
+  // a free function's argument), so a caller that overshoots the context's
+  // batch must be refused by the kernel before the batch is built.
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  llama_context* ctx = small_ctx(model.get(), 256, 32, 2);   // the context's batch is 32
+  REQUIRE(ctx);
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+  TestParams params;
+  const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+
+  BranchHandle h = create(ctx, model.get(), store, 0, params, /*n_batch*/ 64);  // the branch asks for 64
+  REQUIRE(h != INVALID_HANDLE);
+  const auto toks = filler(64, 1000, n_vocab);
+  CHECK_THROWS_WITH(prefill(h, toks.data(), toks.size(), store),
+                    doctest::Contains("exceeds the context's n_batch"));
+  CHECK(get_position(h, store) == 0);
+  CHECK(kv::pos_max(ctx, store.get(h)->seq_id) == -1);
+
+  // A chunk that fits is unaffected.
+  const auto small = filler(32, 2000, n_vocab);
+  CHECK_NOTHROW(prefill(h, small.data(), small.size(), store));
+  CHECK(get_position(h, store) == 32);
+
+  prune(h, store);
+  store.drain();
+  llama_free(ctx);
+}
+
 TEST_CASE("decode failure: a repeated handle is refused before anything is dispatched, in both cohorts") {
   // One rule for every path that batches by handle (require_distinct_handles):
   // decode_each used to state none and put two tokens on one cell; the KV is
@@ -459,24 +494,30 @@ TEST_CASE("decode failure: an image whose rows outrun the KV reports partial on 
   }
   REQUIRE(n_rows > 24);  // room for a first 16-row chunk to land and a later one to fail
 
-  llama_context* ctx = small_ctx(model.get(), 256, 16, 2);
+  // The context takes whole batches (256); the IMAGE branch chunks its rows
+  // by its own n_batch of 16, so a later chunk can fail while earlier ones
+  // stand. Batch and micro-batch agree, so a chunk is one llama_decode.
+  llama_context* ctx = small_ctx(model.get(), 256, 256, 2);
   REQUIRE(ctx);
   BranchStore store(8);
   store.init_tenancy(ctx);
   TestParams params;
   const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
 
-  // Leave the image exactly (n_rows - 8) free cells: its first 16-row chunk
-  // lands, a later one cannot. The filler rides the branch's own n_batch.
-  const int32_t free_for_rows = n_rows - 8;
-  const int32_t fill = 256 - text_before - free_for_rows;
-  REQUIRE(fill > 0);
+  // Leave the image fewer free cells than it has rows — (n_rows - 8) when
+  // the pool could otherwise hold it, and no padding at all when the image
+  // alone outruns the pool (a dynamic-resolution projector on this fixture).
+  // Either way its first 16-row chunk lands and a later one cannot.
+  const int32_t fill = std::max(0, 256 - text_before - (n_rows - 8));
+  REQUIRE(256 - text_before - fill >= 16);
 
   BranchHandle h = create(ctx, model.get(), store, 0, params, 16);
   REQUIRE(h != INVALID_HANDLE);
   const llama_seq_id seq = store.get(h)->seq_id;
-  const auto pad = filler(fill, 1000, n_vocab);
-  prefill(h, pad.data(), pad.size(), store);
+  if (fill > 0) {
+    const auto pad = filler(fill, 1000, n_vocab);
+    prefill(h, pad.data(), pad.size(), store);
+  }
   REQUIRE(get_position(h, store) == fill);
 
   MtmdSource source(mtmd.get(), prompt, images, std::span<const llama_token>(), n_embd_inp);
@@ -487,13 +528,29 @@ TEST_CASE("decode failure: an image whose rows outrun the KV reports partial on 
 
   // The text before the image landed and moved the books; the image's rows
   // that landed did not (decode_embd's books move only on success), so the
-  // KV sits ahead of the branch — poisoned, and prune reclaims it.
+  // KV holds cells the books do not admit to — poisoned. Position is not the
+  // witness here: an M-RoPE projector holds every row at ONE temporal
+  // position, so pos_max cannot count rows. The pool can: a prefill sized
+  // to the books' idea of free space must fail while the orphans stand.
   CHECK(get_position(h, store) == fill + text_before);
   CHECK(store.kv_pressure().cells_used == static_cast<uint32_t>(fill + text_before));
-  CHECK(kv::pos_max(ctx, seq) >= fill + text_before + 16 - 1);
+  const int32_t claimed_free = 256 - (fill + text_before);
+  BranchHandle probe = create(ctx, model.get(), store, 0, params, 256);  // one chunk: all or nothing
+  REQUIRE(probe != INVALID_HANDLE);
+  const auto probe_toks = filler(claimed_free - 15, 7000, n_vocab);       // fits iff < 16 rows landed
+  const Caught blocked = attempt([&] { prefill(probe, probe_toks.data(), probe_toks.size(), store); });
+  CHECK(blocked.threw);
+  CHECK(blocked.rc == 1);
+  CHECK(blocked.partial == false);
+  CHECK(get_position(probe, store) == 0);
 
+  // Prune reclaims the poisoned branch whole — text and orphaned rows — and
+  // the same prefill now lands.
   prune(h, store);
   CHECK(kv::pos_max(ctx, seq) == -1);
+  CHECK_NOTHROW(prefill(probe, probe_toks.data(), probe_toks.size(), store));
+  CHECK(get_position(probe, store) == static_cast<llama_pos>(probe_toks.size()));
+  prune(probe, store);
   CHECK(store.kv_pressure().cells_used == 0);
   store.drain();
   llama_free(ctx);
