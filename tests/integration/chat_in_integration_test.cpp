@@ -1039,3 +1039,64 @@ TEST_CASE("ChatIn Integration: warm multi-turn conversation with semantic recall
     MESSAGE("WARM MULTI-TURN VERIFIED: Context survives across 4 warm turns");
   }
 }
+
+// ===== REASONING DECLARATION SURVIVES EVERY CONVERSATION SHAPE =====
+
+TEST_CASE("ChatIn Integration: a system-only format declares reasoning like a full one") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard backend;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model != nullptr);
+
+  const std::string tools = json::array({
+    {{"type", "function"}, {"function", {
+      {"name", "report"},
+      {"description", "Submit findings"},
+      {"parameters", {{"type", "object"}, {"properties", {{"result", {{"type", "string"}}}}}}}
+    }}}
+  }).dump();
+
+  // What an agent's own suffix is formatted from: a conversation every template accepts.
+  lloyal::chat_in::FormatInputs full;
+  full.messages_json = json::array({
+    {{"role", "system"}, {"content", "You research."}},
+    {{"role", "user"}, {"content", "Report now."}}
+  }).dump();
+  full.tools_json = tools;
+  auto reference = lloyal::chat_in::format(model.get(), full);
+
+  if (!reference.supports_thinking) {
+    MESSAGE("SKIP: this template declares no reasoning section — nothing to compare");
+    return;
+  }
+
+  // What a shared spine is formatted from: a system turn alone, no generation prompt.
+  // Qwen's template REFUSES this (it requires a user), so it takes the synthetic-user
+  // retry — which once reported the prompt, grammar and parser but none of the reasoning
+  // declaration. Every agent sharing that spine inherited an empty tag, and a consumer
+  // repairing a reasoning envelope had nothing to repair it with.
+  lloyal::chat_in::FormatInputs spine;
+  spine.messages_json = json::array({
+    {{"role", "system"}, {"content", "You research."}}
+  }).dump();
+  spine.tools_json = tools;
+  spine.add_generation_prompt = false;
+  auto shared = lloyal::chat_in::format(model.get(), spine);
+
+  CHECK(!shared.prompt.empty());
+  CHECK(shared.supports_thinking == reference.supports_thinking);
+  CHECK(shared.thinking_start_tag == reference.thinking_start_tag);
+  CHECK(shared.thinking_end_tag == reference.thinking_end_tag);
+  CHECK(!shared.thinking_end_tag.empty());
+
+  // The contradiction that shipped: a format that opens a reasoning block in its own
+  // generation prompt while declaring it renders none.
+  if (!shared.generation_prompt.empty() && !shared.thinking_start_tag.empty() &&
+      shared.generation_prompt.find(shared.thinking_start_tag) != std::string::npos) {
+    CHECK(shared.supports_thinking);
+  }
+
+  MESSAGE("spine: supports_thinking=" << shared.supports_thinking
+          << " end_tag=\"" << shared.thinking_end_tag << "\"");
+}

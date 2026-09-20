@@ -402,6 +402,13 @@ inline FormatResult format(const llama_model *model, const FormatInputs& inputs)
             result.grammar_triggers = params.grammar_triggers;
             result.preserved_tokens = params.preserved_tokens;
             result.parser = params.parser;
+            // The template's reasoning declaration is a property of the TEMPLATE, not of the
+            // conversation shape that reached it: a system-only turn takes this retry, and
+            // dropping these left `supports_thinking` false beside a generation prompt that
+            // opens a reasoning block — a contradiction a consumer cannot repair.
+            result.supports_thinking = params.supports_thinking;
+            result.thinking_start_tag = params.thinking_start_tag;
+            result.thinking_end_tag = params.thinking_end_tag;
             result.reasoning_format = tmpl_inputs.reasoning_format;
 
             LLOYAL_LOG_DEBUG(
