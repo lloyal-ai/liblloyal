@@ -112,6 +112,9 @@ struct common_chat_params {
   std::string grammar;
   bool grammar_lazy = false;
   std::string generation_prompt;
+  bool supports_thinking = false;
+  std::string thinking_start_tag;
+  std::string thinking_end_tag;
   std::vector<common_grammar_trigger> grammar_triggers;
   std::vector<std::string> preserved_tokens;
   std::vector<std::string> additional_stops;

@@ -69,7 +69,7 @@ struct FormatInputs {
   std::string tools_json = "";                     ///< JSON array of OpenAI-format tool definitions
   std::string tool_choice = "auto";                ///< "auto" | "required" | "none"
   bool parallel_tool_calls = false;                ///< Allow parallel tool calls
-  std::string reasoning_format = "none";           ///< "none" | "auto" | "deepseek" | "deepseek_legacy"
+  std::string reasoning_format = "auto";           ///< "none" | "auto" | "deepseek" | "deepseek_legacy" — "auto" pairs with enable_thinking: reasoning parsed apart from content
   bool enable_thinking = true;                     ///< Enable <think> blocks (pairs with reasoning_format)
   std::string json_schema = "";                    ///< JSON schema for structured output
   std::string grammar = "";                        ///< Explicit GBNF grammar string
@@ -94,6 +94,9 @@ struct FormatResult {
   std::vector<common_grammar_trigger> grammar_triggers; ///< Triggers for lazy grammar activation
   std::vector<std::string> preserved_tokens;       ///< Tokens to preserve during grammar constraining
   std::string parser;                              ///< PEG parser definition (for PEG formats)
+  bool supports_thinking = false;                  ///< Template renders a reasoning section
+  std::string thinking_start_tag;                  ///< Tag the template opens reasoning with (empty if none)
+  std::string thinking_end_tag;                    ///< Tag it closes with — Qwen "</think>", Magistral "[/THINK]"
 
   // Carried through for chat_out pairing
   common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_NONE; ///< Reasoning format for output parsing
@@ -270,6 +273,9 @@ inline FormatResult format(const llama_model *model, const FormatInputs& inputs)
       result.grammar_triggers = params.grammar_triggers;
       result.preserved_tokens = params.preserved_tokens;
       result.parser = params.parser;
+      result.supports_thinking = params.supports_thinking;
+      result.thinking_start_tag = params.thinking_start_tag;
+      result.thinking_end_tag = params.thinking_end_tag;
 
       // Carry reasoning_format through for chat_out pairing
       result.reasoning_format = tmpl_inputs.reasoning_format;
@@ -396,6 +402,13 @@ inline FormatResult format(const llama_model *model, const FormatInputs& inputs)
             result.grammar_triggers = params.grammar_triggers;
             result.preserved_tokens = params.preserved_tokens;
             result.parser = params.parser;
+            // The template's reasoning declaration is a property of the TEMPLATE, not of the
+            // conversation shape that reached it: a system-only turn takes this retry, and
+            // dropping these left `supports_thinking` false beside a generation prompt that
+            // opens a reasoning block — a contradiction a consumer cannot repair.
+            result.supports_thinking = params.supports_thinking;
+            result.thinking_start_tag = params.thinking_start_tag;
+            result.thinking_end_tag = params.thinking_end_tag;
             result.reasoning_format = tmpl_inputs.reasoning_format;
 
             LLOYAL_LOG_DEBUG(
