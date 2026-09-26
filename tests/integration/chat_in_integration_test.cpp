@@ -623,6 +623,59 @@ TEST_CASE("ChatIn Integration: content_parts array") {
   CHECK(result.prompt.find("world") != std::string::npos);
 }
 
+// The empty-system strip heuristic completes an intent: a system message with
+// EMPTY content means "no system prompt", so the rendered empty block is
+// removed. A parts-based system message is the trap — parts live in
+// content_parts while the content STRING stays empty, so it looks identical to
+// a suppression request while being a real system prompt.
+//
+// This asserts the END-TO-END property (a parts-based system prompt survives),
+// NOT the content_parts guard in isolation. Verified by mutation: deleting
+// `&& messages[0].content_parts.empty()` leaves this case passing, because the
+// strip is prevented TWICE. The guard stops the attempt; the prefix-equality
+// check that follows (`prompt.substr(0, sys_prefix.size()) == sys_prefix`)
+// stops the damage, and a system block rendering real text can never equal the
+// empty-system prefix. The guard is the cheaper of the two and states the
+// intent, so it stays — but a test cannot discriminate it through this seam
+// while the second line of defence holds. What this case does catch is a
+// template or heuristic change that makes the prefix match after all.
+TEST_CASE("ChatIn Integration: system content_parts is not mistaken for empty") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard backend;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model != nullptr);
+
+  lloyal::chat_in::FormatInputs inputs;
+  inputs.messages_json = json::array({
+    {{"role", "system"}, {"content", json::array({
+      {{"type", "text"}, {"text", "SYSTEMSENTINEL directive."}}
+    })}},
+    {{"role", "user"}, {"content", "USERSENTINEL"}}
+  }).dump();
+
+  auto result = lloyal::chat_in::format(model.get(), inputs);
+
+  CHECK(!result.prompt.empty());
+  CHECK_MESSAGE(result.prompt.find("SYSTEMSENTINEL") != std::string::npos,
+                "a parts-based system message must survive the empty-system strip");
+  CHECK(result.prompt.find("USERSENTINEL") != std::string::npos);
+
+  // Both routes matter: templates that reject a system-only conversation take a
+  // retry path that re-applies and subtracts a rendered suffix. Exercise the
+  // system-only shape too, so the guard is covered on that route as well.
+  lloyal::chat_in::FormatInputs sys_only;
+  sys_only.messages_json = json::array({
+    {{"role", "system"}, {"content", json::array({
+      {{"type", "text"}, {"text", "SOLOSENTINEL directive."}}
+    })}}
+  }).dump();
+
+  auto solo = lloyal::chat_in::format(model.get(), sys_only);
+  CHECK_MESSAGE(solo.prompt.find("SOLOSENTINEL") != std::string::npos,
+                "system-only parts message must survive the retry route too");
+}
+
 TEST_CASE("ChatIn Integration: warm continuation with tool messages") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
@@ -985,4 +1038,65 @@ TEST_CASE("ChatIn Integration: warm multi-turn conversation with semantic recall
   if (name_recalled && food_recalled) {
     MESSAGE("WARM MULTI-TURN VERIFIED: Context survives across 4 warm turns");
   }
+}
+
+// ===== REASONING DECLARATION SURVIVES EVERY CONVERSATION SHAPE =====
+
+TEST_CASE("ChatIn Integration: a system-only format declares reasoning like a full one") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard backend;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model != nullptr);
+
+  const std::string tools = json::array({
+    {{"type", "function"}, {"function", {
+      {"name", "report"},
+      {"description", "Submit findings"},
+      {"parameters", {{"type", "object"}, {"properties", {{"result", {{"type", "string"}}}}}}}
+    }}}
+  }).dump();
+
+  // What an agent's own suffix is formatted from: a conversation every template accepts.
+  lloyal::chat_in::FormatInputs full;
+  full.messages_json = json::array({
+    {{"role", "system"}, {"content", "You research."}},
+    {{"role", "user"}, {"content", "Report now."}}
+  }).dump();
+  full.tools_json = tools;
+  auto reference = lloyal::chat_in::format(model.get(), full);
+
+  if (!reference.supports_thinking) {
+    MESSAGE("SKIP: this template declares no reasoning section — nothing to compare");
+    return;
+  }
+
+  // What a shared spine is formatted from: a system turn alone, no generation prompt.
+  // Qwen's template REFUSES this (it requires a user), so it takes the synthetic-user
+  // retry — which once reported the prompt, grammar and parser but none of the reasoning
+  // declaration. Every agent sharing that spine inherited an empty tag, and a consumer
+  // repairing a reasoning envelope had nothing to repair it with.
+  lloyal::chat_in::FormatInputs spine;
+  spine.messages_json = json::array({
+    {{"role", "system"}, {"content", "You research."}}
+  }).dump();
+  spine.tools_json = tools;
+  spine.add_generation_prompt = false;
+  auto shared = lloyal::chat_in::format(model.get(), spine);
+
+  CHECK(!shared.prompt.empty());
+  CHECK(shared.supports_thinking == reference.supports_thinking);
+  CHECK(shared.thinking_start_tag == reference.thinking_start_tag);
+  CHECK(shared.thinking_end_tag == reference.thinking_end_tag);
+  CHECK(!shared.thinking_end_tag.empty());
+
+  // The contradiction that shipped: a format that opens a reasoning block in its own
+  // generation prompt while declaring it renders none.
+  if (!shared.generation_prompt.empty() && !shared.thinking_start_tag.empty() &&
+      shared.generation_prompt.find(shared.thinking_start_tag) != std::string::npos) {
+    CHECK(shared.supports_thinking);
+  }
+
+  MESSAGE("spine: supports_thinking=" << shared.supports_thinking
+          << " end_tag=\"" << shared.thinking_end_tag << "\"");
 }

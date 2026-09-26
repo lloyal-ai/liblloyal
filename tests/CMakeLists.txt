@@ -176,7 +176,9 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
     integration/logits_integration_test.cpp
     integration/branch_integration_test.cpp
     integration/kv_pressure_integration_test.cpp
+    integration/decode_failure_integration_test.cpp
     integration/contrastive_logits_test.cpp
+    integration/multimodal_integration_test.cpp
   )
 
   # Create llama/ subdirectory and symlink headers so #include <llama/llama.h> works
@@ -203,6 +205,12 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
     ${GGML_INCLUDE_DIR}                     # ggml headers
     ${LLAMA_CPP_COMMON_DIR}                 # common library headers (common.h, chat.h, etc.)
     ${LLAMA_CPP_VENDOR_DIR}                 # vendor headers (nlohmann/json.hpp)
+    ${LLAMA_CPP_DIR}/tools/mtmd             # mtmd.h, mtmd-helper.h
+  )
+
+  # Fixture path (test images), so the runner works from any directory
+  target_compile_definitions(IntegrationRunner PRIVATE
+    LLOYAL_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
   )
 
   # Find common library (static)
@@ -290,6 +298,28 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
   find_library(GGML_LIB NAMES ggml PATHS ${LLAMA_CPP_DYLIB_DIR} NO_DEFAULT_PATH)
   find_library(GGML_BASE_LIB NAMES ggml-base PATHS ${LLAMA_CPP_DYLIB_DIR} NO_DEFAULT_PATH)
 
+  # mtmd — multimodal codec, required by <lloyal/mtmd.hpp>. Not built by
+  # default: llama.cpp leaves LLAMA_BUILD_TOOLS off, so tools/mtmd declares no
+  # targets. Must come from the SAME build tree as libllama above.
+  find_library(MTMD_LIB
+    NAMES mtmd
+    PATHS
+      ${LLAMA_CPP_DYLIB_DIR}/tools/mtmd
+      ${LLAMA_CPP_DYLIB_DIR}
+    NO_DEFAULT_PATH
+  )
+  if(NOT MTMD_LIB)
+    message(FATAL_ERROR
+      "libmtmd not found — the multimodal integration tests need it.\n"
+      "Build it in the same tree as libllama:\n"
+      "  cmake ${LLAMA_CPP_BUILD_DIR} -DLLAMA_BUILD_TOOLS=ON -DMTMD_VIDEO=OFF\n"
+      "  cmake --build ${LLAMA_CPP_BUILD_DIR} --target mtmd\n"
+      "Searched:\n"
+      "  - ${LLAMA_CPP_DYLIB_DIR}/tools/mtmd\n"
+      "  - ${LLAMA_CPP_DYLIB_DIR}")
+  endif()
+  message(STATUS "mtmd library: ${MTMD_LIB}")
+
   set(LLAMA_LIBS ${LLAMA_LIB})
   if(GGML_LIB)
     list(APPEND LLAMA_LIBS ${GGML_LIB})
@@ -297,6 +327,8 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
   if(GGML_BASE_LIB)
     list(APPEND LLAMA_LIBS ${GGML_BASE_LIB})
   endif()
+  # mtmd calls into llama/ggml, so it precedes them in the link line.
+  list(PREPEND LLAMA_LIBS ${MTMD_LIB})
 
   # Link order: common before common-base (common calls into base); base before
   # libllama.dylib (which provides ggml symbols that base may reference).
@@ -355,6 +387,10 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
   add_test(NAME integration_tests COMMAND IntegrationRunner)
   set_tests_properties(integration_tests PROPERTIES
     LABELS "integration;llama"
-    TIMEOUT 180
+    # Real inference, not stubs: the suite decodes on an actual model for every
+    # case, and the multimodal cases add image encodes on top. ~5 min on Metal,
+    # several times that on a CPU-only runner. 180s killed runs that pass when
+    # IntegrationRunner is invoked directly.
+    TIMEOUT 1800
   )
 endif()

@@ -88,8 +88,12 @@ llama_memory_t llama_get_memory(llama_context * /*ctx*/) {
   return g_memory_handle;
 }
 
-bool llama_memory_seq_rm(llama_memory_t /*mem*/, llama_seq_id /*seq*/,
-                         llama_pos /*p0*/, llama_pos /*p1*/) {
+bool llama_memory_seq_rm(llama_memory_t /*mem*/, llama_seq_id seq,
+                         llama_pos p0, llama_pos p1) {
+  g_stub_config.seq_rm_called = true;
+  g_stub_config.seq_rm_seq = seq;
+  g_stub_config.seq_rm_p0 = p0;
+  g_stub_config.seq_rm_p1 = p1;
   return g_stub_config.rm_ok;
 }
 
@@ -254,7 +258,16 @@ int llama_decode(llama_context * /*ctx*/, llama_batch batch) {
     // If already -2 (mixed), leave it as -2
   }
 
+  if (g_stub_config.decode_fail_on_call > 0 &&
+      g_stub_config.decode_call_count == g_stub_config.decode_fail_on_call) {
+    return g_stub_config.decode_fail_rc;
+  }
   return g_stub_config.decode_result;
+}
+
+void llama_set_causal_attn(llama_context * /*ctx*/, bool causal) {
+  g_stub_config.causal_attn = causal;
+  g_stub_config.causal_attn_log.push_back(causal);
 }
 
 // ===== TOKENIZATION OPERATIONS =====
@@ -356,7 +369,15 @@ int llama_token_to_piece(const llama_vocab *vocab, llama_token /*token*/,
 static llama_vocab g_vocab_handle;
 
 uint32_t llama_n_batch(const llama_context * /*ctx*/) {
-  return 512;  // Default batch size
+  return g_stub_config.n_batch;
+}
+
+uint32_t llama_n_ubatch(const llama_context * /*ctx*/) {
+  return g_stub_config.n_ubatch;
+}
+
+int32_t llama_model_n_embd_inp(const llama_model * /*model*/) {
+  return g_stub_config.n_embd_inp;
 }
 
 float *llama_get_logits_ith(llama_context * /*ctx*/, int32_t /*i*/) {

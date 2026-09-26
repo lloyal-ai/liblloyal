@@ -124,6 +124,9 @@ extern "C" {
     // Decode operations
     int llama_decode(llama_context* ctx, llama_batch batch);
 
+    // Attention mode (used by the embedding rail's non-causal bracket)
+    void llama_set_causal_attn(llama_context* ctx, bool causal);
+
     // Tokenization operations
     int llama_tokenize(
         const llama_vocab* vocab,
@@ -156,6 +159,7 @@ extern "C" {
 
     // Context parameters
     uint32_t llama_n_batch(const llama_context* ctx);
+    uint32_t llama_n_ubatch(const llama_context* ctx);
 
     // Sampling operations
     float* llama_get_logits_ith(llama_context* ctx, int32_t i);
@@ -206,6 +210,7 @@ extern "C" {
 
     // Model introspection (for vendored common_sampler)
     const llama_model* llama_get_model(const llama_context* ctx);
+    int32_t llama_model_n_embd_inp(const llama_model* model);
 
     // Embedding operations
     int32_t llama_model_n_embd(const llama_model* model);
@@ -235,6 +240,13 @@ struct LlamaStubConfig {
     llama_pos pos_max = -1;                    // Max position in KV cache (-1 = empty)
     bool rm_ok = true;                         // Whether llama_memory_seq_rm succeeds
 
+    // Sequence removal tracking — mirrors the seq_cp fields below, so a test
+    // can assert that a failed decode rolled back exactly what it wrote.
+    bool seq_rm_called = false;
+    llama_seq_id seq_rm_seq = -1;
+    llama_pos seq_rm_p0 = -1;
+    llama_pos seq_rm_p1 = -1;
+
     // Sequence copy tracking (System 2)
     bool seq_cp_called = false;
     llama_seq_id seq_cp_src = -1;
@@ -256,9 +268,32 @@ struct LlamaStubConfig {
 
     // Batch/Decode operations
     bool batch_init_succeeds = true;           // Controls if llama_batch_init succeeds
-    int decode_result = 0;                     // 0=success, <0=failure
+    int decode_result = 0;                     // 0=success, <0=failure (every call)
     int decode_call_count = 0;                 // Track number of decode calls
+    // Fail exactly ONE call — the Nth (1-based) — with `decode_fail_rc`, so a
+    // test can put the failure on a LATER chunk of a chunked operation and
+    // assert what the earlier chunks left behind. 0 = disabled.
+    int decode_fail_on_call = 0;
+    int decode_fail_rc = 1;                    // llama.h: 1 = no KV slot for the batch
     int batch_free_call_count = 0;             // Track RAII cleanup
+
+    // Causal-attention bracket (decode::embd for non-causal projectors).
+    // `causal_attn` is the live state; the log records every transition so a
+    // test can assert the bracket opened before the decode and closed after —
+    // including on the error path.
+    bool causal_attn = true;
+    std::vector<bool> causal_attn_log;
+
+    // Batch geometry reported by llama_n_batch / llama_n_ubatch. Settable so a
+    // test can force an oversized non-causal block, which decode::embd must
+    // reject rather than silently split across dispatches.
+    uint32_t n_batch = 512;
+    uint32_t n_ubatch = 512;
+
+    // Row width the resident model expects, as reported by
+    // llama_model_n_embd_inp. 0 means "no opinion" — decode::embd then skips
+    // the width check, which is what most stub tests want.
+    int32_t n_embd_inp = 0;
 
     // Sequence ID tracking (for multi-sequence tests)
     llama_seq_id last_batch_seq_id = -1;       // Last seq_id seen in batch (first token)

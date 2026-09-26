@@ -64,7 +64,27 @@ inline ggml_type from_str(const std::string& s) {
  * @brief Remove token range from KV cache sequence
  *
  * Removes tokens in the range [p0, p1) from the specified sequence's KV cache.
- * Used for selective eviction in context window management.
+ *
+ * @warning LANDMINE — a PARTIAL range is only meaningful on attention layers.
+ *
+ * The signature offers p0/p1, so rewinding a sequence to an earlier point
+ * looks like a supported operation. On attention it is: cells are per
+ * position, and removing a tail removes them. On a RECURRENT or hybrid model
+ * there is no per-position cell — the carrier has already folded every prior
+ * token into fixed-size state, so there is nothing at [p0, p1) to remove.
+ *
+ * llama.cpp will rewind a recurrent sequence only where the model keeps
+ * per-token snapshots, bounded by n_rs_seq, and returns false otherwise.
+ * Qwen3.5's Gated DeltaNet — the default model — reports rs_seq = 0, so every
+ * partial rewind there fails. NEVER discard this function's return value: a
+ * caller that ignores it gets attention rolled back, the carrier untouched,
+ * and no indication the two now disagree. That is a silent wrong answer, the
+ * worst failure mode available.
+ *
+ * Whole-sequence removal (0, -1) is safe everywhere and is what tenancy uses.
+ * To correct a lineage, do NOT rewind it: replay the content onto a fresh
+ * sequence. Replay re-runs the folds, which is why it is the portable form
+ * and keeps working when the layer type changes underneath you.
  *
  * @param ctx Llama context (must not be null)
  * @param seq Sequence ID (use 0 for single-sequence mode)
@@ -134,6 +154,13 @@ inline llama_pos pos_max(llama_context *ctx, llama_seq_id seq) {
  * @param p1 End position (exclusive), default -1 for "to end"
  *
  * @note Use case: Multi-sequence search (fork from trunk without copying model weights)
+ *
+ * @warning The same landmine as remove_range(): p0/p1 make a PARTIAL prefix
+ *          copy look available, and it slices attention layers correctly
+ *          while producing garbage on recurrent ones — back-dating a fork
+ *          point cannot work where the carrier has already folded the tokens
+ *          you are trying to exclude. Copy whole sequences; to start from an
+ *          earlier point, replay the content onto a fresh one.
  */
 inline void seq_cp(llama_context *ctx, llama_seq_id src, llama_seq_id dst,
                    llama_pos p0 = 0, llama_pos p1 = -1) {
