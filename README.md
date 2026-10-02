@@ -7,6 +7,8 @@
 
 **A kernel for Vertical Inference — Git-like tree ops for live inference state**
 
+<a href="https://www.producthunt.com/products/lloyal?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-lloyal" target="_blank" rel="noopener noreferrer"><img alt="Lloyal - Turn open-weight models into AI apps people can download | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1265797&amp;theme=light&amp;t=1790954564828"></a>
+
 A KV cache already holds everything the model has read. Git-like branching is what turns that into structure you can work with: fork a generation at any point, and the child inherits every token before it while diverging under its own sampler, seed, grammar and constraints. The shared prefix is never recomputed — only the divergence costs anything.
 
 So the operations are the ones you already know:
