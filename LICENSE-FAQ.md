@@ -20,7 +20,7 @@ project on a list of approved use cases.
 **Yes.** You can build, distribute, sell, license and host applications using
 Lloyal.
 
-The [Lloyal Harness Builder Grant](https://github.com/lloyal-ai/hdk/blob/main/GRANT.md)
+The [Lloyal Harness Builder Grant](https://github.com/lloyal-ai/hdk/blob/b9cf6d87c3523208dc38964845ed19d115b19a65/GRANT.md)
 expressly protects this permission—even when your application competes directly
 with an application or service offered by Lloyal Labs.
 
@@ -60,6 +60,6 @@ Builder Grant. Each version becomes available under Apache 2.0 two years after
 that version is first made available.
 
 This FAQ explains the terms. The
-[LICENSE](https://github.com/lloyal-ai/liblloyal/blob/main/LICENSE) and
-[GRANT](https://github.com/lloyal-ai/liblloyal/blob/main/GRANT.md) contain the
+[LICENSE](https://github.com/lloyal-ai/liblloyal/blob/4858217cd33a1f55266315160cc490fd6008d725/LICENSE) and
+[GRANT](https://github.com/lloyal-ai/liblloyal/blob/4858217cd33a1f55266315160cc490fd6008d725/GRANT.md) contain the
 governing text.
