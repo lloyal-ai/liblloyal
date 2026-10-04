@@ -20,7 +20,7 @@ project on a list of approved use cases.
 **Yes.** You can build, distribute, sell, license and host applications using
 Lloyal.
 
-The [Lloyal Harness Builder Grant](https://github.com/lloyal-ai/hdk/blob/b9cf6d87c3523208dc38964845ed19d115b19a65/GRANT.md)
+The [Lloyal Harness Builder Grant](https://github.com/lloyal-ai/hdk/blob/c1632c51a4e42393b2ad5828a66c1c7b48ff487c/GRANT.md)
 expressly protects this permission—even when your application competes directly
 with an application or service offered by Lloyal Labs.
 
@@ -38,8 +38,8 @@ commercially making the covered software available as:
   applications.
 - A managed or hosted service providing the covered runtime's functionality to
   third-party developers.
-- A general distribution channel, registry or marketplace for HDK Apps, other
-  than Lloyal's canonical channel, offered to third-party Harness developers.
+- A general distribution channel, registry or marketplace for Lloyal abilities,
+  other than Lloyal's canonical channel, offered to third-party Harness developers.
 
 Hosting your own application for its users is permitted. So are private
 distribution within your organization, distribution to your customers as part
@@ -61,5 +61,5 @@ that version is first made available.
 
 This FAQ explains the terms. The
 [LICENSE](https://github.com/lloyal-ai/liblloyal/blob/4858217cd33a1f55266315160cc490fd6008d725/LICENSE) and
-[GRANT](https://github.com/lloyal-ai/liblloyal/blob/4858217cd33a1f55266315160cc490fd6008d725/GRANT.md) contain the
+[GRANT](https://github.com/lloyal-ai/liblloyal/blob/c3fe93dfecf498f997be1925307fad15f14532d3/GRANT.md) contain the
 governing text.

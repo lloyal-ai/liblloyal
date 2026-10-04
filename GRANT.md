@@ -40,8 +40,8 @@ desktop application, mobile application, CLI tool, server application, embedded
 or on-device system, or a hosted product whose backend uses the Software to
 serve that product's own end users.
 
-An **"App"** is a capability bundle conforming to the HDK App protocol (a
-manifest, Source, Tools, and/or skill template validated by the App protocol),
+An **"Ability"** is a capability bundle conforming to the HDK Ability protocol (a
+manifest, Source, Tools, and/or skill template validated by the Ability protocol),
 whether distributed through the canonical channel, distributed privately, or
 used internally.
 
@@ -50,28 +50,28 @@ used internally.
 For each version of the Software this Grant covers, we irrevocably grant you
 the following, on no conditions beyond those already in the License:
 
-**3.1 Harnesses and Apps are always a Permitted Purpose.** Building,
+**3.1 Harnesses and Abilities are always a Permitted Purpose.** Building,
 distributing, selling, licensing, hosting, and otherwise commercializing a
-Harness or an App is a Permitted Purpose under the License and is **never a
+Harness or an Ability is a Permitted Purpose under the License and is **never a
 Competing Use** — regardless of any overlap in category, functionality,
 market, audience, or business model with any product or service offered by
 Lloyal, now or in the future, including without limitation **reasoning.run**,
-Lloyal's first-party Apps, and any vertical or industry deployment by Lloyal.
+Lloyal's first-party Abilities, and any vertical or industry deployment by Lloyal.
 
 For clarity: a commercial deep-research product, a medical-practice product, a
 product in any category Lloyal occupies or later enters — all are Permitted
-Purposes when built as a Harness or App.
+Purposes when built as a Harness or Ability.
 
 **3.2 Internal and private distribution is always a Permitted Purpose.**
 Operating a private registry, mirror, or distribution mechanism to deploy
-Harnesses and Apps **within your own organization or to your own customers as
-part of your Harness** is a Permitted Purpose and is not an "alternative App
+Harnesses and Abilities **within your own organization or to your own customers as
+part of your Harness** is a Permitted Purpose and is not an "alternative Ability
 distribution channel" or other Competing Use.
 
 **3.3 Plugin systems of a Harness are out of scope.** A Harness's own
 extension or plugin mechanism, in the Harness's own format, is part of that
 Harness. Clause 4(c) below applies only to the distribution of bundles
-conforming to the HDK App protocol to third-party Harness developers in
+conforming to the HDK Ability protocol to third-party Harness developers in
 general.
 
 ## 4. Covenant on the Meaning of Competing Use
@@ -91,7 +91,7 @@ or HDK-as-a-service). A hosted product that uses the Software to serve that
 product's own end users is a Harness under Section 2 and is permitted;
 
 **(c)** a general distribution channel, registry, or marketplace for HDK
-Apps, other than the canonical channel operated by Lloyal, offered to
+Abilities, other than the canonical channel operated by Lloyal, offered to
 third-party Harness developers. Private and internal distribution under
 Section 3.2 and Harness plugin systems under Section 3.3 are not within this
 clause.

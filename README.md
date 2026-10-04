@@ -411,9 +411,8 @@ You can build and sell commercial products using liblloyal.
 liblloyal 3.0 is source-available under FSL-1.1-Apache-2.0 and converts to
 Apache 2.0 two years after each release. The restriction is narrow: you
 cannot offer a competing HDK runtime, managed HDK service, or alternative
-HDK App distribution channel.
+ability distribution channel.
 
-See [`LICENSE-FAQ.md`](./LICENSE-FAQ.md) for concrete examples of what's
-permitted and what's restricted. See [`LICENSE`](./LICENSE) for the legal
+See [`LICENSE-FAQ.md`](./LICENSE-FAQ.md) for permissions and restrictions. See [`LICENSE`](./LICENSE) for the legal
 text and [`NOTICE`](./NOTICE) for attribution including the bundled
 llama.cpp MIT dependency.
