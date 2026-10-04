@@ -38,8 +38,9 @@ commercially making the covered software available as:
   applications.
 - A managed or hosted service providing the covered runtime's functionality to
   third-party developers.
-- A general distribution channel, registry or marketplace for HDK Apps, other
-  than Lloyal's canonical channel, offered to third-party Harness developers.
+- A general distribution channel, registry or marketplace for Lloyal abilities
+  (defined as "Apps" in the Harness Builder Grant), other than Lloyal's canonical
+  channel, offered to third-party Harness developers.
 
 Hosting your own application for its users is permitted. So are private
 distribution within your organization, distribution to your customers as part
