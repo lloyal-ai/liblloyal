@@ -1,7 +1,7 @@
 # liblloyal
 
 [![Tests](https://github.com/lloyal-ai/liblloyal/actions/workflows/tests.yml/badge.svg)](https://github.com/lloyal-ai/liblloyal/actions/workflows/tests.yml)
-[![License](https://img.shields.io/badge/license-FSL--1.1--Apache--2.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-FSL--1.1--MIT-blue.svg)](LICENSE)
 [![C++](https://img.shields.io/badge/C++-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
 [![llama.cpp](https://img.shields.io/badge/llama.cpp-pinned-green.svg)](./.llama-cpp-version)
 
@@ -406,8 +406,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 You can build and sell commercial products using liblloyal.
 
-liblloyal 3.0 is source-available under FSL-1.1-Apache-2.0 and converts to
-Apache 2.0 two years after each release. The restriction is narrow: you
+liblloyal is source-available under FSL-1.1-MIT and becomes available under
+MIT two years after each version is first made available. The restriction is narrow: you
 cannot offer a competing HDK runtime, managed HDK service, or alternative
 ability distribution channel.
 

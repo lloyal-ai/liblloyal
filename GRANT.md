@@ -1,14 +1,18 @@
 # Developer Grant
 
-**Version 1.0 — Effective 2026-06-12.** Lloyal may publish revised versions for
+**Version 1.1 — Effective 2026-10-08.** Lloyal may publish revised versions for
 future releases of the Software; under Section 5, no revision affects any
 version already published.
 
-**Editorial revision 2026-10-08:** Title, package inventory and product references
-updated. The permissions, covenants and original effective date are unchanged.
+**Revision 1.1:** Updated for FSL-1.1-MIT, with the Developer Grant title and
+current package inventory. The permissions and covenants in Sections 2–4 are
+unchanged. Previously published versions retain the grant and future-license
+rights supplied with them, including Version 1.0 effective 2026-06-12 and any
+promised Apache 2.0 future license. This revision does not restart their
+two-year period.
 
-This Grant accompanies the Functional Source License, Version 1.1, with Apache 2.0
-Future License (**FSL-1.1-Apache-2.0**), under which Lloyal Labs Pty Ltd
+This Grant accompanies the Functional Source License, Version 1.1, with MIT
+Future License (**FSL-1.1-MIT**), under which Lloyal Labs Pty Ltd
 (**"Lloyal," "we," "us"**) makes the Covered Packages available. It applies to each
 version of the Covered Packages published while this Grant is in effect.
 
@@ -41,7 +45,7 @@ Package within another:
 - `@lloyal-labs/wikipedia-ability`
 - `@lloyal-labs/web-app`, `@lloyal-labs/corpus-app`, `@lloyal-labs/wikipedia-app`
   (previously listed package names, retained for historical coverage)
-- any other package Lloyal publishes under FSL-1.1-Apache-2.0 that identifies
+- any other package Lloyal publishes under FSL-1.1-MIT that identifies
   this Grant in its repository
 
 (together, the **"Software"**, matching the License's defined term for each
@@ -123,8 +127,8 @@ own separate applications** with it.
 This Grant is irrevocable for every version of the Software published while it
 is in effect. We may amend this Grant for future versions only; no amendment
 affects any version already published. This Grant survives, and is in any case
-subsumed by, each version's conversion to Apache 2.0 under the License's
-Future License terms.
+subsumed by, the additional MIT license that takes effect for each covered
+version under the License's Future License terms.
 
 ## 6. No Other Changes
 
