@@ -1,6 +1,6 @@
 #pragma once
 
-// SPDX-License-Identifier: LicenseRef-FSL-1.1-Apache-2.0
+// SPDX-License-Identifier: LicenseRef-FSL-1.1-MIT
 // Copyright 2026 Lloyal Labs
 
 
@@ -9,7 +9,7 @@
  *
  * Header-only library for llama.cpp-bound LLM operations
  * Version: 1.0.0 (bound to llama.cpp b8087)
- * License: Apache-2.0
+ * License: FSL-1.1-MIT
  */
 
 // ===== PLATFORM-NATIVE LOGGING =====

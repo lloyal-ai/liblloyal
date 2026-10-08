@@ -2,8 +2,8 @@
 
 > Canonical version at https://docs.lloyal.ai/licensing/faq.
 > This file is a synced copy. Edit the canonical source and re-run
-> `scripts/sync-license-faq.sh` in hdk to update all copies.
-
+> `scripts/sync-license-faq.sh --docs-dir ../hdk-docs --native-dir ../lloyal.node --kernel-dir ../liblloyal`
+> in hdk to update all copies.
 
 **You can use Lloyal to build and sell your own products.**
 
@@ -20,8 +20,8 @@ project on a list of approved use cases.
 **Yes.** You can build, distribute, sell, license and host applications using
 Lloyal.
 
-The [Lloyal Harness Builder Grant](https://github.com/lloyal-ai/hdk/blob/c1632c51a4e42393b2ad5828a66c1c7b48ff487c/GRANT.md)
-expressly protects this permission—even when your application competes directly
+The [Developer Grant](https://github.com/lloyal-ai/hdk/blob/d9112692d592f73e3922d096a4cdf2edcc889089/GRANT.md)
+expressly protects this permission, even when your application competes directly
 with an application or service offered by Lloyal Labs.
 
 Your application may let its users create workflows, compose agents and install
@@ -45,9 +45,53 @@ Hosting your own application for its users is permitted. So are private
 distribution within your organization, distribution to your customers as part
 of your application, and your application's own plugin system.
 
-These boundaries are defined in Section 4 of the Harness Builder Grant. The
+These boundaries are defined in Section 4 of the Developer Grant. The
 grant only adds permissions; it does not take away rights provided by the
 license.
+
+## Which packages does the grant cover?
+
+The Developer Grant covers the FSL runtime, application packages and abilities:
+
+| Layer | Covered packages |
+|---|---|
+| Native inference | `liblloyal`, `@lloyal-labs/lloyal.node` |
+| Runtime | `@lloyal-labs/sdk`, `@lloyal-labs/lloyal-agents`, `@lloyal-labs/rig` |
+| Application integration | `@lloyal-labs/binding`, `@lloyal-labs/host`, `@lloyal-labs/relay`, `@lloyal-labs/desktop`, `@lloyal-labs/ui`, `@lloyal-labs/dev-tools` |
+| Media and abilities | `@lloyal-labs/media`, `@lloyal-labs/web-ability`, `@lloyal-labs/corpus-ability`, `@lloyal-labs/documents-ability`, `@lloyal-labs/wikipedia-ability` |
+
+Previously named `@lloyal-labs/web-app`, `@lloyal-labs/corpus-app` and
+`@lloyal-labs/wikipedia-app` packages remain covered. The grant also covers other
+Lloyal FSL packages that identify it in their repository. See Section 1 of the
+[Developer Grant](https://github.com/lloyal-ai/hdk/blob/d9112692d592f73e3922d096a4cdf2edcc889089/GRANT.md) for the governing coverage.
+
+The `lloyal-ai` CLI and Fieldnote application source are MIT;
+`@lloyal-labs/channel-verify` is Apache 2.0. These do not need this grant for
+their own code. Runtime dependencies and model weights retain their respective
+licenses.
+
+## Can the grant change for a version I already use?
+
+**No.** The grant is irrevocable for every version published while it is in
+effect. Revisions apply only to future versions; they do not remove permissions
+from versions already published.
+
+## What changed with FSL-1.1-MIT?
+
+New runtime versions carrying **FSL-1.1-MIT** become available under MIT on
+the second anniversary of the date each version is first made available.
+The initial two-year FSL period and the Developer Grant's application-building
+permissions remain. The runtime is not MIT-only during that period.
+
+Earlier versions published under **FSL-1.1-Apache-2.0** retain their existing
+terms, including the irrevocable future Apache 2.0 license, their original
+two-year clocks and the grant permissions already provided with them. This
+change does not replace those rights or restart those clocks. Check the
+`LICENSE` and `GRANT.md` supplied with the version you use.
+
+Developer Grant version 1.1, effective 2026-10-08, accompanies new
+FSL-1.1-MIT versions. It preserves the application and ability permissions
+and covenants; earlier versions retain the grant supplied with them.
 
 ## What obligations remain?
 
@@ -55,11 +99,11 @@ Keep the required license and copyright notices when redistributing the covered
 software. The license's patent, trademark and other conditions continue to
 apply.
 
-The runtime is provided under **FSL-1.1-Apache-2.0**, supplemented by the Harness
-Builder Grant. Each version becomes available under Apache 2.0 two years after
-that version is first made available.
+The runtime is provided under **FSL-1.1-MIT**, supplemented by the
+Developer Grant. Each version carrying this license becomes available under
+MIT two years after that version is first made available.
 
 This FAQ explains the terms. The
-[LICENSE](https://github.com/lloyal-ai/liblloyal/blob/4858217cd33a1f55266315160cc490fd6008d725/LICENSE) and
-[GRANT](https://github.com/lloyal-ai/liblloyal/blob/c3fe93dfecf498f997be1925307fad15f14532d3/GRANT.md) contain the
+[LICENSE](https://github.com/lloyal-ai/hdk/blob/d9112692d592f73e3922d096a4cdf2edcc889089/LICENSE) and
+[Developer Grant](https://github.com/lloyal-ai/hdk/blob/d9112692d592f73e3922d096a4cdf2edcc889089/GRANT.md) contain the
 governing text.

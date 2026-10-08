@@ -2,8 +2,8 @@ liblloyal
 Copyright 2026 Lloyal Labs
 
 This product includes software developed by Lloyal Labs and licensed
-under the Functional Source License, Version 1.1, Apache 2.0 Future
-License (FSL-1.1-Apache-2.0). See LICENSE for terms.
+under the Functional Source License, Version 1.1, MIT Future
+License (FSL-1.1-MIT). See LICENSE for terms.
 
 This product links against and depends on llama.cpp, distributed under
 the MIT License:
@@ -40,7 +40,7 @@ through to any binary distribution that links against llama.cpp.
 
 ---
 
-For a plain-English explanation of what FSL-1.1-Apache-2.0 means in
+For a plain-English explanation of what FSL-1.1-MIT means in
 practice — including what commercial uses are permitted and what is
 specifically restricted — see LICENSE-FAQ.md in this repository or the
 canonical version at https://docs.lloyal.ai/licensing/faq.
