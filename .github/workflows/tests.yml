@@ -139,10 +139,10 @@ jobs:
     - name: Cache test models
       uses: actions/cache@v4
       with:
-        path: tests/fixtures
-        key: test-models-v2-${{ hashFiles('.github/workflows/tests.yml') }}
+        path: tests/fixtures/*.gguf
+        key: test-models-v3-${{ hashFiles('.github/workflows/tests.yml', 'tests/fixtures/*-models.sha256') }}
         restore-keys: |
-          test-models-v2-
+          test-models-v3-
 
     - name: Download test models
       working-directory: tests
@@ -187,31 +187,28 @@ jobs:
           echo "✓ Using cached nomic-embed-text-v1.5.Q4_K_M.gguf"
         fi
 
-        # SmolVLM-256M + its projector (274MB) for the multimodal tests.
-        # This is the plain-position tier: it exercises the embedding rail,
-        # the cell/slack accounting and the fan-out, but not M-RoPE (which
-        # needs a Qwen-class VL model and runs locally / on the GPU rig).
-        for f in SmolVLM-256M-Instruct-Q8_0.gguf mmproj-SmolVLM-256M-Instruct-Q8_0.gguf; do
-          if [ ! -f "fixtures/$f" ]; then
-            echo "Downloading $f..."
-            curl -fsSL --retry 3 --retry-delay 2 \
-              "https://huggingface.co/ggml-org/SmolVLM-256M-Instruct-GGUF/resolve/main/$f" \
-              -o "fixtures/$f"
-
-            echo "Verifying $f..."
-            if ! head -c 4 "fixtures/$f" | grep -q "GGUF"; then
-              echo "ERROR: Downloaded file is not a valid GGUF file"
-              head -c 32 "fixtures/$f" | xxd
-              rm -f "fixtures/$f"
-              exit 1
-            fi
-            echo "✓ $f verified"
-          else
-            echo "✓ Using cached $f"
-          fi
-        done
-
         echo "All test models ready"
+
+    - name: Download and verify multimodal model pairs
+      working-directory: tests
+      run: |
+        set -euo pipefail
+        download_pair() {
+          local repo="$1" revision="$2" manifest="$3"
+          while read -r expected file; do
+            if ! printf '%s  %s\n' "$expected" "fixtures/$file" | sha256sum -c --status; then
+              curl -fsSL --retry 3 --retry-delay 2 \
+                "https://huggingface.co/$repo/resolve/$revision/$file" \
+                -o "fixtures/$file.part"
+              printf '%s  %s\n' "$expected" "fixtures/$file.part" | sha256sum -c -
+              mv "fixtures/$file.part" "fixtures/$file"
+            fi
+          done < "$manifest"
+        }
+        download_pair unsloth/Qwen3.5-4B-GGUF \
+          e87f176479d0855a907a41277aca2f8ee7a09523 fixtures/vision-models.sha256
+        download_pair ggml-org/Qwen3-ASR-0.6B-GGUF \
+          928ab958557df9aa2ef1c93e0e83c7ad0933fae2 fixtures/asr-models.sha256
 
     - name: Configure CMake for integration tests
       working-directory: tests
@@ -237,7 +234,7 @@ jobs:
         echo "Model path: $LLAMA_TEST_MODEL"
         ls -lh "$LLAMA_TEST_MODEL"
         ./build_integration/IntegrationRunner --success \
-          --test-case-exclude="*Embedding*,*multimodal*" 2>&1 | tee test_output.txt
+          --test-case-exclude="*Embedding*,*multimodal*,audio:*,decode failure: an image*" 2>&1 | tee test_output.txt
         # Fail if no tests actually executed (all filtered/skipped)
         if grep -qE "test cases:.*\| 0 passed \| 0 failed \|" test_output.txt; then
           echo "::error::No tests executed — all were skipped or filtered out"
@@ -262,18 +259,17 @@ jobs:
           exit 1
         fi
 
-    - name: Run multimodal tests
+    - name: Run image projection tests (Qwen3.5-4B)
       working-directory: tests
       env:
-        LLAMA_TEST_MODEL: ${{ github.workspace }}/tests/fixtures/SmolVLM-256M-Instruct-Q8_0.gguf
-        LLAMA_MMPROJ_MODEL: ${{ github.workspace }}/tests/fixtures/mmproj-SmolVLM-256M-Instruct-Q8_0.gguf
-        # Mechanics tier: SmolVLM-256M exercises the embedding rail, the
-        # cell/slack accounting and the fan-out, but is too small to be held
-        # to a grounded answer. Content assertions run on the Qwen tier.
-        LLOYAL_VL_STRICT: "0"
+        LLAMA_TEST_MODEL: ${{ github.workspace }}/tests/fixtures/Qwen3.5-4B-Q4_K_M.gguf
+        LLAMA_MMPROJ_MODEL: ${{ github.workspace }}/tests/fixtures/mmproj-F16.gguf
+        LLAMA_N_GPU_LAYERS: "0"
+        LLOYAL_VL_STRICT: "1"
+        UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
       run: |
         set -o pipefail
-        echo "Running multimodal tests with SmolVLM-256M..."
+        echo "Running image projection tests with Qwen3.5-4B..."
         echo "Model path: $LLAMA_TEST_MODEL"
         echo "Projector path: $LLAMA_MMPROJ_MODEL"
         ls -lh "$LLAMA_TEST_MODEL" "$LLAMA_MMPROJ_MODEL"
@@ -287,12 +283,31 @@ jobs:
           exit 1
         fi
 
+    - name: Run audio integration tests
+      working-directory: tests
+      env:
+        LLAMA_TEST_MODEL: ${{ github.workspace }}/tests/fixtures/Qwen3-ASR-0.6B-Q8_0.gguf
+        LLAMA_MMPROJ_MODEL: ${{ github.workspace }}/tests/fixtures/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf
+        LLAMA_N_GPU_LAYERS: "0"
+        LLOYAL_ASR_TEST: "1"
+        UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+      run: |
+        set -euo pipefail
+        ./build_integration/IntegrationRunner --success \
+          --test-case="audio:*" 2>&1 | tee audio_output.txt
+        if ! grep -qE 'test cases:.*\| +[1-9][0-9]* passed \| +0 failed \|' audio_output.txt; then
+          echo "::error::No passing audio cases were reported"
+          exit 1
+        fi
+
     - name: Upload test results
       if: always()
       uses: actions/upload-artifact@v4
       with:
         name: integration-test-results-macos
-        path: tests/build_integration/
+        path: |
+          tests/build_integration/
+          tests/audio_output.txt
 
   lint:
     name: Code Style Check
