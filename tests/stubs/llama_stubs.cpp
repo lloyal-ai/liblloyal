@@ -1,4 +1,5 @@
 #include "llama_stubs.h"
+#include <cmath>
 #include <atomic>
 
 // Global configuration instance
@@ -551,9 +552,24 @@ llama_sampler *llama_sampler_init_grammar_lazy_patterns(
   return reinterpret_cast<llama_sampler *>(0xA001); // Stub pointer (lazy)
 }
 
-void llama_sampler_apply(llama_sampler * /*smpl*/,
-                         llama_token_data_array * /*cur_p*/) {
-  // Stub - no-op
+void llama_sampler_apply(llama_sampler *smpl, llama_token_data_array *cur_p) {
+  if (!cur_p) return;
+  const auto id = reinterpret_cast<uintptr_t>(smpl);
+  if (id == 0xA000 || id == 0xA001) {
+    // The grammar: refuse the configured tokens, remember how much of the vocabulary it was shown.
+    g_stub_config.grammar_apply_sizes.push_back(cur_p->size);
+    for (size_t i = 0; i < cur_p->size; ++i) {
+      if (g_stub_config.grammar_rejects.count(cur_p->data[i].id)) cur_p->data[i].logit = -INFINITY;
+    }
+    return;
+  }
+  // The chain: greedy over the finite candidates.
+  int64_t best = -1;
+  float best_logit = -INFINITY;
+  for (size_t i = 0; i < cur_p->size; ++i) {
+    if (cur_p->data[i].logit > best_logit) { best_logit = cur_p->data[i].logit; best = static_cast<int64_t>(i); }
+  }
+  cur_p->selected = best;
 }
 
 void llama_sampler_accept(llama_sampler * /*smpl*/, llama_token /*token*/) {

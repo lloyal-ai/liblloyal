@@ -266,6 +266,13 @@ struct LlamaStubConfig {
     size_t global_size = 0;                    // Global state size
     size_t global_rw = 0;                      // Global read/write bytes
 
+    // Sampler operations. The stub grammar refuses the tokens named here (their logit becomes -INFINITY)
+    // and records the size of every candidate array it was applied to, so a test can tell a whole-vocabulary
+    // mask (n_vocab) from a one-token check (1). The stub chain picks the finite candidate with the highest
+    // logit, so a sample is deterministic.
+    std::set<llama_token> grammar_rejects;
+    std::vector<size_t> grammar_apply_sizes;
+
     // Batch/Decode operations
     bool batch_init_succeeds = true;           // Controls if llama_batch_init succeeds
     int decode_result = 0;                     // 0=success, <0=failure (every call)

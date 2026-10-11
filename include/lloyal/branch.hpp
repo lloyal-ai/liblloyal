@@ -275,6 +275,8 @@ inline CachedSamplingParams snapshot_params(const P& p) {
  *
  * Sampling application order in sample():
  *   Grammar → Logit Bias → Steer → Sampler Chain
+ * or, with grammar_sample_first: Logit Bias → Steer → Sampler Chain → Grammar check of the pick,
+ * falling back to the first order only when the pick is refused.
  */
 struct BranchState {
   llama_context* ctx = nullptr;       ///< Llama context (not owned, must outlive branch)
@@ -295,6 +297,10 @@ struct BranchState {
 
   SamplerChainHandle sampler_chain = 0;  ///< Handle into BranchStore's sampler registry
   GrammarHandle grammar = 0;             ///< Handle into BranchStore's grammar registry
+  /// Grammar order for sample(): false masks the whole vocabulary before the chain (exact under
+  /// truncation); true lets the chain pick first and asks the grammar about that one token, masking
+  /// only when it is refused. Reset to false whenever a grammar is attached; cloned by fork().
+  bool grammar_sample_first = false;
 
   CachedSamplingParams cached_params;    ///< Params used to create current chain (for memoization)
 
@@ -1505,6 +1511,7 @@ private:
     slot.img_slack_total = 0;
     slot.sampler_chain = 0;
     slot.grammar = 0;
+    slot.grammar_sample_first = false;
     slot.metrics = 0;
     slot.cached_params = CachedSamplingParams{};
     slot.last_token = -1;
@@ -1776,6 +1783,7 @@ inline BranchHandle fork(BranchHandle source, BranchStore& s, ForkOpts opts = {}
   if (src->grammar != 0) {
     dst->grammar = s.clone_grammar(src->grammar);
   }
+  dst->grammar_sample_first = src->grammar_sample_first;
 
   if (src->boundary_tracker) {
     dst->boundary_tracker = src->boundary_tracker->clone().release();
@@ -2003,6 +2011,7 @@ inline void set_grammar(
     s.free_grammar(state->grammar);
     state->grammar = 0;
   }
+  state->grammar_sample_first = false;
 
   // Create new grammar if provided
   if (grammar_str && grammar_str[0] != '\0') {
@@ -2043,6 +2052,7 @@ inline void set_grammar_lazy(
     s.free_grammar(state->grammar);
     state->grammar = 0;
   }
+  state->grammar_sample_first = false;
 
   if (grammar_str && grammar_str[0] != '\0') {
     state->grammar = s.create_grammar_lazy(
@@ -2051,6 +2061,28 @@ inline void set_grammar_lazy(
 
   LLOYAL_LOG_DEBUG("[branch::set_grammar_lazy] %s grammar on handle=%u",
                    state->grammar != 0 ? "Set" : "Cleared", handle);
+}
+
+/**
+ * @brief Choose how sample() consults the attached grammar
+ *
+ * Mask-first (the default) tests every vocabulary entry against the grammar before the sampler chain
+ * runs, which is exact under top-k/top-p/min-p but costs a walk over the whole vocabulary per token.
+ * Sample-first runs the chain on the raw candidates, asks the grammar about the one chosen token, and
+ * only when it is refused falls back to the mask-first order for that token. Inside a free-text span of
+ * a grammar the pick is almost always legal, so the mask is almost never built. The order is reset to
+ * mask-first whenever a grammar is attached, so it has to be chosen after set_grammar()/set_grammar_lazy().
+ *
+ * @param handle Branch to configure
+ * @param sample_first true for sample-then-check, false for mask-first
+ * @param s Branch store
+ */
+inline void set_grammar_order(BranchHandle handle, bool sample_first, BranchStore& s) {
+  BranchState* state = s.get(handle);
+  if (!state) {
+    throw std::runtime_error("set_grammar_order: invalid branch handle");
+  }
+  state->grammar_sample_first = sample_first;
 }
 
 /**
@@ -2304,7 +2336,9 @@ inline void get_logits_at(BranchHandle handle,
  * @brief Sample a token from the branch's captured logits
  *
  * Applies modifiers in order: Grammar → Logit Bias → Steer → Sampler Chain,
- * then selects a token. Also records filtered candidates for metrics.
+ * then selects a token. With grammar_sample_first the grammar moves to the end as a check of the one
+ * chosen token, and the full order runs only when that check refuses it. Also records filtered
+ * candidates for metrics.
  *
  * Requires prior force_snapshot_logits(), prefill(), or step().
  *
@@ -2329,57 +2363,77 @@ inline llama_token sample(BranchHandle handle, BranchStore& s) {
     return -1;
   }
 
-  // Reuse pre-allocated candidates buffer (avoids O(n_vocab) allocs per sample)
-  for (int i = 0; i < state->n_vocab; i++) {
-    state->candidates_buffer[i] = llama_token_data{
-        static_cast<llama_token>(i),
-        state->logits_snapshot[i],
-        0.0f};
-  }
-
-  llama_token_data_array cur_p = {
-      state->candidates_buffer.data(),
-      static_cast<size_t>(state->n_vocab),
-      -1,
-      false};
-
-  // Apply grammar first if present (via anti-corruption layer)
   llama_sampler* gram = s.get_grammar_sampler(state->grammar);
-  if (gram) {
-    grammar::apply(gram, &cur_p);
-  }
 
-  // Apply logit bias if present — O(n_biases) via direct index
-  // (candidates are in token-ID order; grammar::apply preserves order)
-  if (!state->logit_bias.empty()) {
-    for (const auto& bias : state->logit_bias) {
-      if (bias.token >= 0 && bias.token < state->n_vocab) {
-        cur_p.data[bias.token].logit += bias.bias;
+  // The candidate array is rebuilt from the branch's own logits snapshot for every pass, so a pass that
+  // decided nothing (a refused pick) costs one more fill, never another decode.
+  auto fill = [&]() -> llama_token_data_array {
+    for (int i = 0; i < state->n_vocab; i++) {
+      state->candidates_buffer[i] = llama_token_data{
+          static_cast<llama_token>(i),
+          state->logits_snapshot[i],
+          0.0f};
+    }
+    return llama_token_data_array{
+        state->candidates_buffer.data(),
+        static_cast<size_t>(state->n_vocab),
+        -1,
+        false};
+  };
+
+  // One pass of the modifiers after the (optional) grammar mask: Logit Bias → Steer → Sampler Chain.
+  auto shape = [&](llama_token_data_array& cur_p, bool mask_with_grammar) -> llama_token {
+    if (mask_with_grammar && gram) {
+      grammar::apply(gram, &cur_p);
+    }
+
+    // Logit bias — O(n_biases) via direct index (candidates are in token-ID order; grammar::apply
+    // preserves order)
+    if (!state->logit_bias.empty()) {
+      for (const auto& bias : state->logit_bias) {
+        if (bias.token >= 0 && bias.token < state->n_vocab) {
+          cur_p.data[bias.token].logit += bias.bias;
+        }
       }
     }
-  }
 
-  // Apply steer callback if present
-  if (state->steer_fn) {
-    try {
-      state->steer_fn(cur_p);
-    } catch (const std::exception& e) {
-      LLOYAL_LOG_DEBUG("[branch::sample] Steer exception: %s", e.what());
-      // Continue sampling without steer on exception
+    if (state->steer_fn) {
+      try {
+        state->steer_fn(cur_p);
+      } catch (const std::exception& e) {
+        LLOYAL_LOG_DEBUG("[branch::sample] Steer exception: %s", e.what());
+        // Continue sampling without steer on exception
+      }
     }
+
+    sampler::apply(chain, &cur_p);
+    return cur_p.selected == -1 ? -1 : cur_p.data[cur_p.selected].id;
+  };
+
+  // Does the grammar admit this one token? One-element apply: the grammar decodes one piece instead of
+  // the whole vocabulary, and apply() reads the parser state without advancing it.
+  auto admits = [&](llama_token token) -> bool {
+    llama_token_data single{token, 0.0f, 0.0f};
+    llama_token_data_array one{&single, 1, -1, false};
+    grammar::apply(gram, &one);
+    return one.data[0].logit != -INFINITY;
+  };
+
+  llama_token_data_array cur_p = fill();
+  const bool sample_first = gram && state->grammar_sample_first;
+  llama_token token = shape(cur_p, /*mask_with_grammar=*/!sample_first);
+
+  if (sample_first && token != -1 && !admits(token)) {
+    // Refused: take the exact order for this token.
+    cur_p = fill();
+    token = shape(cur_p, /*mask_with_grammar=*/true);
   }
 
-  // Apply sampler chain (via anti-corruption layer)
-  sampler::apply(chain, &cur_p);
-
-  if (cur_p.selected == -1) {
+  if (token == -1) {
     return -1;
   }
 
-  llama_token token = cur_p.data[cur_p.selected].id;
-
-  // Capture filtered candidates for sampling metrics
-  // After BOTH grammar and sampler chain - this is the actual sampling distribution
+  // Capture filtered candidates for sampling metrics: the distribution the token was actually drawn from.
   state->last_token = token;
   state->last_candidates.clear();
   state->last_candidates.reserve(cur_p.size);

@@ -15,6 +15,7 @@
 #include <lloyal/branch.hpp>
 #include <cmath>  // std::isnan, std::isinf
 #include <vector>
+#include <set>
 
 using namespace lloyal::branch;
 
@@ -1790,4 +1791,117 @@ TEST_CASE("branch: a failed decode_embd poisons the branch but keeps its books")
 
   prune(h, ts.store);
   CHECK(ts.store.kv_pressure().cells_used == 0);
+}
+
+// ============================================================================
+// Grammar order: mask first, or sample first and check the pick
+// ============================================================================
+//
+// The stub grammar refuses the tokens a test names and records how much of the
+// vocabulary each apply saw; the stub chain picks the finite candidate with the
+// highest logit. Eight tokens, token 3 the model's favourite, token 5 next.
+
+namespace {
+
+struct OrderFixture {
+  TestStore ts{4};
+  TestSamplingParams params;
+  llama_model* model = reinterpret_cast<llama_model*>(0x2000);
+  std::vector<float> logits{0.f, 0.f, 0.f, 9.f, 0.f, 7.f, 0.f, 1.f};
+
+  BranchHandle branch(const char* grammar = "root ::= [a-z]+") {
+    BranchHandle h = create(ts.ctx, model, ts.store, 0, params, 512, grammar);
+    REQUIRE(h != INVALID_HANDLE);
+    set_logits(h, std::span<const float>(logits), ts.store);
+    return h;
+  }
+  std::vector<size_t>& applies() { return llamaStubConfig().grammar_apply_sizes; }
+  std::set<llama_token>& rejects() { return llamaStubConfig().grammar_rejects; }
+};
+
+} // namespace
+
+TEST_CASE("grammar order: mask first by default shows the grammar the whole vocabulary") {
+  OrderFixture f;
+  BranchHandle h = f.branch();
+  f.rejects() = {3};
+  CHECK(sample(h, f.ts.store) == 5);
+  CHECK(f.applies() == std::vector<size_t>{8});
+  prune(h, f.ts.store);
+}
+
+TEST_CASE("grammar order: sample first asks the grammar about the pick alone when it is admitted") {
+  OrderFixture f;
+  BranchHandle h = f.branch();
+  set_grammar_order(h, true, f.ts.store);
+  CHECK(sample(h, f.ts.store) == 3);
+  CHECK(f.applies() == std::vector<size_t>{1});
+  // The candidates recorded for the sampling metrics are the pass the token came from.
+  const BranchState* st = f.ts.store.get(h);
+  REQUIRE(st != nullptr);
+  CHECK(st->last_token == 3);
+  CHECK(st->last_candidates.size() == 8);
+  prune(h, f.ts.store);
+}
+
+TEST_CASE("grammar order: a refused pick is resampled under the full mask") {
+  OrderFixture f;
+  BranchHandle h = f.branch();
+  set_grammar_order(h, true, f.ts.store);
+  f.rejects() = {3};
+  CHECK(sample(h, f.ts.store) == 5);
+  CHECK(f.applies() == std::vector<size_t>{1, 8});
+  const BranchState* st = f.ts.store.get(h);
+  REQUIRE(st != nullptr);
+  CHECK(st->last_token == 5);
+  // The metrics see the masked pass: the refused token carries no probability mass.
+  REQUIRE(st->last_candidates.size() == 8);
+  CHECK(std::isinf(st->last_candidates[3].logit));
+  prune(h, f.ts.store);
+}
+
+TEST_CASE("grammar order: no grammar means no check, whatever the order says") {
+  OrderFixture f;
+  BranchHandle h = f.branch(nullptr);
+  set_grammar_order(h, true, f.ts.store);
+  f.rejects() = {3};
+  CHECK(sample(h, f.ts.store) == 3);
+  CHECK(f.applies().empty());
+  prune(h, f.ts.store);
+}
+
+TEST_CASE("grammar order: attaching a grammar resets to mask first") {
+  OrderFixture f;
+  BranchHandle h = f.branch();
+  set_grammar_order(h, true, f.ts.store);
+  REQUIRE(f.ts.store.get(h)->grammar_sample_first);
+  set_grammar(h, f.model, "root ::= [0-9]+", f.ts.store);
+  CHECK_FALSE(f.ts.store.get(h)->grammar_sample_first);
+  set_grammar_order(h, true, f.ts.store);
+  set_grammar_lazy(h, f.model, "root ::= [0-9]+", {"<tool_call>"}, {}, f.ts.store);
+  CHECK_FALSE(f.ts.store.get(h)->grammar_sample_first);
+  prune(h, f.ts.store);
+}
+
+TEST_CASE("grammar order: fork copies the order, a reused slot does not inherit it") {
+  OrderFixture f;
+  BranchHandle h = f.branch();
+  set_grammar_order(h, true, f.ts.store);
+  BranchHandle child = fork(h, f.ts.store);
+  REQUIRE(child != INVALID_HANDLE);
+  CHECK(f.ts.store.get(child)->grammar_sample_first);
+  prune(child, f.ts.store);
+  prune(h, f.ts.store);
+  // The slot h occupied comes back for the next branch, mask first.
+  BranchHandle again = f.branch();
+  CHECK_FALSE(f.ts.store.get(again)->grammar_sample_first);
+  f.rejects() = {3};
+  CHECK(sample(again, f.ts.store) == 5);
+  CHECK(f.applies() == std::vector<size_t>{8});
+  prune(again, f.ts.store);
+}
+
+TEST_CASE("grammar order: set_grammar_order refuses an invalid handle") {
+  OrderFixture f;
+  CHECK_THROWS_AS(set_grammar_order(INVALID_HANDLE, true, f.ts.store), std::runtime_error);
 }
