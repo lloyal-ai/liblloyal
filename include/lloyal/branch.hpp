@@ -1511,6 +1511,7 @@ private:
     slot.img_slack_total = 0;
     slot.sampler_chain = 0;
     slot.grammar = 0;
+    slot.grammar_sample_first = false;
     slot.metrics = 0;
     slot.cached_params = CachedSamplingParams{};
     slot.last_token = -1;
