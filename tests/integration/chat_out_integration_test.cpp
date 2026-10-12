@@ -95,14 +95,17 @@ TEST_CASE("ChatOut Integration: parse plain text output") {
   auto model = TestConfig::acquire_test_model();
   REQUIRE(model != nullptr);
 
-  // Get format from chat_in for this model
+  // Get format from chat_in for this model. Thinking stays off: a thinking
+  // template's generation prompt opens a reasoning block, and plain text with
+  // no closing tag would then be reasoning, not content.
   lloyal::chat_in::FormatInputs inputs;
   inputs.messages_json = json::array({
     {{"role", "user"}, {"content", "Hello"}}
   }).dump();
+  inputs.enable_thinking = false;
   auto fmt = lloyal::chat_in::format(model.get(), inputs);
 
-  // Parse plain text with the detected format
+  // Parse plain text with the detected format and its parser
   auto result = lloyal::chat_out::parse(
     "Hello, I'm an AI assistant!",
     fmt.format,
