@@ -23,7 +23,7 @@ Qwen3.5-4B with its projector, greedy sampling, one context (`n_ctx` 32768, `n_b
 cd tests && cmake -B build_bench -DLLOYAL_BUILD_BENCH=ON \
   -DLLAMA_CPP_DIR=../../llama.cpp -DLLAMA_CPP_BUILD_DIR=../../llama.cpp/build \
   && cmake --build build_bench --target Bench
-./build_bench/Bench model.gguf mmproj.gguf tests/fixtures/cat.jpg <label> > run.jsonl
+./build_bench/Bench model.gguf mmproj.gguf fixtures/cat.jpg <label> > run.jsonl
 python3 bench/compare.py bench/baselines/<baseline>.jsonl run.jsonl
 ```
 

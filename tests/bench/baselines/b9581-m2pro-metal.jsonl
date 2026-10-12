@@ -1,16 +1,16 @@
-{"baseline":"b9581","machine":"Apple M2 Pro, 16 GB, Metal","taken":"2026-10-12","model":"Qwen3.5-4B Q4_K_M + mmproj F16","flags":"n_ctx 32768, n_batch 512, n_ubatch 512, n_seq_max 10, n_gpu_layers 99, greedy","run":"warm, second of two back-to-back runs"}
-{"label":"pin","item":"model_load","unit":"ms","p50":451.787,"p90":451.787,"min":451.787,"max":451.787,"n":1}
-{"label":"pin","item":"context_init","unit":"ms","p50":311.117,"p90":311.117,"min":311.117,"max":311.117,"n":1}
-{"label":"pin","item":"chat_in_format_with_tool","unit":"ms","p50":13.368,"p90":14.529,"min":12.747,"max":14.529,"n":5,"grammar_bytes":2203,"lazy":false}
-{"label":"pin","item":"prefill","unit":"ms","p50":1730.013,"p90":1730.013,"min":1730.013,"max":1730.013,"n":1,"tokens":881,"tok_per_s":509.244667}
-{"label":"pin","item":"fork","unit":"ms","p50":0.125,"p90":0.702,"min":0.107,"max":0.702,"n":8,"prefix_tokens":881}
-{"label":"pin","item":"decode_each_step_n1","unit":"ms","p50":23.636,"p90":24.771,"min":23.369,"max":48.325,"n":40,"branches":1}
-{"label":"pin","item":"sample_no_grammar_n1","unit":"ms_per_branch","p50":1.630,"p90":1.716,"min":1.575,"max":5.139,"n":40,"branches":1}
-{"label":"pin","item":"decode_each_step_n3","unit":"ms","p50":60.614,"p90":61.107,"min":59.745,"max":71.520,"n":40,"branches":3}
-{"label":"pin","item":"sample_no_grammar_n3","unit":"ms_per_branch","p50":1.611,"p90":1.652,"min":1.553,"max":1.704,"n":40,"branches":3}
-{"label":"pin","item":"decode_each_step_n8","unit":"ms","p50":147.229,"p90":148.789,"min":145.572,"max":169.030,"n":40,"branches":8}
-{"label":"pin","item":"sample_no_grammar_n8","unit":"ms_per_branch","p50":1.567,"p90":1.840,"min":1.538,"max":2.547,"n":40,"branches":8}
-{"label":"pin","item":"sample_grammar_mask_first","unit":"ms","p50":50.010,"p90":51.318,"min":12.871,"max":62.755,"n":60,"n_vocab":248320}
-{"label":"pin","item":"sample_grammar_sample_first","unit":"ms","p50":0.252,"p90":0.283,"min":0.226,"max":12.724,"n":60,"n_vocab":248320}
-{"label":"pin","item":"image_prefill_total","unit":"ms","p50":1721.892,"p90":1734.012,"min":1721.385,"max":1734.012,"n":3,"cells":576,"advance":44}
-{"label":"pin","item":"image_decode_and_tokenize","unit":"ms","p50":9.415,"p90":9.482,"min":8.729,"max":9.482,"n":3}
+{"baseline":"b9581","machine":"Apple M2 Pro, 16 GB, Metal","taken":"2026-10-12","model":"Qwen3.5-4B Q4_K_M + mmproj F16","flags":"n_ctx 32768, n_batch 512, n_ubatch 512, n_seq_max 10, n_gpu_layers 99, greedy","run":"warm, second of two back-to-back runs","note":"sample_no_grammar rows time branch::sample alone"}
+{"label":"b9581","item":"model_load","unit":"ms","p50":397.925,"p90":397.925,"min":397.925,"max":397.925,"n":1}
+{"label":"b9581","item":"context_init","unit":"ms","p50":130.392,"p90":130.392,"min":130.392,"max":130.392,"n":1}
+{"label":"b9581","item":"chat_in_format_with_tool","unit":"ms","p50":12.007,"p90":13.414,"min":11.895,"max":13.414,"n":5,"grammar_bytes":2203,"lazy":false}
+{"label":"b9581","item":"prefill","unit":"ms","p50":1684.361,"p90":1684.361,"min":1684.361,"max":1684.361,"n":1,"tokens":881,"tok_per_s":523.046928}
+{"label":"b9581","item":"fork","unit":"ms","p50":0.105,"p90":0.369,"min":0.099,"max":0.369,"n":8,"prefix_tokens":881}
+{"label":"b9581","item":"decode_each_step_n1","unit":"ms","p50":24.534,"p90":26.113,"min":23.451,"max":47.146,"n":40,"branches":1}
+{"label":"b9581","item":"sample_no_grammar_n1","unit":"ms_per_branch","p50":0.219,"p90":0.238,"min":0.215,"max":0.353,"n":40,"branches":1}
+{"label":"b9581","item":"decode_each_step_n3","unit":"ms","p50":61.635,"p90":63.283,"min":60.041,"max":71.531,"n":40,"branches":3}
+{"label":"b9581","item":"sample_no_grammar_n3","unit":"ms_per_branch","p50":0.226,"p90":0.381,"min":0.215,"max":0.432,"n":40,"branches":3}
+{"label":"b9581","item":"decode_each_step_n8","unit":"ms","p50":150.048,"p90":152.353,"min":146.258,"max":169.853,"n":40,"branches":8}
+{"label":"b9581","item":"sample_no_grammar_n8","unit":"ms_per_branch","p50":0.222,"p90":0.265,"min":0.216,"max":0.367,"n":40,"branches":8}
+{"label":"b9581","item":"sample_grammar_mask_first","unit":"ms","p50":51.010,"p90":52.708,"min":12.795,"max":88.838,"n":60,"n_vocab":248320}
+{"label":"b9581","item":"sample_grammar_sample_first","unit":"ms","p50":0.262,"p90":0.409,"min":0.231,"max":13.077,"n":60,"n_vocab":248320}
+{"label":"b9581","item":"image_prefill_total","unit":"ms","p50":1778.411,"p90":1778.514,"min":1776.570,"max":1778.514,"n":3,"cells":576,"advance":44}
+{"label":"b9581","item":"image_decode_and_tokenize","unit":"ms","p50":9.936,"p90":10.563,"min":8.650,"max":10.563,"n":3}

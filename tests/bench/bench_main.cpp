@@ -39,12 +39,46 @@ static Stats stats(std::vector<double> v) {
   };
   return {at(0.5), at(0.9), v.front(), v.back(), v.size()};
 }
-static const char *g_label = "unlabelled";
+static std::string g_label = "unlabelled";
+
+// The label is user input printed inside a JSON string: escape what JSON
+// escapes.
+static std::string json_escaped(const std::string &s) {
+  std::string out;
+  for (unsigned char c : s) {
+    switch (c) {
+    case '"':
+      out += "\\\"";
+      break;
+    case '\\':
+      out += "\\\\";
+      break;
+    case '\n':
+      out += "\\n";
+      break;
+    case '\r':
+      out += "\\r";
+      break;
+    case '\t':
+      out += "\\t";
+      break;
+    default:
+      if (c < 0x20) {
+        char buf[8];
+        std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+        out += buf;
+      } else {
+        out += static_cast<char>(c);
+      }
+    }
+  }
+  return out;
+}
 static void report(const char *item, const char *unit, const Stats &s,
                    const std::string &extra = "") {
   std::printf("{\"label\":\"%s\",\"item\":\"%s\",\"unit\":\"%s\",\"p50\":%.3f,"
               "\"p90\":%.3f,\"min\":%.3f,\"max\":%.3f,\"n\":%zu%s}\n",
-              g_label, item, unit, s.p50, s.p90, s.min, s.max, s.n,
+              g_label.c_str(), item, unit, s.p50, s.p90, s.min, s.max, s.n,
               extra.c_str());
   std::fflush(stdout);
 }
@@ -81,7 +115,7 @@ int main(int argc, char **argv) {
     return 2;
   }
   if (argc > 4)
-    g_label = argv[4];
+    g_label = json_escaped(argv[4]);
   llama_log_set([](ggml_log_level, const char *, void *) {}, nullptr);
   llama_backend_init();
 
@@ -176,13 +210,17 @@ int main(int argc, char **argv) {
     std::vector<double> step_ms, sample_ms;
     for (int s = 0; s < 40; ++s) {
       std::vector<lloyal::branch::DecodeEachItem> items;
-      auto ts = clk::now();
+      // Only sample() is timed: acceptance and bookkeeping are not what this
+      // row reports.
+      double sampled_ms = 0.0;
       for (auto h : hs) {
+        auto ts = clk::now();
         llama_token tok = lloyal::branch::sample(h, store);
+        sampled_ms += ms_since(ts);
         lloyal::branch::accept_token(h, tok, store);
         items.push_back({h, tok});
       }
-      sample_ms.push_back(ms_since(ts) / n);
+      sample_ms.push_back(sampled_ms / n);
       auto t = clk::now();
       store.decode_each(items);
       step_ms.push_back(ms_since(t));
