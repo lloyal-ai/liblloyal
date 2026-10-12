@@ -28,6 +28,7 @@ ctest --test-dir build
 - Unit tests go in `tests/` directory
 - Use doctest framework
 - Integration tests for complex workflows
+- An engine change (a llama.cpp pin move, a decode or sampling refactor) runs `tests/bench` before and after; the stop rule is in `tests/bench/README.md`
 
 ### Commit Messages
 - Use conventional commit format: `type(scope): description`
