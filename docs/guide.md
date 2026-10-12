@@ -580,12 +580,23 @@ liblloyal provides persistent handle-based APIs for efficient reuse of complex o
 ```cpp
 #include <lloyal/sampler.hpp>
 
-// Create reusable sampler chain (configure once, use many times)
-auto params = llama_sampler_chain_default_params();
-params.temp = 0.7f;
-params.top_k = 40;
-params.top_p = 0.95f;
+// Sampling parameters are the application's own type: anything with the
+// fields `SamplingParamsLike` names (a binding's generated struct qualifies).
+struct SamplingParams {
+    float temperature = 0.7f;
+    int32_t top_k = 40;
+    float top_p = 0.95f;
+    float typical_p = 1.0f;
+    float min_p = 0.05f;
+    float penalty_repeat = 1.1f;
+    float penalty_freq = 0.0f;
+    float penalty_present = 0.0f;
+    int32_t penalty_last_n = 64;
+    uint32_t seed = 42;
+};
 
+// Create reusable sampler chain (configure once, use many times)
+SamplingParams params;
 auto chain = lloyal::sampler::create_chain(params, llama_vocab_n_tokens(vocab));
 
 // Reuse chain across generation loop (no repeated initialization)
