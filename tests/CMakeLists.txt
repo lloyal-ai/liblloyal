@@ -116,14 +116,15 @@ add_custom_target(run_tests
   COMMENT "Running liblloyal tests..."
 )
 
-# ===== INTEGRATION TESTS =====
-# Optional: Build integration tests that link against real llama.cpp
-# These tests verify llama.cpp behavior hasn't changed in breaking ways
+# ===== LLAMA.CPP DISCOVERY =====
+# Shared by the integration tests and the benchmark: both link the real
+# llama.cpp. Either a lloyal.node build (shared libraries beside each other in
+# one directory) or a plain llama.cpp build tree (one static archive per
+# target) is accepted.
 option(LLOYAL_BUILD_INTEGRATION_TESTS "Build integration tests with real llama.cpp" OFF)
+option(LLOYAL_BUILD_BENCH "Build the engine benchmark with real llama.cpp" OFF)
 
-if(LLOYAL_BUILD_INTEGRATION_TESTS)
-  message(STATUS "Building integration tests with real llama.cpp")
-
+if(LLOYAL_BUILD_INTEGRATION_TESTS OR LLOYAL_BUILD_BENCH)
   # Configure llama.cpp paths
   # Can be overridden via -DLLAMA_CPP_DIR=/path/to/llama.cpp
   if(NOT DEFINED LLAMA_CPP_DIR)
@@ -158,28 +159,7 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
   get_filename_component(LLAMA_CPP_DYLIB_DIR "${LLAMA_CPP_DYLIB_DIR}" REALPATH)
 
   message(STATUS "Using llama.cpp from: ${LLAMA_CPP_DIR}")
-  message(STATUS "Using llama.cpp dylib from: ${LLAMA_CPP_DYLIB_DIR}")
-
-  # Integration test executable
-  add_executable(IntegrationRunner
-    integration/main.cpp
-    integration/behavioral_contract_test.cpp
-    integration/init_context_test.cpp
-    integration/e2e_parameter_flow_test.cpp
-    integration/sampler_integration_test.cpp
-    integration/clear_and_reseed_test.cpp
-    integration/chat_in_integration_test.cpp
-    integration/chat_out_integration_test.cpp
-    integration/kv_file_persistence_test.cpp
-    integration/embedding_integration_test.cpp
-    integration/multi_sequence_integration_test.cpp
-    integration/logits_integration_test.cpp
-    integration/branch_integration_test.cpp
-    integration/kv_pressure_integration_test.cpp
-    integration/decode_failure_integration_test.cpp
-    integration/contrastive_logits_test.cpp
-    integration/multimodal_integration_test.cpp
-  )
+  message(STATUS "Using llama.cpp libraries from: ${LLAMA_CPP_DYLIB_DIR}")
 
   # Create llama/ subdirectory and symlink headers so #include <llama/llama.h> works
   file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/include/llama)
@@ -198,19 +178,14 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
   set(LLAMA_CPP_COMMON_DIR "${LLAMA_CPP_DIR}/common")
   set(LLAMA_CPP_VENDOR_DIR "${LLAMA_CPP_DIR}/vendor")
 
-  target_include_directories(IntegrationRunner PRIVATE
-    ../include                              # liblloyal headers
-    ${CMAKE_CURRENT_BINARY_DIR}/include     # For llama/llama.h
-    ${LLAMA_CPP_INCLUDE_DIR}                # llama.cpp headers
-    ${GGML_INCLUDE_DIR}                     # ggml headers
-    ${LLAMA_CPP_COMMON_DIR}                 # common library headers (common.h, chat.h, etc.)
-    ${LLAMA_CPP_VENDOR_DIR}                 # vendor headers (nlohmann/json.hpp)
-    ${LLAMA_CPP_DIR}/tools/mtmd             # mtmd.h, mtmd-helper.h
-  )
-
-  # Fixture path (test images), so the runner works from any directory
-  target_compile_definitions(IntegrationRunner PRIVATE
-    LLOYAL_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
+  set(LLOYAL_LLAMA_INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include   # liblloyal headers
+    ${CMAKE_CURRENT_BINARY_DIR}/include      # For llama/llama.h
+    ${LLAMA_CPP_INCLUDE_DIR}                 # llama.cpp headers
+    ${GGML_INCLUDE_DIR}                      # ggml headers
+    ${LLAMA_CPP_COMMON_DIR}                  # common library headers (common.h, chat.h, etc.)
+    ${LLAMA_CPP_VENDOR_DIR}                  # vendor headers (nlohmann/json.hpp)
+    ${LLAMA_CPP_DIR}/tools/mtmd              # mtmd.h, mtmd-helper.h
   )
 
   # Find common library (static)
@@ -283,20 +258,42 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
     message(STATUS "Common-base library: ${LLAMA_COMMON_BASE_LIB}")
   endif()
 
-  # Find llama library (cross-platform)
+  # Find llama library: a shared library beside the others (lloyal.node) or the
+  # static archive in its own target directory (plain llama.cpp build tree)
   find_library(LLAMA_LIB
     NAMES llama
-    PATHS ${LLAMA_CPP_DYLIB_DIR}
+    PATHS
+      ${LLAMA_CPP_DYLIB_DIR}
+      ${LLAMA_CPP_DYLIB_DIR}/src
     NO_DEFAULT_PATH
   )
   if(NOT LLAMA_LIB)
     # Fallback: construct expected path
     set(LLAMA_LIB "${LLAMA_CPP_DYLIB_DIR}/libllama${CMAKE_SHARED_LIBRARY_SUFFIX}")
   endif()
+  get_filename_component(_LLAMA_LIB_EXT "${LLAMA_LIB}" LAST_EXT)
+  if(_LLAMA_LIB_EXT STREQUAL ".a" OR _LLAMA_LIB_EXT STREQUAL ".lib")
+    set(LLOYAL_LLAMA_STATIC ON)
+  else()
+    set(LLOYAL_LLAMA_STATIC OFF)
+  endif()
 
-  # Find ggml libraries if separate (lloyal-node structure has separate dylibs)
-  find_library(GGML_LIB NAMES ggml PATHS ${LLAMA_CPP_DYLIB_DIR} NO_DEFAULT_PATH)
-  find_library(GGML_BASE_LIB NAMES ggml-base PATHS ${LLAMA_CPP_DYLIB_DIR} NO_DEFAULT_PATH)
+  # ggml libraries: separate shared libraries beside libllama (lloyal.node), or
+  # one static archive per ggml target under ggml/src (plain build tree)
+  set(_GGML_PATHS ${LLAMA_CPP_DYLIB_DIR} ${LLAMA_CPP_DYLIB_DIR}/ggml/src)
+  find_library(GGML_LIB NAMES ggml PATHS ${_GGML_PATHS} NO_DEFAULT_PATH)
+  find_library(GGML_BASE_LIB NAMES ggml-base PATHS ${_GGML_PATHS} NO_DEFAULT_PATH)
+  set(GGML_BACKEND_LIBS)
+  foreach(_backend cpu metal blas cuda vulkan)
+    find_library(GGML_${_backend}_LIB
+      NAMES ggml-${_backend}
+      PATHS ${_GGML_PATHS} ${LLAMA_CPP_DYLIB_DIR}/ggml/src/ggml-${_backend}
+      NO_DEFAULT_PATH
+    )
+    if(GGML_${_backend}_LIB)
+      list(APPEND GGML_BACKEND_LIBS ${GGML_${_backend}_LIB})
+    endif()
+  endforeach()
 
   # mtmd — multimodal codec, required by <lloyal/mtmd.hpp>. Not built by
   # default: llama.cpp leaves LLAMA_BUILD_TOOLS off, so tools/mtmd declares no
@@ -320,35 +317,85 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
   endif()
   message(STATUS "mtmd library: ${MTMD_LIB}")
 
-  set(LLAMA_LIBS ${LLAMA_LIB})
-  if(GGML_LIB)
-    list(APPEND LLAMA_LIBS ${GGML_LIB})
-  endif()
-  if(GGML_BASE_LIB)
-    list(APPEND LLAMA_LIBS ${GGML_BASE_LIB})
-  endif()
-  # mtmd calls into llama/ggml, so it precedes them in the link line.
-  list(PREPEND LLAMA_LIBS ${MTMD_LIB})
-
-  # Link order: common before common-base (common calls into base); base before
-  # libllama.dylib (which provides ggml symbols that base may reference).
-  set(LLAMA_COMMON_LIBS ${LLAMA_COMMON_LIB})
+  # Link order follows the dependency chain: mtmd and common call into llama,
+  # common calls into common-base and the vendored libraries, llama calls into
+  # ggml, the ggml backends call into ggml-base.
+  set(LLOYAL_LLAMA_LINK_LIBS ${LLAMA_COMMON_LIB})
   if(LLAMA_COMMON_BASE_LIB)
-    list(APPEND LLAMA_COMMON_LIBS ${LLAMA_COMMON_BASE_LIB})
+    list(APPEND LLOYAL_LLAMA_LINK_LIBS ${LLAMA_COMMON_BASE_LIB})
+  endif()
+  list(APPEND LLOYAL_LLAMA_LINK_LIBS ${MTMD_LIB} ${LLAMA_LIB})
+  if(GGML_LIB)
+    list(APPEND LLOYAL_LLAMA_LINK_LIBS ${GGML_LIB})
+  endif()
+  list(APPEND LLOYAL_LLAMA_LINK_LIBS ${GGML_BACKEND_LIBS})
+  if(GGML_BASE_LIB)
+    list(APPEND LLOYAL_LLAMA_LINK_LIBS ${GGML_BASE_LIB})
+  endif()
+  if(LLOYAL_LLAMA_STATIC)
+    # Libraries llama.cpp vendors as separate archives (hashing, HTTP); common
+    # references them, so they close the static link line.
+    file(GLOB LLAMA_VENDOR_LIBS
+      ${LLAMA_CPP_DYLIB_DIR}/vendor/*/*.a
+      ${LLAMA_CPP_DYLIB_DIR}/vendor/*/*.lib)
+    list(APPEND LLOYAL_LLAMA_LINK_LIBS ${LLAMA_VENDOR_LIBS})
+    if(APPLE)
+      list(APPEND LLOYAL_LLAMA_LINK_LIBS
+        "-framework Metal" "-framework MetalKit" "-framework Foundation"
+        "-framework Accelerate" "-framework CoreGraphics")
+    endif()
+    if(NOT APPLE AND NOT MSVC)
+      # GNU ld resolves archives in one pass; group them so order never bites.
+      list(PREPEND LLOYAL_LLAMA_LINK_LIBS "-Wl,--start-group")
+      list(APPEND LLOYAL_LLAMA_LINK_LIBS "-Wl,--end-group")
+    endif()
   endif()
 
-  target_link_libraries(IntegrationRunner PRIVATE
-    ${LLAMA_COMMON_LIBS}
-    ${LLAMA_LIBS}
-    doctest::doctest
-  )
+  # Everything a target needs to compile and link against this llama.cpp.
+  function(lloyal_link_llama target)
+    target_include_directories(${target} PRIVATE ${LLOYAL_LLAMA_INCLUDE_DIRS})
+    target_link_libraries(${target} PRIVATE ${LLOYAL_LLAMA_LINK_LIBS})
+    # Set RPATH so a shared libllama can be found at runtime
+    set_target_properties(${target} PROPERTIES
+      BUILD_RPATH "${LLAMA_CPP_DYLIB_DIR}"
+      INSTALL_RPATH "${LLAMA_CPP_DYLIB_DIR}"
+    )
+  endfunction()
+endif()
 
-  # Set RPATH so dylib can be found at runtime
-  set_target_properties(IntegrationRunner PROPERTIES
-    BUILD_RPATH "${LLAMA_CPP_DYLIB_DIR}"
-    INSTALL_RPATH "${LLAMA_CPP_DYLIB_DIR}"
-  )
+# ===== INTEGRATION TESTS =====
+# Optional: Build integration tests that link against real llama.cpp
+# These tests verify llama.cpp behavior hasn't changed in breaking ways
+if(LLOYAL_BUILD_INTEGRATION_TESTS)
+  message(STATUS "Building integration tests with real llama.cpp")
 
+  # Integration test executable
+  add_executable(IntegrationRunner
+    integration/main.cpp
+    integration/behavioral_contract_test.cpp
+    integration/init_context_test.cpp
+    integration/e2e_parameter_flow_test.cpp
+    integration/sampler_integration_test.cpp
+    integration/clear_and_reseed_test.cpp
+    integration/chat_in_integration_test.cpp
+    integration/chat_out_integration_test.cpp
+    integration/kv_file_persistence_test.cpp
+    integration/embedding_integration_test.cpp
+    integration/multi_sequence_integration_test.cpp
+    integration/logits_integration_test.cpp
+    integration/branch_integration_test.cpp
+    integration/kv_pressure_integration_test.cpp
+    integration/decode_failure_integration_test.cpp
+    integration/contrastive_logits_test.cpp
+    integration/multimodal_integration_test.cpp
+  )
+  lloyal_link_llama(IntegrationRunner)
+  target_link_libraries(IntegrationRunner PRIVATE doctest::doctest)
+
+  # Fixture path (test images), so the runner works from any directory
+  target_compile_definitions(IntegrationRunner PRIVATE
+    LLOYAL_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
+  )
   # Optional: UBSan for integration tests (pass -DLLOYAL_ENABLE_UBSAN_INTEGRATION=ON)
   # NOTE: ASan is deliberately excluded — libllama.dylib is not ASan-instrumented,
   # and mixing instrumented/uninstrumented code causes false positives or crashes.
@@ -393,4 +440,15 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
     # IntegrationRunner is invoked directly.
     TIMEOUT 1800
   )
+endif()
+
+# ===== BENCHMARK =====
+# The engine-level benchmark: one binary, compiled against whichever llama.cpp
+# the build directory holds, so a pin and its successor report the same items
+# in the same units. See bench/README.md for the run and the stop rule.
+if(LLOYAL_BUILD_BENCH)
+  message(STATUS "Building the engine benchmark with real llama.cpp")
+  add_executable(Bench bench/bench_main.cpp)
+  lloyal_link_llama(Bench)
+  target_compile_options(Bench PRIVATE -O2)
 endif()
