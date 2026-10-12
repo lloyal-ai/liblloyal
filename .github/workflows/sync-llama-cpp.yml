@@ -117,15 +117,7 @@ jobs:
           printf '# llama.cpp version for integration tests\n# Last updated: %s\n# Format: git commit hash or tag\n%s\n' \
             "$DATE" "$TARGET" > .llama-cpp-version
 
-          # Update CMakeLists.txt hardcoded version strings
-          sed -i "s/llama.cpp (${CURRENT} or compatible)/llama.cpp (${TARGET} or compatible)/" CMakeLists.txt
-          sed -i "s/against llama.cpp ${CURRENT}/against llama.cpp ${TARGET}/" CMakeLists.txt
-          sed -i "s/STREQUAL \"${CURRENT}\"/STREQUAL \"${TARGET}\"/" CMakeLists.txt
-          sed -i "s/llama.cpp ${CURRENT}, found/llama.cpp ${TARGET}, found/" CMakeLists.txt
-          sed -i "s/llama.cpp version ${CURRENT}/llama.cpp version ${TARGET}/" CMakeLists.txt
-          sed -i "s/Recommended: ${CURRENT}/Recommended: ${TARGET}/" CMakeLists.txt
-
-          git add .llama-cpp-version CMakeLists.txt
+          git add .llama-cpp-version
           git commit -m "chore(deps): bump llama.cpp ${CURRENT} -> ${TARGET}"
           git push origin "$BRANCH"
 
@@ -137,7 +129,6 @@ jobs:
 
           **Changes:**
           - \`.llama-cpp-version\`: ${CURRENT} -> ${TARGET}
-          - \`CMakeLists.txt\`: version check strings updated
 
           **Review checklist:**
           - [ ] Integration tests pass (CI runs automatically)
