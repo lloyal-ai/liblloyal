@@ -52,7 +52,7 @@ TEST_CASE("ModelKeyHash: deterministic hashing") {
 TEST_CASE("ModelRegistry: path normalization") {
   resetStubConfig();
 
-  auto params = llama_model_params{.n_gpu_layers = 32, .use_mmap = true};
+  auto params = llama_model_params{.n_gpu_layers = 32, .load_mode = LLAMA_LOAD_MODE_MMAP};
 
   // file:// URI and filesystem path should normalize to same key
   std::string path1 = "file:///tmp/test/model.gguf";
@@ -71,7 +71,7 @@ TEST_CASE("ModelRegistry: path normalization") {
 TEST_CASE("ModelRegistry: cache hit behavior") {
   resetStubConfig();
 
-  auto params = llama_model_params{.n_gpu_layers = 32, .use_mmap = true};
+  auto params = llama_model_params{.n_gpu_layers = 32, .load_mode = LLAMA_LOAD_MODE_MMAP};
 
   std::string path = "/path/to/model.gguf";
 
@@ -106,9 +106,9 @@ TEST_CASE("ModelRegistry: cache miss behavior") {
   std::string path = "/path/to/model.gguf";
 
   SUBCASE("Different GPU layers produce different models") {
-    auto params1 = llama_model_params{.n_gpu_layers = 32, .use_mmap = true};
+    auto params1 = llama_model_params{.n_gpu_layers = 32, .load_mode = LLAMA_LOAD_MODE_MMAP};
 
-    auto params2 = llama_model_params{.n_gpu_layers = 16, .use_mmap = true};
+    auto params2 = llama_model_params{.n_gpu_layers = 16, .load_mode = LLAMA_LOAD_MODE_MMAP};
 
     auto model1 = ModelRegistry::acquire(path, params1);
     auto model2 = ModelRegistry::acquire(path, params2);
@@ -121,9 +121,9 @@ TEST_CASE("ModelRegistry: cache miss behavior") {
   }
 
   SUBCASE("Different mmap settings produce different models") {
-    auto params1 = llama_model_params{.n_gpu_layers = 32, .use_mmap = true};
+    auto params1 = llama_model_params{.n_gpu_layers = 32, .load_mode = LLAMA_LOAD_MODE_MMAP};
 
-    auto params2 = llama_model_params{.n_gpu_layers = 32, .use_mmap = false};
+    auto params2 = llama_model_params{.n_gpu_layers = 32, .load_mode = LLAMA_LOAD_MODE_NONE};
 
     auto model1 = ModelRegistry::acquire(path, params1);
     auto model2 = ModelRegistry::acquire(path, params2);
@@ -139,7 +139,7 @@ TEST_CASE("ModelRegistry: cache miss behavior") {
 TEST_CASE("ModelRegistry: reference counting") {
   resetStubConfig();
 
-  auto params = llama_model_params{.n_gpu_layers = 32, .use_mmap = true};
+  auto params = llama_model_params{.n_gpu_layers = 32, .load_mode = LLAMA_LOAD_MODE_MMAP};
 
   std::string path = "/path/to/model.gguf";
 
@@ -166,7 +166,7 @@ TEST_CASE("ModelRegistry: reference counting") {
 TEST_CASE("ModelRegistry: automatic cleanup") {
   resetStubConfig();
 
-  auto params = llama_model_params{.n_gpu_layers = 32, .use_mmap = true};
+  auto params = llama_model_params{.n_gpu_layers = 32, .load_mode = LLAMA_LOAD_MODE_MMAP};
 
   std::string path = "/path/to/model.gguf";
 
@@ -187,7 +187,7 @@ TEST_CASE("ModelRegistry: automatic cleanup") {
 TEST_CASE("ModelRegistry: after last release, next acquire makes new model") {
   resetStubConfig();
 
-  auto params = llama_model_params{.n_gpu_layers = 32, .use_mmap = true};
+  auto params = llama_model_params{.n_gpu_layers = 32, .load_mode = LLAMA_LOAD_MODE_MMAP};
 
   std::string path = "/path/to/model.gguf";
 
@@ -215,7 +215,7 @@ TEST_CASE("ModelRegistry: after last release, next acquire makes new model") {
 TEST_CASE("ModelRegistry: error handling") {
   resetStubConfig();
 
-  auto params = llama_model_params{.n_gpu_layers = 32, .use_mmap = true};
+  auto params = llama_model_params{.n_gpu_layers = 32, .load_mode = LLAMA_LOAD_MODE_MMAP};
 
   std::string path = "/path/to/model.gguf";
 
@@ -231,7 +231,7 @@ TEST_CASE("ModelRegistry: error handling") {
 TEST_CASE("ModelRegistry: model size reporting") {
   resetStubConfig();
 
-  auto params = llama_model_params{.n_gpu_layers = 32, .use_mmap = true};
+  auto params = llama_model_params{.n_gpu_layers = 32, .load_mode = LLAMA_LOAD_MODE_MMAP};
 
   std::string path = "/path/to/model.gguf";
 

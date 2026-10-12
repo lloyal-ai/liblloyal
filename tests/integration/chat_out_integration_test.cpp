@@ -106,7 +106,9 @@ TEST_CASE("ChatOut Integration: parse plain text output") {
   auto result = lloyal::chat_out::parse(
     "Hello, I'm an AI assistant!",
     fmt.format,
-    fmt.reasoning_format
+    false,
+    fmt.generation_prompt,
+    fmt.parser
   );
 
   CHECK(!result.content.empty());
@@ -143,11 +145,7 @@ TEST_CASE("ChatOut Integration: parse with format from chat_in roundtrip") {
   MESSAGE("generated: \"" << output << "\"");
   auto result = lloyal::chat_out::parse(
     output,
-    fmt.format,
-    fmt.reasoning_format,
-    false,
-    fmt.generation_prompt,
-    fmt.parser
+    fmt.format, false, fmt.generation_prompt, fmt.parser
   );
 
   MESSAGE("Parsed content: \"" << result.content << "\"");
@@ -155,7 +153,7 @@ TEST_CASE("ChatOut Integration: parse with format from chat_in roundtrip") {
   CHECK((!result.content.empty() || !result.tool_calls.empty()));
   if (fmt.supports_thinking) {
     CHECK(result.content.find(fmt.thinking_start_tag) == std::string::npos);
-    CHECK(result.content.find(fmt.thinking_end_tag) == std::string::npos);
+    CHECK(result.content.find(fmt.thinking_end_tags.front()) == std::string::npos);
   }
 }
 
@@ -176,7 +174,7 @@ static std::optional<lloyal::chat_in::FormatResult> thinking_format(const llama_
   inputs.messages_json = json::array({{{"role", "user"}, {"content", user}}}).dump();
   inputs.tools_json = tools_json;
   auto fmt = lloyal::chat_in::format(model, inputs);
-  if (!fmt.supports_thinking || fmt.thinking_end_tag.empty()) return std::nullopt;
+  if (!fmt.supports_thinking || fmt.thinking_end_tags.empty()) return std::nullopt;
   return fmt;
 }
 
@@ -190,11 +188,11 @@ TEST_CASE("ChatOut Integration: a thinking model's reply parses apart from its r
 
   const std::string output = generate(model.get(), fmt->prompt, 1024);
   MESSAGE("generated: \"" << output << "\"");
-  REQUIRE_MESSAGE(output.find(fmt->thinking_end_tag) != std::string::npos, "the model closed its reasoning within the budget");
+  REQUIRE_MESSAGE(output.find(fmt->thinking_end_tags.front()) != std::string::npos, "the model closed its reasoning within the budget");
 
-  auto result = lloyal::chat_out::parse(output, fmt->format, fmt->reasoning_format, false, fmt->generation_prompt, fmt->parser);
+  auto result = lloyal::chat_out::parse(output, fmt->format, false, fmt->generation_prompt, fmt->parser);
   MESSAGE("content: \"" << result.content << "\"");
-  CHECK(result.content.find(fmt->thinking_end_tag) == std::string::npos);
+  CHECK(result.content.find(fmt->thinking_end_tags.front()) == std::string::npos);
   CHECK(result.content.find(fmt->thinking_start_tag) == std::string::npos);
   CHECK(result.content.find('4') != std::string::npos);
   CHECK(!result.reasoning_content.empty());
@@ -216,11 +214,11 @@ TEST_CASE("ChatOut Integration: a thinking model's tool call parses, and its rea
 
   const std::string output = generate(model.get(), fmt->prompt, 1024);
   MESSAGE("generated: \"" << output << "\"");
-  auto result = lloyal::chat_out::parse(output, fmt->format, fmt->reasoning_format, false, fmt->generation_prompt, fmt->parser);
+  auto result = lloyal::chat_out::parse(output, fmt->format, false, fmt->generation_prompt, fmt->parser);
 
   REQUIRE(result.tool_calls.size() == 1);
   CHECK(result.tool_calls[0].name == "get_time");
-  CHECK(result.content.find(fmt->thinking_end_tag) == std::string::npos);
+  CHECK(result.content.find(fmt->thinking_end_tags.front()) == std::string::npos);
   CHECK(!result.reasoning_content.empty());
 }
 

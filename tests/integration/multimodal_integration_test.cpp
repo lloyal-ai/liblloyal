@@ -803,7 +803,7 @@ TEST_CASE("audio: Qwen ASR prompt and tokenization match upstream"
 
   const auto bytes = read_fixture("asr-counting.wav");
   REQUIRE(!bytes.empty());
-  auto decoded = mtmd_helper_bitmap_init_from_buf(mtmd, bytes.data(), bytes.size(), false);
+  auto decoded = mtmd_helper_bitmap_init_from_buf(mtmd, bytes.data(), bytes.size(), false, mtmd_helper_init_opt_default());
   REQUIRE(decoded.bitmap);
   REQUIRE(decoded.video_ctx == nullptr);
   ::mtmd::bitmap_ptr bitmap(decoded.bitmap);
@@ -811,8 +811,16 @@ TEST_CASE("audio: Qwen ASR prompt and tokenization match upstream"
   const mtmd_bitmap* ptr = bitmap.get();
   ::mtmd::input_chunks_ptr expected(mtmd_input_chunks_init());
   ::mtmd::input_chunks_ptr observed(mtmd_input_chunks_init());
-  mtmd_input_text reference{upstream.c_str(), true, true};
-  mtmd_input_text input{actual.c_str(), false, true};
+  mtmd_input_text reference{};
+  reference.text = upstream.c_str();
+  reference.text_len = upstream.size();
+  reference.add_special = true;
+  reference.parse_special = true;
+  mtmd_input_text input{};
+  input.text = actual.c_str();
+  input.text_len = actual.size();
+  input.add_special = false;
+  input.parse_special = true;
   REQUIRE(mtmd_tokenize(mtmd, expected.get(), &reference, &ptr, 1) == 0);
   REQUIRE(mtmd_tokenize(mtmd, observed.get(), &input, &ptr, 1) == 0);
   REQUIRE(mtmd_input_chunks_size(observed.get()) == mtmd_input_chunks_size(expected.get()));

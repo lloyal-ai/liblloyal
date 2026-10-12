@@ -60,8 +60,8 @@ struct ToolCall {
  * chat_in::format() can reconstruct the template correctly on subsequent turns.
  *
  * @code{.cpp}
- * auto parsed = chat_out::parse(raw_output, fmt.format, fmt.reasoning_format,
- *                                false, fmt.generation_prompt, fmt.parser);
+ * auto parsed = chat_out::parse(raw_output, fmt.format, false,
+ *                                fmt.generation_prompt, fmt.parser);
  *
  * // Build assistant message with separate fields
  * json assistant_msg = {{"role", "assistant"}, {"content", parsed.content}};
@@ -90,27 +90,28 @@ struct ParseResult {
  *
  * @param output The raw model output text to parse
  * @param format The chat format (from chat_in::FormatResult.format)
- * @param reasoning_format How to handle reasoning/thinking blocks
  * @param is_partial True if output is incomplete (streaming)
  * @param generation_prompt Generation prompt prefill text (e.g. "<think>")
- * @param parser_data Serialized PEG parser (from chat_in::FormatResult.parser).
- *                    Required for PEG format models; ignored for others.
+ * @param parser The PEG parser chat_in::format built for this conversation
+ *               (chat_in::FormatResult.parser). It is an object graph, not a
+ *               string: keep the FormatResult and hand its parser back here.
+ *               How reasoning is parsed is decided when the parser is built,
+ *               from the reasoning_format the template was applied with.
  *
  * @return ParseResult with content, reasoning_content, and tool_calls
  *
  * @note This function never throws. On error, returns raw output as content.
  *
- * @warning For PEG format models (COMMON_CHAT_FORMAT_PEG_*), the @p parser_data
- * parameter must contain the serialized PEG parser from chat_in::FormatResult::parser.
- * Omitting it will cause parse failures for these formats.
+ * @warning For PEG format models (COMMON_CHAT_FORMAT_PEG_*), @p parser must be
+ * the one from chat_in::FormatResult::parser. A default arena parses nothing.
  *
  * @see lloyal::chat_in::format()
  *
  * @code{.cpp}
  * auto fmt = chat_in::format(model, inputs);
  * // ... generate tokens ...
- * auto parsed = chat_out::parse(output_text, fmt.format, fmt.reasoning_format,
- *                                false, fmt.generation_prompt, fmt.parser);
+ * auto parsed = chat_out::parse(output_text, fmt.format, false,
+ *                                fmt.generation_prompt, fmt.parser);
  * if (!parsed.tool_calls.empty()) {
  *   // Handle tool calls
  * }
@@ -129,8 +130,8 @@ struct ParseResult {
  * std::string raw_output = detokenized_text;
  *
  * // Parse: separates reasoning from content
- * auto parsed = chat_out::parse(raw_output, fmt.format,
- *     fmt.reasoning_format, false, fmt.generation_prompt, fmt.parser);
+ * auto parsed = chat_out::parse(raw_output, fmt.format, false,
+ *     fmt.generation_prompt, fmt.parser);
  *
  * // Store with separate fields for correct re-formatting on cold restart
  * json msg = {{"role", "assistant"}, {"content", parsed.content}};
@@ -143,10 +144,9 @@ struct ParseResult {
 inline ParseResult parse(
     const std::string& output,
     common_chat_format format,
-    common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_NONE,
     bool is_partial = false,
     const std::string& generation_prompt = "",
-    const std::string& parser_data = ""
+    const common_peg_arena& parser = {}
 ) {
   ParseResult result;
 
@@ -154,16 +154,11 @@ inline ParseResult parse(
     // Build parser params
     common_chat_parser_params syntax;
     syntax.format = format;
-    syntax.reasoning_format = reasoning_format;
-    syntax.generation_prompt = generation_prompt;
-
-    // Load serialized PEG parser if provided (required for PEG format models)
-    if (!parser_data.empty()) {
-      syntax.parser.load(parser_data);
-    }
+    syntax.generation_prompt = common_chat_input(generation_prompt);
+    syntax.parser = parser;
 
     // Call llama.cpp's output parser
-    common_chat_msg msg = common_chat_parse(output, is_partial, syntax);
+    common_chat_msg msg = common_chat_parse(common_chat_input(output), is_partial, syntax);
 
     // Convert to ParseResult
     result.content = msg.content;
@@ -222,8 +217,7 @@ inline ParseResult parse(
     common_chat_params params = common_chat_templates_apply(tmpls.get(), inputs);
 
     // Delegate to explicit-format overload
-    return parse(output, params.format, COMMON_REASONING_FORMAT_NONE, is_partial,
-                 params.generation_prompt);
+    return parse(output, params.format, is_partial, params.generation_prompt, params.parser);
 
   } catch (const std::exception& e) {
     LLOYAL_LOG_DEBUG("[chat_out::parse] Auto-detect failed: %s", e.what());

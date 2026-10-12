@@ -5,6 +5,30 @@ All notable changes to liblloyal will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+- llama.cpp pinned to b11559 (from b9581, 2026-06-09): about two thousand
+  upstream commits. Required by models whose architectures the old pin did not
+  know (EmbeddingGemma 2) and by the upstream fix that makes `fork()` carry the
+  repetition-penalty window (the four fork-fidelity integration cases, held
+  since the defect was found, now pass).
+- Breaking: `chat_in::FormatResult.parser` is a `common_peg_arena` (upstream
+  dropped the parser's string form) and `thinking_end_tag` is
+  `thinking_end_tags`; `chat_out::parse` takes the arena and no longer takes a
+  reasoning format, which upstream now decides when the parser is built.
+- Breaking: `sampler::create_chain` and `BranchStore::create_sampler` take the
+  vocabulary size, which upstream's penalties sampler needs.
+- `ModelRegistry` keys on `llama_model_params.load_mode` (upstream replaced
+  `use_mmap`, `use_mlock` and `use_direct_io` with it).
+- `decode.hpp` and `embedding.hpp` fill `llama_batch_init` batches themselves and
+  no longer include llama.cpp's `common.h`; `llama_batch` and `mtmd_input_text`
+  carry `static_assert` shape guards, and `MtmdSource` names the text struct's
+  fields (upstream inserted `text_len`, which a positional initialiser compiled
+  wrong without a word).
+- `tests/bench`: the engine benchmark and the b9581 baseline taken on an M2 Pro;
+  the integration CMake links against a plain llama.cpp build tree; the version
+  check reads `.llama-cpp-version`.
+
 ## 3.0.0 — 2026-06-12
 
 - **Relicensed from Apache 2.0 to FSL-1.1-Apache-2.0** (Functional Source

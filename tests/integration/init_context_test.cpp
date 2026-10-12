@@ -67,13 +67,13 @@ TEST_CASE("Integration: ModelRegistry respects n_gpu_layers parameter") {
   }
 }
 
-TEST_CASE("Integration: ModelRegistry respects use_mmap parameter") {
+TEST_CASE("Integration: ModelRegistry respects load_mode parameter") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
-  SUBCASE("use_mmap = true (memory mapped loading)") {
+  SUBCASE("load_mode = mmap") {
     auto model_params = llama_model_default_params();
-    model_params.use_mmap = true;
+    model_params.load_mode = LLAMA_LOAD_MODE_MMAP;
     model_params.n_gpu_layers = 0; // CPU for determinism
 
     auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
@@ -83,9 +83,9 @@ TEST_CASE("Integration: ModelRegistry respects use_mmap parameter") {
     CHECK(model_size > 0);
   }
 
-  SUBCASE("use_mmap = false (direct loading)") {
+  SUBCASE("load_mode = none (direct loading)") {
     auto model_params = llama_model_default_params();
-    model_params.use_mmap = false;
+    model_params.load_mode = LLAMA_LOAD_MODE_NONE;
     model_params.n_gpu_layers = 0; // CPU for determinism
 
     auto model = ModelRegistry::acquire(MODEL_PATH, model_params);
@@ -103,11 +103,11 @@ TEST_CASE("Integration: Multiple models can coexist with different params") {
   // Load same model with different parameters
   auto params_cpu = llama_model_default_params();
   params_cpu.n_gpu_layers = 0;
-  params_cpu.use_mmap = true;
+  params_cpu.load_mode = LLAMA_LOAD_MODE_MMAP;
 
   auto params_gpu = llama_model_default_params();
   params_gpu.n_gpu_layers = -1;
-  params_gpu.use_mmap = false;
+  params_gpu.load_mode = LLAMA_LOAD_MODE_NONE;
 
   auto model1 = ModelRegistry::acquire(MODEL_PATH, params_cpu);
   auto model2 = ModelRegistry::acquire(MODEL_PATH, params_gpu);

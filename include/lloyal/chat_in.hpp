@@ -41,6 +41,8 @@
 #include "tokenizer.hpp"
 #include <llama/llama.h>
 #include <chat.h>         // llama.cpp common library: common_chat_templates_*
+#include <json.h>
+#include <peg-parser.h>
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <exception>
@@ -93,10 +95,10 @@ struct FormatResult {
   std::string generation_prompt;                    ///< Generation prompt prefill (e.g. "<think>")
   std::vector<common_grammar_trigger> grammar_triggers; ///< Triggers for lazy grammar activation
   std::vector<std::string> preserved_tokens;       ///< Tokens to preserve during grammar constraining
-  std::string parser;                              ///< PEG parser definition (for PEG formats)
+  common_peg_arena parser;                         ///< PEG parser (for PEG formats)
   bool supports_thinking = false;                  ///< Template renders a reasoning section
   std::string thinking_start_tag;                  ///< Tag the template opens reasoning with (empty if none)
-  std::string thinking_end_tag;                    ///< Tag it closes with — Qwen "</think>", Magistral "[/THINK]"
+  std::vector<std::string> thinking_end_tags;      ///< Tags it closes with — Qwen "</think>", Magistral "[/THINK]"
 
   // Carried through for chat_out pairing
   common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_NONE; ///< Reasoning format for output parsing
@@ -140,9 +142,6 @@ inline FormatResult format(const llama_model *model, const FormatInputs& inputs)
   FormatResult result;
 
   try {
-    using json = nlohmann::ordered_json;
-    json messages_array = json::parse(inputs.messages_json);
-
     // Initialize templates from model (or override)
     common_chat_templates_ptr tmpls = common_chat_templates_init(model, inputs.template_override);
     if (!tmpls) {
@@ -152,7 +151,7 @@ inline FormatResult format(const llama_model *model, const FormatInputs& inputs)
 
     {
       // Parse messages
-      std::vector<common_chat_msg> messages = common_chat_msgs_parse_oaicompat(messages_array);
+      std::vector<common_chat_msg> messages = common_chat_msgs_parse_oaicompat(common_json::parse(inputs.messages_json));
 
       // Build full template inputs
       common_chat_templates_inputs tmpl_inputs;
@@ -162,8 +161,7 @@ inline FormatResult format(const llama_model *model, const FormatInputs& inputs)
 
       // Tools
       if (!inputs.tools_json.empty()) {
-        json tools_array = json::parse(inputs.tools_json);
-        tmpl_inputs.tools = common_chat_tools_parse_oaicompat(tools_array);
+        tmpl_inputs.tools = common_chat_tools_parse_oaicompat(common_json::parse(inputs.tools_json));
         tmpl_inputs.tool_choice = common_chat_tool_choice_parse_oaicompat(inputs.tool_choice);
         tmpl_inputs.parallel_tool_calls = inputs.parallel_tool_calls;
       }
@@ -275,7 +273,7 @@ inline FormatResult format(const llama_model *model, const FormatInputs& inputs)
       result.parser = params.parser;
       result.supports_thinking = params.supports_thinking;
       result.thinking_start_tag = params.thinking_start_tag;
-      result.thinking_end_tag = params.thinking_end_tag;
+      result.thinking_end_tags = params.thinking_end_tags;
 
       // Carry reasoning_format through for chat_out pairing
       result.reasoning_format = tmpl_inputs.reasoning_format;
@@ -295,14 +293,11 @@ inline FormatResult format(const llama_model *model, const FormatInputs& inputs)
     // Inject a sentinel user message, re-apply the template, then strip the
     // sentinel user turn from the output to recover just the system/tool portion.
     try {
-      using json = nlohmann::ordered_json;
-      json messages_array = json::parse(inputs.messages_json);
-
       common_chat_templates_ptr tmpls = common_chat_templates_init(model, inputs.template_override);
       if (tmpls) {
         static const std::string SENTINEL = "\x1F__LLOYAL_RETRY__\x1F";
 
-        std::vector<common_chat_msg> messages = common_chat_msgs_parse_oaicompat(messages_array);
+        std::vector<common_chat_msg> messages = common_chat_msgs_parse_oaicompat(common_json::parse(inputs.messages_json));
 
         // Check that no user role exists (otherwise the failure was something else)
         bool has_user = false;
@@ -325,8 +320,7 @@ inline FormatResult format(const llama_model *model, const FormatInputs& inputs)
 
           // Carry over tools so the system block includes tool definitions
           if (!inputs.tools_json.empty()) {
-            json tools_array = json::parse(inputs.tools_json);
-            tmpl_inputs.tools = common_chat_tools_parse_oaicompat(tools_array);
+            tmpl_inputs.tools = common_chat_tools_parse_oaicompat(common_json::parse(inputs.tools_json));
             tmpl_inputs.tool_choice = common_chat_tool_choice_parse_oaicompat(inputs.tool_choice);
             tmpl_inputs.parallel_tool_calls = inputs.parallel_tool_calls;
           }
@@ -408,7 +402,7 @@ inline FormatResult format(const llama_model *model, const FormatInputs& inputs)
             // opens a reasoning block — a contradiction a consumer cannot repair.
             result.supports_thinking = params.supports_thinking;
             result.thinking_start_tag = params.thinking_start_tag;
-            result.thinking_end_tag = params.thinking_end_tag;
+            result.thinking_end_tags = params.thinking_end_tags;
             result.reasoning_format = tmpl_inputs.reasoning_format;
 
             LLOYAL_LOG_DEBUG(

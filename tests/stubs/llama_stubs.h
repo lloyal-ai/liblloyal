@@ -34,15 +34,24 @@ struct llama_batch {
     int32_t* n_seq_id;
     llama_seq_id** seq_id;
     int8_t* logits;
+};
+// The real struct's shape, exactly: liblloyal guards it with a static_assert.
+// The stub keeps each batch's capacity beside the struct, not inside it.
 
-    // Stub-specific: track allocated capacity for cleanup
-    int32_t _capacity;
+// How the model's tensors are brought into memory (llama.cpp b10000+)
+enum llama_load_mode {
+    LLAMA_LOAD_MODE_AUTO       = -1,
+    LLAMA_LOAD_MODE_NONE       =  0,
+    LLAMA_LOAD_MODE_MMAP       =  1,
+    LLAMA_LOAD_MODE_MLOCK      =  2,
+    LLAMA_LOAD_MODE_MMAP_MLOCK =  3,
+    LLAMA_LOAD_MODE_DIRECT_IO  =  4,
 };
 
 // Model parameters structure matching llama.cpp
 struct llama_model_params {
-    int n_gpu_layers = -1;  // Number of layers to offload to GPU (-1 = all)
-    bool use_mmap = true;   // Use memory mapping for model loading
+    int n_gpu_layers = -1;                            // Number of layers to offload to GPU (-1 = all)
+    enum llama_load_mode load_mode = LLAMA_LOAD_MODE_AUTO;  // How to load the model
 };
 
 // Context parameters structure matching llama.cpp
@@ -189,6 +198,7 @@ extern "C" {
     llama_sampler* llama_sampler_init_min_p(float p, size_t min_keep);
     llama_sampler* llama_sampler_init_typical(float p, size_t min_keep);
     llama_sampler* llama_sampler_init_penalties(
+        int32_t n_vocab,
         int32_t penalty_last_n,
         float penalty_repeat,
         float penalty_freq,

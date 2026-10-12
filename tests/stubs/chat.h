@@ -4,6 +4,7 @@
 #pragma once
 
 #include "common.h"
+#include "json.h"
 #include "peg-parser.h"
 #include "llama/llama.h"
 #include "llama_stubs.h"
@@ -114,26 +115,34 @@ struct common_chat_params {
   std::string generation_prompt;
   bool supports_thinking = false;
   std::string thinking_start_tag;
-  std::string thinking_end_tag;
+  std::vector<std::string> thinking_end_tags;
   std::vector<common_grammar_trigger> grammar_triggers;
   std::vector<std::string> preserved_tokens;
   std::vector<std::string> additional_stops;
-  std::string parser;
+  common_peg_arena parser;
+};
+
+// The text a parser sees, with the tokens it came from when the caller has them
+struct common_chat_input {
+  std::string text;
+  std::vector<llama_token> tokens;
+
+  common_chat_input() = default;
+  explicit common_chat_input(std::string t) : text(std::move(t)), tokens(text.size(), LLAMA_TOKEN_NULL) {}
 };
 
 // Parser parameters (for common_chat_parse)
 struct common_chat_parser_params {
   common_chat_format format = COMMON_CHAT_FORMAT_CONTENT_ONLY;
-  common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_NONE;
-  bool reasoning_in_content = false;
-  std::string generation_prompt;
-  bool parse_tool_calls = true;
+  common_chat_input generation_prompt;
+  bool debug = false;
   common_peg_arena parser = {};
 
   common_chat_parser_params() = default;
   common_chat_parser_params(const common_chat_params& chat_params) {
     format = chat_params.format;
-    generation_prompt = chat_params.generation_prompt;
+    generation_prompt = common_chat_input(chat_params.generation_prompt);
+    parser = chat_params.parser;
   }
 };
 
@@ -197,9 +206,10 @@ inline bool common_chat_verify_template(
 
 // Parse JSON messages to common_chat_msg vector
 inline std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(
-    const nlohmann::ordered_json& messages
+    const common_json& messages_json
 ) {
   std::vector<common_chat_msg> result;
+  const auto& messages = messages_json.raw();
 
   for (const auto& msg : messages) {
     common_chat_msg chat_msg;
@@ -262,10 +272,10 @@ inline std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(
 
 // Parse tools from OpenAI-compatible JSON
 inline std::vector<common_chat_tool> common_chat_tools_parse_oaicompat(
-    const nlohmann::ordered_json& tools
+    const common_json& tools_json
 ) {
   std::vector<common_chat_tool> result;
-  for (const auto& tool : tools) {
+  for (const auto& tool : tools_json.raw()) {
     common_chat_tool t;
     if (tool.contains("function")) {
       const auto& func = tool["function"];
@@ -314,7 +324,7 @@ inline const char* common_chat_format_name(common_chat_format format) {
 
 // Parse model output — stub returns content passthrough
 inline common_chat_msg common_chat_parse(
-    const std::string& input,
+    const common_chat_input& input,
     bool is_partial,
     const common_chat_parser_params& syntax
 ) {
@@ -322,6 +332,6 @@ inline common_chat_msg common_chat_parse(
   (void)syntax;
   common_chat_msg result;
   result.role = "assistant";
-  result.content = input;
+  result.content = input.text;
   return result;
 }

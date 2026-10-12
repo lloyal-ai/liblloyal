@@ -248,7 +248,7 @@ inline llama_token sample_with_params(llama_context *ctx,
     if (penalty_repeat != 1.0f || penalty_freq != 0.0f ||
         penalty_present != 0.0f) {
       llama_sampler_chain_add(
-          chain, llama_sampler_init_penalties(penalty_last_n, penalty_repeat,
+          chain, llama_sampler_init_penalties(n_vocab, penalty_last_n, penalty_repeat,
                                               penalty_freq, penalty_present));
     }
     if (top_k > 0) {
@@ -325,7 +325,7 @@ inline llama_token sample_with_params(llama_context *ctx,
                      penalty_repeat, penalty_freq, penalty_present,
                      penalty_last_n);
     llama_sampler_chain_add(sampler_chain, llama_sampler_init_penalties(
-                                               penalty_last_n, penalty_repeat,
+                                               n_vocab, penalty_last_n, penalty_repeat,
                                                penalty_freq, penalty_present));
   }
 
@@ -460,10 +460,11 @@ inline llama_token sample_with_params(llama_context *ctx,
  * Handles temperature <= 0 as greedy mode (deterministic argmax).
  *
  * @param params Sampling parameters (any SamplingParamsLike type)
+ * @param n_vocab Vocabulary size (the penalties sampler sizes its table by it)
  * @return Owned sampler chain - caller must free with free_chain()
  */
 template <SamplingParamsLike P>
-inline llama_sampler* create_chain(const P& params) {
+inline llama_sampler* create_chain(const P& params, int32_t n_vocab) {
   using detail::as_value;
 
   // Extract parameters with defaults
@@ -489,7 +490,7 @@ inline llama_sampler* create_chain(const P& params) {
   // Add samplers in standard order: penalties → filters → temperature/greedy → dist
   if (penalty_repeat != 1.0f || penalty_freq != 0.0f || penalty_present != 0.0f) {
     llama_sampler_chain_add(chain,
-        llama_sampler_init_penalties(penalty_last_n, penalty_repeat, penalty_freq, penalty_present));
+        llama_sampler_init_penalties(n_vocab, penalty_last_n, penalty_repeat, penalty_freq, penalty_present));
   }
   if (top_k > 0) {
     llama_sampler_chain_add(chain, llama_sampler_init_top_k(top_k));

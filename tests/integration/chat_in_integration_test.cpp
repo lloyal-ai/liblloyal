@@ -1087,8 +1087,8 @@ TEST_CASE("ChatIn Integration: a system-only format declares reasoning like a fu
   CHECK(!shared.prompt.empty());
   CHECK(shared.supports_thinking == reference.supports_thinking);
   CHECK(shared.thinking_start_tag == reference.thinking_start_tag);
-  CHECK(shared.thinking_end_tag == reference.thinking_end_tag);
-  CHECK(!shared.thinking_end_tag.empty());
+  CHECK(shared.thinking_end_tags == reference.thinking_end_tags);
+  CHECK(!shared.thinking_end_tags.empty());
 
   // The contradiction that shipped: a format that opens a reasoning block in its own
   // generation prompt while declaring it renders none.
@@ -1098,5 +1098,5 @@ TEST_CASE("ChatIn Integration: a system-only format declares reasoning like a fu
   }
 
   MESSAGE("spine: supports_thinking=" << shared.supports_thinking
-          << " end_tag=\"" << shared.thinking_end_tag << "\"");
+          << " end_tag=\"" << shared.thinking_end_tags.front() << "\"");
 }

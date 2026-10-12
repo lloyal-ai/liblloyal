@@ -5,7 +5,6 @@
 
 
 #include "common.hpp"
-#include <common.h>  // llama.cpp common library: common_batch_clear, common_batch_add
 #include <algorithm>
 #include <cstdint>
 #include <llama/llama.h>
@@ -35,7 +34,7 @@
  * multi-sequence ones do not — packing across sequences is a policy decision
  * that lives in BranchStore (see bin_pack).
  *
- * Uses batch utilities from llama.cpp common (common_batch_clear, common_batch_add).
+ * Batches allocated by llama_batch_init() are filled by detail::batch_clear/batch_add.
  *
  * ## Logit Indexing: How llama_get_logits_ith() Maps to Batch Positions
  *
@@ -77,6 +76,29 @@
  */
 
 namespace lloyal::decode {
+
+#if INTPTR_MAX == INT64_MAX
+// Scratch::as_batch and as_embd_batch write llama_batch field by field; a new
+// upstream field would arrive as zero without a word. Fail the build instead.
+static_assert(sizeof(llama_batch) == 56, "llama_batch changed shape: audit Scratch::as_batch and as_embd_batch");
+#endif
+
+namespace detail {
+/// The two helpers llama.cpp's common library used to provide for a
+/// llama_batch_init()-allocated batch: reset the count, append one token
+/// targeting one sequence.
+inline void batch_clear(llama_batch& batch) { batch.n_tokens = 0; }
+inline void batch_add(llama_batch& batch, llama_token id, llama_pos pos,
+                      llama_seq_id seq_id, bool logits) {
+  const int32_t i = batch.n_tokens;
+  batch.token[i] = id;
+  batch.pos[i] = pos;
+  batch.n_seq_id[i] = 1;
+  batch.seq_id[i][0] = seq_id;
+  batch.logits[i] = logits ? int8_t{1} : int8_t{0};
+  batch.n_tokens++;
+}
+} // namespace detail
 
 /**
  * @brief llama_decode failure carrying the raw return code
@@ -241,8 +263,7 @@ inline void require_fits_batch(llama_context* ctx, int32_t n_tokens, const char*
   while (processed < n_tokens) {
     const int32_t n_eval = std::min(n_tokens - processed, n_batch);
 
-    // Clear batch using llama.cpp common library
-    common_batch_clear(batch);
+    detail::batch_clear(batch);
 
     // Add tokens one by one, mark logits=true only on the final chunk's last token
     const bool is_last_chunk = (processed + n_eval >= n_tokens);
@@ -250,10 +271,7 @@ inline void require_fits_batch(llama_context* ctx, int32_t n_tokens, const char*
       const int32_t pos = n_past + i;
       const bool want_logits = is_last_chunk && (i == n_eval - 1);
 
-      // Add token via llama.cpp common library (function-call ABI).
-      // {seq_id} constructs a temporary vector per token — acceptable cost
-      // vs direct field writes which create struct-layout ABI coupling.
-      common_batch_add(batch, tokens[processed + i], pos, {seq_id}, want_logits);
+      detail::batch_add(batch, tokens[processed + i], pos, seq_id, want_logits);
     }
 
     // Decode chunk (updates KV cache)
@@ -323,8 +341,8 @@ inline void require_fits_batch(llama_context* ctx, int32_t n_tokens, const char*
   };
   thread_local ThreadLocalBatch tl;
 
-  common_batch_clear(tl.batch);
-  common_batch_add(tl.batch, tok, pos, {seq_id}, want_logits);
+  detail::batch_clear(tl.batch);
+  detail::batch_add(tl.batch, tok, pos, seq_id, want_logits);
 
   return llama_decode(ctx, tl.batch);
 }

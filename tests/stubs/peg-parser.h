@@ -4,16 +4,19 @@
 #pragma once
 
 #include <string>
-#include <vector>
 
-// Minimal stub — only the types referenced by chat.h and chat_out.hpp
-// Real PEG parsing is not exercised in unit tests (integration tests use real llama.cpp)
-
+// Minimal stub: only what chat.h and chat_out.hpp touch. The real arena is an
+// object graph that is built by the template engine and copied by value; it
+// has no string form. Real PEG parsing is not exercised in unit tests
+// (integration tests use real llama.cpp).
 class common_peg_arena {
 public:
-  bool empty() const { return data_.empty(); }
-  void load(const std::string& data) { data_ = data; }
-  std::string save() const { return data_; }
+  bool empty() const { return name_.empty(); }
+  std::string dump() const { return name_; }
+
+  // Stub-only: lets a test tell one arena from another
+  void set_name(std::string name) { name_ = std::move(name); }
+
 private:
-  std::string data_;
+  std::string name_;
 };
