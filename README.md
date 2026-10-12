@@ -245,7 +245,7 @@ RAII `~Branch()` uses CASCADE, so cleanup always succeeds even on deep trees. Mu
 - **Chat Templates** — Jinja2 formatting with fallbacks
 
 ```cpp
-auto chain  = lloyal::sampler::create_chain(params);
+auto chain  = lloyal::sampler::create_chain(params, llama_vocab_n_tokens(vocab));
 auto gram   = lloyal::grammar::init_sampler(model, schema);
 auto model1 = lloyal::ModelRegistry::acquire(path, params);
 auto model2 = lloyal::ModelRegistry::acquire(path, params);  // cache hit

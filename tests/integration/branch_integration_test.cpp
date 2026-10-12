@@ -3341,13 +3341,26 @@ TEST_CASE("fork fidelity: PRNG state is cloned, and reseed breaks it") {
   REQUIRE(chain);
   sampler::reseed_chain(chain, 9973);
 
+  // In lockstep with an unreseeded sibling: both stand at the same PRNG position
+  // (one draw past the fork), so an unreseeded clone would match it draw for
+  // draw, and only a real reseed can make the two sequences part.
+  BranchHandle control = fork(parent, store);
+  REQUIRE(control != INVALID_HANDLE);
   int diverged = 0;
+  int control_tracks = 0;
   for (int i = 0; i < 8; ++i) {
     set_logits(reseeded, std::span<const float>(uniform), store);
-    if (sample(reseeded, store) != from_parent) ++diverged;
+    set_logits(control, std::span<const float>(uniform), store);
+    set_logits(children[0], std::span<const float>(uniform), store);
+    const llama_token sibling = sample(children[0], store);
+    if (sample(control, store) == sibling) ++control_tracks;
+    if (sample(reseeded, store) != sibling) ++diverged;
   }
+  CHECK_MESSAGE(control_tracks == 8,
+                "an unreseeded fork draws in lockstep with its sibling (" << control_tracks << " of 8)");
   CHECK_MESSAGE(diverged > 0,
-                "a reseeded fork must not track the parent's draw forever");
+                "a reseeded fork must part from its sibling's draws");
+  prune(control, store);
 
   for (auto c : children) prune(c, store);
   prune(reseeded, store);

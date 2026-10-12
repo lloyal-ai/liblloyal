@@ -82,6 +82,17 @@ struct ParseResult {
 };
 
 /**
+ * The shape before the engine pin moved took a reasoning format third. The enum
+ * converts to bool, so an unmigrated call would compile and read DEEPSEEK as
+ * is_partial. Refuse it at compile time instead; reasoning is decided when the
+ * parser is built.
+ */
+ParseResult parse(const std::string& output, common_chat_format format,
+                  common_reasoning_format reasoning_format, bool is_partial = false,
+                  const std::string& generation_prompt = "",
+                  const std::string& parser_data = "") = delete;
+
+/**
  * @brief Parse model output with explicit format
  *
  * Uses the format detected by chat_in::format() to apply the correct parser.

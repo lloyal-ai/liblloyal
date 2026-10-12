@@ -156,7 +156,7 @@ TEST_CASE("ChatOut Integration: parse with format from chat_in roundtrip") {
   CHECK((!result.content.empty() || !result.tool_calls.empty()));
   if (fmt.supports_thinking) {
     CHECK(result.content.find(fmt.thinking_start_tag) == std::string::npos);
-    CHECK(result.content.find(fmt.thinking_end_tags.front()) == std::string::npos);
+    for (const auto& close : fmt.thinking_end_tags) CHECK(result.content.find(close) == std::string::npos);
   }
 }
 
@@ -191,11 +191,12 @@ TEST_CASE("ChatOut Integration: a thinking model's reply parses apart from its r
 
   const std::string output = generate(model.get(), fmt->prompt, 1024);
   MESSAGE("generated: \"" << output << "\"");
+  REQUIRE(!fmt->thinking_end_tags.empty());
   REQUIRE_MESSAGE(output.find(fmt->thinking_end_tags.front()) != std::string::npos, "the model closed its reasoning within the budget");
 
   auto result = lloyal::chat_out::parse(output, fmt->format, false, fmt->generation_prompt, fmt->parser);
   MESSAGE("content: \"" << result.content << "\"");
-  CHECK(result.content.find(fmt->thinking_end_tags.front()) == std::string::npos);
+  for (const auto& close : fmt->thinking_end_tags) CHECK(result.content.find(close) == std::string::npos);
   CHECK(result.content.find(fmt->thinking_start_tag) == std::string::npos);
   CHECK(result.content.find('4') != std::string::npos);
   CHECK(!result.reasoning_content.empty());
@@ -221,7 +222,7 @@ TEST_CASE("ChatOut Integration: a thinking model's tool call parses, and its rea
 
   REQUIRE(result.tool_calls.size() == 1);
   CHECK(result.tool_calls[0].name == "get_time");
-  CHECK(result.content.find(fmt->thinking_end_tags.front()) == std::string::npos);
+  for (const auto& close : fmt->thinking_end_tags) CHECK(result.content.find(close) == std::string::npos);
   CHECK(!result.reasoning_content.empty());
 }
 

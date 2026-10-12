@@ -19,7 +19,7 @@
  * Provides weak-pointer cache to avoid reloading same model multiple times.
  * Uses inline static members (C++17) for header-only implementation with static state.
  *
- * Cache key: (canonPath, n_gpu_layers, use_mmap)
+ * Cache key: (canonPath, n_gpu_layers, load_mode)
  * Cache value: weak_ptr to llama_model (auto-cleanup when last context releases)
  *
  * Thread-safe via std::mutex for all cache operations.
@@ -47,7 +47,7 @@ struct ModelKey {
 /**
  * @brief Hash functor for ModelKey
  *
- * Computes combined hash of path, GPU layers, and mmap flag for use in
+ * Computes combined hash of path, GPU layers, and load mode for use in
  * std::unordered_map. Uses XOR with golden ratio constant for good distribution.
  */
 // Compiler-specific sanitizer suppression (GCC/Clang only; no-op on MSVC)
@@ -61,7 +61,7 @@ struct ModelKeyHash {
   /**
    * @brief Compute hash for ModelKey
    *
-   * Combines path hash with GPU/mmap configuration using XOR and golden ratio.
+   * Combines path hash with GPU layers and load mode using XOR and golden ratio.
    *
    * @param k Key to hash
    * @return Combined hash value
@@ -81,7 +81,7 @@ struct ModelKeyHash {
  * @brief Thread-safe weak-pointer cache for sharing llama_model instances
  *
  * Avoids redundant model loads when multiple contexts use the same GGUF file.
- * The cache stores weak_ptrs keyed by (path, n_gpu_layers, use_mmap).
+ * The cache stores weak_ptrs keyed by (path, n_gpu_layers, load_mode).
  *
  * **Ownership model:**
  * - acquire() returns a shared_ptr to the model
@@ -122,7 +122,7 @@ public:
    * while holding the mutex.
    *
    * @param fsPath Filesystem path to model file (file:// prefix auto-stripped)
-   * @param params Model load parameters (GPU layers, mmap, etc.)
+   * @param params Model load parameters (GPU layers, load mode, etc.)
    * @return shared_ptr to model (caller shares ownership), or nullptr on load failure
    */
   static std::shared_ptr<llama_model> acquire(const std::string &fsPath,
@@ -144,7 +144,7 @@ private:
    * "file:///path" and "/path" map to the same cache entry.
    *
    * @param fsPath Filesystem path (may include file:// prefix)
-   * @param params Model parameters for GPU/mmap configuration
+   * @param params Model parameters for GPU layers and load mode
    * @return Normalized ModelKey
    */
   static ModelKey makeKey(const std::string &fsPath,

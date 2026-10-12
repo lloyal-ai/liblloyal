@@ -1088,7 +1088,7 @@ TEST_CASE("ChatIn Integration: a system-only format declares reasoning like a fu
   CHECK(shared.supports_thinking == reference.supports_thinking);
   CHECK(shared.thinking_start_tag == reference.thinking_start_tag);
   CHECK(shared.thinking_end_tags == reference.thinking_end_tags);
-  CHECK(!shared.thinking_end_tags.empty());
+  REQUIRE(!shared.thinking_end_tags.empty());
 
   // The contradiction that shipped: a format that opens a reasoning block in its own
   // generation prompt while declaring it renders none.

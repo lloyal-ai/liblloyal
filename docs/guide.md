@@ -586,7 +586,7 @@ params.temp = 0.7f;
 params.top_k = 40;
 params.top_p = 0.95f;
 
-auto chain = lloyal::sampler::create_chain(model, params);
+auto chain = lloyal::sampler::create_chain(params, llama_vocab_n_tokens(vocab));
 
 // Reuse chain across generation loop (no repeated initialization)
 for (int i = 0; i < max_tokens; i++) {
