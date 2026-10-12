@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <optional>
 #include <string>
+#include <algorithm>
 
 using json = nlohmann::ordered_json;
 
@@ -192,7 +193,9 @@ TEST_CASE("ChatOut Integration: a thinking model's reply parses apart from its r
   const std::string output = generate(model.get(), fmt->prompt, 1024);
   MESSAGE("generated: \"" << output << "\"");
   REQUIRE(!fmt->thinking_end_tags.empty());
-  REQUIRE_MESSAGE(output.find(fmt->thinking_end_tags.front()) != std::string::npos, "the model closed its reasoning within the budget");
+  const bool closed = std::any_of(fmt->thinking_end_tags.begin(), fmt->thinking_end_tags.end(),
+    [&](const std::string& close) { return output.find(close) != std::string::npos; });
+  REQUIRE_MESSAGE(closed, "the model closed its reasoning, with one of the template's closes, within the budget");
 
   auto result = lloyal::chat_out::parse(output, fmt->format, false, fmt->generation_prompt, fmt->parser);
   MESSAGE("content: \"" << result.content << "\"");

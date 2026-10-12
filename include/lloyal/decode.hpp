@@ -77,11 +77,17 @@
 
 namespace lloyal::decode {
 
-#if INTPTR_MAX == INT64_MAX
 // Scratch::as_batch and as_embd_batch write llama_batch field by field; a new
-// upstream field would arrive as zero without a word. Fail the build instead.
+// upstream field would arrive as zero without a word. Fail the build instead:
+// the size on 64-bit, and the member count, which padding cannot hide.
+#if INTPTR_MAX == INT64_MAX
 static_assert(sizeof(llama_batch) == 56, "llama_batch changed shape: audit Scratch::as_batch and as_embd_batch");
 #endif
+namespace shape_guard {
+inline void llama_batch_has_seven_members() {
+  [[maybe_unused]] auto [n_tokens, token, embd, pos, n_seq_id, seq_id, logits] = llama_batch{};
+}
+}  // namespace shape_guard
 
 namespace detail {
 /// The two helpers llama.cpp's common library used to provide for a

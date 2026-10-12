@@ -54,11 +54,17 @@
 
 namespace lloyal {
 
+// The text struct is filled field by field below; a new upstream field would be
+// value-initialised to zero without a word. Fail the build instead: the size on
+// 64-bit, and the member count, which padding cannot hide.
 #if INTPTR_MAX == INT64_MAX
-// The text struct is filled field by field above; a new upstream field would be
-// value-initialised to zero without a word. Fail the build instead.
 static_assert(sizeof(mtmd_input_text) == 24, "mtmd_input_text changed shape: revisit MtmdSource's construction");
 #endif
+namespace shape_guard {
+inline void mtmd_input_text_has_four_members() {
+  [[maybe_unused]] auto [text, text_len, add_special, parse_special] = mtmd_input_text{};
+}
+}  // namespace shape_guard
 
 /** A borrowed admitted representation. Bytes are consumed during construction. */
 struct MediaInput {
