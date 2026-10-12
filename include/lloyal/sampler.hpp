@@ -466,6 +466,11 @@ inline llama_token sample_with_params(llama_context *ctx,
 template <SamplingParamsLike P>
 inline llama_sampler* create_chain(const P& params, int32_t n_vocab) {
   using detail::as_value;
+  // The penalties sampler sizes its table by n_vocab; a non-positive value is
+  // a caller error, refused here the way the sampling paths refuse it.
+  if (n_vocab <= 0) {
+    throw std::invalid_argument("create_chain: n_vocab must be positive, got " + std::to_string(n_vocab));
+  }
 
   // Extract parameters with defaults
   int32_t penalty_last_n = as_value(params.penalty_last_n, static_cast<int32_t>(64));
