@@ -388,6 +388,11 @@ LLAMA_TEST_MODEL=path/to/model.gguf ./build_integration/IntegrationRunner
 # Multimodal cases additionally need a matched VL pair
 LLAMA_TEST_MODEL=model.gguf LLAMA_MMPROJ_MODEL=mmproj.gguf \
   ./build_integration/IntegrationRunner -tc="multimodal*"
+
+# Benchmark — the gate for engine changes (see tests/bench/README.md)
+cd tests && cmake -B build_bench -DLLOYAL_BUILD_BENCH=ON \
+  -DLLAMA_CPP_DIR=../../llama.cpp && cmake --build build_bench --target Bench
+./build_bench/Bench model.gguf mmproj.gguf fixtures/cat.jpg pin > run.jsonl
 ```
 
 ## Design Principles

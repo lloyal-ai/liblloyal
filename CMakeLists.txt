@@ -10,7 +10,7 @@ project(liblloyal VERSION 3.0.0 LANGUAGES CXX)
 # specifiers.
 #
 # Dependencies:
-#   - llama.cpp (b8369 or compatible)
+#   - llama.cpp at the build named in .llama-cpp-version (or compatible)
 #   - C++20 compiler
 #
 # Usage:
@@ -178,19 +178,23 @@ endif()
 # Version Check for llama.cpp
 # =============================================================================
 
-# liblloyal is tested against llama.cpp b8369
-# This is a soft check - we warn but don't fail the build
+# liblloyal is tested against the llama.cpp build named in .llama-cpp-version;
+# the file is the one place the pin lives. This is a soft check - we warn but
+# don't fail the build.
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/.llama-cpp-version" _LLOYAL_PIN_LINES REGEX "^[^#]")
+list(GET _LLOYAL_PIN_LINES 0 LLOYAL_LLAMA_CPP_PIN)
+string(STRIP "${LLOYAL_LLAMA_CPP_PIN}" LLOYAL_LLAMA_CPP_PIN)
 if(DEFINED LLAMA_CPP_VERSION)
-    if(NOT LLAMA_CPP_VERSION STREQUAL "b8369")
+    if(NOT LLAMA_CPP_VERSION STREQUAL LLOYAL_LLAMA_CPP_PIN)
         message(WARNING
-            "liblloyal: Designed for llama.cpp b8369, found ${LLAMA_CPP_VERSION}. "
+            "liblloyal: Designed for llama.cpp ${LLOYAL_LLAMA_CPP_PIN}, found ${LLAMA_CPP_VERSION}. "
             "API compatibility not guaranteed.")
     else()
-        message(STATUS "liblloyal: Using recommended llama.cpp version b8369")
+        message(STATUS "liblloyal: Using recommended llama.cpp version ${LLOYAL_LLAMA_CPP_PIN}")
     endif()
 else()
     message(STATUS
-        "liblloyal: LLAMA_CPP_VERSION not set. Recommended: b8369. "
+        "liblloyal: LLAMA_CPP_VERSION not set. Recommended: ${LLOYAL_LLAMA_CPP_PIN}. "
         "Define LLAMA_CPP_VERSION in your llama.cpp CMakeLists to enable version check.")
 endif()
 
