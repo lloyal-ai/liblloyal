@@ -332,13 +332,16 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS OR LLOYAL_BUILD_BENCH)
   if(GGML_BASE_LIB)
     list(APPEND LLOYAL_LLAMA_LINK_LIBS ${GGML_BASE_LIB})
   endif()
+  # Libraries llama.cpp vendors as separate archives (hashing, HTTP). common
+  # references them, and since b11559 so does mtmd, and both are archives in
+  # every tree this runner links against: the CI's combined shared libllama
+  # carries llama and ggml only. So the vendor archives close the link line
+  # whether libllama itself is an archive or not.
+  file(GLOB LLAMA_VENDOR_LIBS
+    ${LLAMA_CPP_DYLIB_DIR}/vendor/*/*.a
+    ${LLAMA_CPP_DYLIB_DIR}/vendor/*/*.lib)
+  list(APPEND LLOYAL_LLAMA_LINK_LIBS ${LLAMA_VENDOR_LIBS})
   if(LLOYAL_LLAMA_STATIC)
-    # Libraries llama.cpp vendors as separate archives (hashing, HTTP); common
-    # references them, so they close the static link line.
-    file(GLOB LLAMA_VENDOR_LIBS
-      ${LLAMA_CPP_DYLIB_DIR}/vendor/*/*.a
-      ${LLAMA_CPP_DYLIB_DIR}/vendor/*/*.lib)
-    list(APPEND LLOYAL_LLAMA_LINK_LIBS ${LLAMA_VENDOR_LIBS})
     if(APPLE)
       list(APPEND LLOYAL_LLAMA_LINK_LIBS
         "-framework Metal" "-framework MetalKit" "-framework Foundation"
