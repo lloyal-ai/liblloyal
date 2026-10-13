@@ -1450,12 +1450,13 @@ TEST_CASE("multimodal: one video encode, N branches fan out over the shared clip
   CHECK_MESSAGE(counted.encodes == 9, "16 frames: one lone frame, then seven fused pairs and a last single");
   const uint32_t after_video = store.kv_pressure().cells_used;
 
-  // Questions llama-server's own video path answers correctly for this clip on
-  // Qwen3.5-4B Q4_K_M at the pin. It calls the red square "white", so a colour
-  // question would test the model rather than the path.
+  // Each question llama-server's own video path answers correctly for this clip
+  // on Qwen3.5-4B Q4_K_M at the pin (fixtures/video/video.md).
   struct Ask { const char* question; std::vector<std::string> expect; };
   const std::vector<Ask> asks = {
       {"Which direction does the red square move? Answer in a few words.", {"right"}},
+      {"What color is the moving square? Answer in one word.", {"red"}},
+      {"Is the square moving or standing still? Answer in one word.", {"moving"}},
       {"What color is the background? Answer in one word.", {"white"}},
   };
   std::vector<BranchHandle> children;
