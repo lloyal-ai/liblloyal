@@ -36,6 +36,7 @@
 #include <lloyal/tokenizer.hpp>
 #include <limits>
 #include <memory>
+#include <nlohmann/json.hpp>
 #include <span>
 #include <string>
 #include <vector>
@@ -1222,4 +1223,549 @@ TEST_CASE("audio: position overflow is refused before filling decoder positions"
     CHECK(std::all_of(positions.begin(), positions.end(), [](auto p) { return p == -1; }));
   }
   CHECK(audio_chunks == 1);
+}
+
+// ============================================================================
+// Video — the frames of one clip, handed over the way llama.cpp's own video
+// helper hands them: "Video:", every frame mergeable, a timestamp text after
+// the frame that crosses each interval. Qwen-VL projectors fuse adjacent frames
+// in pairs; still images never fuse.
+// ============================================================================
+
+static std::vector<std::vector<uint8_t>> video_frames() {
+  std::vector<std::vector<uint8_t>> frames;
+  for (int i = 0; i < 16; ++i) {
+    char name[32];
+    std::snprintf(name, sizeof name, "video/frame-%02d.png", i);
+    frames.push_back(read_fixture(name));
+    REQUIRE_MESSAGE(!frames.back().empty(), "fixtures/video frames missing");
+  }
+  return frames;
+}
+
+/// Borrowed views over sampled frames, in the shape MediaInput::Kind::Video takes.
+struct Clip {
+  std::vector<std::vector<uint8_t>> bytes = video_frames();
+  std::vector<std::span<const uint8_t>> frames;
+  std::vector<int64_t> timestamps_ms;
+  std::vector<VideoNote> notes;
+
+  explicit Clip(int64_t frame_ms = 250) {
+    for (size_t i = 0; i < bytes.size(); ++i) {
+      frames.emplace_back(bytes[i]);
+      timestamps_ms.push_back(static_cast<int64_t>(i) * frame_ms);
+    }
+  }
+
+  MediaInput input(int64_t interval_ms = 5000) const {
+    return MediaInput{MediaInput::Kind::Video, {},
+                      VideoFrames{frames, timestamps_ms, interval_ms, notes}};
+  }
+};
+
+static MtmdSource video_source(mtmd_context* mtmd, const llama_model* model,
+                               const std::string& prompt, const Clip& clip) {
+  const std::array media{clip.input()};
+  return MtmdSource(mtmd, prompt, media, {}, llama_model_n_embd_inp(model), {});
+}
+
+/// What a source yields, walked once: text tokens, or the rows of one media chunk.
+struct Walked {
+  decode::Segment::Kind kind;
+  std::vector<llama_token> tokens;
+  int32_t n_rows = 0;
+};
+
+static std::vector<Walked> walk(decode::SegmentSource& source) {
+  std::vector<Walked> out;
+  for (size_t i = 0; i < source.size(); ++i) {
+    const auto seg = source.at(i);
+    out.push_back({seg.kind, {seg.tokens.begin(), seg.tokens.end()}, seg.n_rows});
+  }
+  return out;
+}
+
+static std::vector<int32_t> media_rows(const std::vector<Walked>& walked) {
+  std::vector<int32_t> rows;
+  for (const auto& w : walked) {
+    if (w.kind == decode::Segment::Kind::Embd) rows.push_back(w.n_rows);
+  }
+  return rows;
+}
+
+/// The user turn the server measurement used: the clip first, then the question.
+static std::string video_ask_prompt(const llama_model* model, const std::string& ask) {
+  chat_in::FormatInputs in;
+  in.messages_json =
+      std::string(R"([{"role":"user","content":[{"type":"media_marker","text":")") +
+      mtmd_default_marker() + R"("},{"type":"text","text":")" + ask + R"("}]}])";
+  in.enable_thinking = false;
+  return chat_in::format(model, in).prompt;
+}
+
+/// One user turn split at its question: the spine prefills the clip once, and
+/// each child closes the same turn with its own question, so every child sees
+/// exactly the single-turn request the server measurement used.
+struct OpenTurn {
+  std::string head;
+  std::string tail;
+};
+
+static OpenTurn open_video_turn(const llama_model* model) {
+  const std::string slot = "QUESTION_SLOT";
+  const auto full = video_ask_prompt(model, slot);
+  const auto at = full.find(slot);
+  REQUIRE(at != std::string::npos);
+  return {full.substr(0, at), full.substr(at + slot.size())};
+}
+
+static std::vector<llama_token> close_turn(const llama_model* model, const OpenTurn& turn,
+                                           const std::string& question) {
+  return tokenizer::tokenize(llama_model_get_vocab(model), question + turn.tail,
+                             /*add_special*/ false, /*parse_special*/ true);
+}
+
+TEST_CASE("multimodal: still images of one size never fuse") {
+  REQUIRE_VL();
+  LlamaBackendGuard guard;
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+  mtmd_context* mtmd = acquire_mtmd(model.get());
+  REQUIRE(mtmd);
+
+  const auto frame = read_fixture("video/frame-00.png");
+  REQUIRE(!frame.empty());
+  const int32_t width = llama_model_n_embd_inp(model.get());
+  const std::string marker = mtmd_default_marker();
+
+  std::vector<std::vector<uint8_t>> one{frame};
+  MtmdSource single(mtmd, marker, one, {}, width);
+  const auto single_rows = media_rows(walk(single));
+  REQUIRE(single_rows.size() == 1);
+
+  std::vector<std::vector<uint8_t>> four(4, frame);
+  MtmdSource stills(mtmd, marker + marker + marker + marker, four, {}, width);
+  const auto rows = media_rows(walk(stills));
+  CHECK_MESSAGE(rows == std::vector<int32_t>(4, single_rows.front()),
+                "four same-size still images encode one by one at this pin");
+}
+
+TEST_CASE("multimodal: a video's frames tokenize as the server's video does") {
+  REQUIRE_VL();
+  LlamaBackendGuard guard;
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+  mtmd_context* mtmd = acquire_mtmd(model.get());
+  REQUIRE(mtmd);
+
+  const auto json = read_fixture("video/video-reference.json");
+  REQUIRE_MESSAGE(!json.empty(), "fixtures/video/video-reference.json missing");
+  const auto reference = nlohmann::json::parse(json.begin(), json.end());
+
+  Clip clip;
+  auto source = video_source(mtmd, model.get(), reference["prompt"].get<std::string>(), clip);
+  CHECK(source.cells() == reference["n_tokens"].get<size_t>());
+
+  const auto walked = walk(source);
+  const auto& chunks = reference["chunks"];
+  REQUIRE(walked.size() == chunks.size());
+  for (size_t i = 0; i < walked.size(); ++i) {
+    INFO("chunk " << i);
+    const bool text = chunks[i]["type"] == "text";
+    REQUIRE((walked[i].kind == decode::Segment::Kind::Text) == text);
+    if (text) {
+      CHECK(walked[i].tokens == chunks[i]["tokens"].get<std::vector<llama_token>>());
+    } else {
+      CHECK(walked[i].n_rows == chunks[i]["n_tokens"].get<int32_t>());
+    }
+  }
+}
+
+TEST_CASE("multimodal: a video answers grounded on motion") {
+  REQUIRE_VL();
+  LlamaBackendGuard guard;
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+  mtmd_context* mtmd = acquire_mtmd(model.get());
+  REQUIRE(mtmd);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 4096;
+  cparams.n_batch = 512;
+  cparams.n_seq_max = 4;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+  TestParams params;
+
+  BranchHandle h = create(ctx, model.get(), store, 0, params, 512);
+  REQUIRE(h != INVALID_HANDLE);
+  Clip clip;
+  auto source = video_source(mtmd, model.get(),
+      video_ask_prompt(model.get(), "Which direction does the red square move? Answer in a few words."),
+      clip);
+  const size_t quote = source.cells();
+  const auto r = store.decode_segments(h, source);
+  CHECK(static_cast<int64_t>(quote) == r.cells);
+  CHECK(r.advance < r.cells);
+
+  const auto answer = generate(h, store, llama_model_get_vocab(model.get()), 24);
+  INFO("answer: " << answer);
+  if (vl_strict()) CHECK(contains_any(answer, {"right"}));
+
+  prune(h, store);
+  CHECK(store.kv_pressure().cells_used == 0);
+  store.drain();
+  llama_free(ctx);
+}
+
+TEST_CASE("multimodal: one video encode, N branches fan out over the shared clip") {
+  REQUIRE_VL();
+  LlamaBackendGuard guard;
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+  mtmd_context* mtmd = acquire_mtmd(model.get());
+  REQUIRE(mtmd);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 8192;
+  cparams.n_batch = 512;
+  cparams.n_seq_max = 8;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+  BranchStore store(16);
+  store.init_tenancy(ctx);
+  TestParams params;
+  const auto* vocab = llama_model_get_vocab(model.get());
+
+  BranchHandle spine = create(ctx, model.get(), store, 0, params, 512);
+  REQUIRE(spine != INVALID_HANDLE);
+  Clip clip;
+  const auto turn = open_video_turn(model.get());
+  auto source = video_source(mtmd, model.get(), turn.head, clip);
+  CountedSource counted(source);
+  const auto projected = store.decode_segments(spine, counted);
+  CHECK(projected.cells == static_cast<int64_t>(source.cells()));
+  CHECK_MESSAGE(counted.encodes == 9, "16 frames: one lone frame, then seven fused pairs and a last single");
+  const uint32_t after_video = store.kv_pressure().cells_used;
+
+  // Questions llama-server's own video path answers correctly for this clip on
+  // Qwen3.5-4B Q4_K_M at the pin. It calls the red square "white", so a colour
+  // question would test the model rather than the path.
+  struct Ask { const char* question; std::vector<std::string> expect; };
+  const std::vector<Ask> asks = {
+      {"Which direction does the red square move? Answer in a few words.", {"right"}},
+      {"What color is the background? Answer in one word.", {"white"}},
+  };
+  std::vector<BranchHandle> children;
+  for (size_t i = 0; i < asks.size(); ++i) {
+    children.push_back(fork(spine, store));
+    REQUIRE(children.back() != INVALID_HANDLE);
+  }
+  CHECK_MESSAGE(store.kv_pressure().cells_used == after_video,
+                "forking after the video copies no cells");
+
+  std::vector<std::vector<llama_token>> suffixes;
+  std::vector<DecodeScatterItem> items;
+  size_t suffix_total = 0;
+  for (const auto& a : asks) suffixes.push_back(close_turn(model.get(), turn, a.question));
+  for (size_t i = 0; i < children.size(); ++i) {
+    items.push_back({children[i], std::span<const llama_token>(suffixes[i])});
+    suffix_total += suffixes[i].size();
+  }
+  store.decode_scatter(std::span<const DecodeScatterItem>(items));
+  CHECK(store.kv_pressure().cells_used == after_video + suffix_total);
+
+  std::vector<std::string> answers(children.size());
+  std::vector<bool> done(children.size(), false);
+  for (int step = 0; step < 24; ++step) {
+    std::vector<DecodeEachItem> batch;
+    for (size_t i = 0; i < children.size(); ++i) {
+      if (done[i]) continue;
+      const llama_token t = sample(children[i], store);
+      if (t < 0 || tokenizer::is_eog(vocab, t)) { done[i] = true; continue; }
+      accept_token(children[i], t, store);
+      answers[i] += tokenizer::detokenize(vocab, t, false);
+      batch.push_back({children[i], t});
+    }
+    if (batch.empty()) break;
+    store.decode_each(std::span<const DecodeEachItem>(batch));
+  }
+  for (size_t i = 0; i < children.size(); ++i) {
+    INFO("Q: " << asks[i].question << "  |  A: " << answers[i]);
+    CHECK(!answers[i].empty());
+    if (vl_strict()) CHECK(contains_any(answers[i], asks[i].expect));
+  }
+  CHECK_MESSAGE(counted.encodes == 9, "children never re-encode the clip");
+
+  const uint32_t before = store.kv_pressure().cells_used;
+  BranchState* first = store.get(children[0]);
+  const auto own = static_cast<uint32_t>(first->position - first->fork_head);
+  prune(children[0], store);
+  CHECK(before - store.kv_pressure().cells_used == own);
+  for (size_t i = 1; i < children.size(); ++i) prune(children[i], store);
+  CHECK(store.kv_pressure().cells_used == after_video);
+  prune(spine, store);
+  CHECK(store.kv_pressure().cells_used == 0);
+  store.drain();
+  llama_free(ctx);
+}
+
+TEST_CASE("multimodal: a video partially decoded is reclaimed and spares its sibling") {
+  REQUIRE_VL();
+  LlamaBackendGuard guard;
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+  mtmd_context* mtmd = acquire_mtmd(model.get());
+  REQUIRE(mtmd);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 1024;
+  cparams.n_batch = 512;
+  cparams.n_seq_max = 4;
+  cparams.kv_unified = true;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+  TestParams params;
+  const auto* vocab = llama_model_get_vocab(model.get());
+
+  BranchHandle parent = create(ctx, model.get(), store, 0, params, 512);
+  REQUIRE(parent != INVALID_HANDLE);
+  const auto lead = tokenizer::tokenize(vocab, "A short clip follows.", false, false);
+  prefill(parent, lead.data(), lead.size(), store);
+  const auto parent_cells = store.kv_pressure().cells_used;
+  const auto parent_position = get_position(parent, store);
+  const BranchHandle sibling = fork(parent, store);
+  const BranchHandle failing = fork(parent, store);
+  REQUIRE(sibling != INVALID_HANDLE);
+  REQUIRE(failing != INVALID_HANDLE);
+  const auto seq = store.get(failing)->seq_id;
+
+  // Room for the opening text and two frame chunks, not the whole clip.
+  const auto capacity = llama_n_ctx(ctx);
+  const auto dot = tokenizer::tokenize(vocab, ".", false, false);
+  const std::vector<llama_token> padding(capacity - parent_cells - 200, dot.front());
+  prefill(failing, padding.data(), padding.size(), store);
+
+  Clip clip;
+  auto source = video_source(mtmd, model.get(), mtmd_default_marker(), clip);
+  REQUIRE(source.cells() > 200);
+  bool failed = false;
+  try {
+    store.decode_segments(failing, source);
+  } catch (const decode::DecodeError& error) {
+    failed = true;
+    CHECK(error.rc == 1);
+    CHECK(error.partial);
+  }
+  REQUIRE(failed);
+  CHECK(get_position(sibling, store) == parent_position);
+  CHECK(get_position(parent, store) == parent_position);
+
+  prune(failing, store);
+  CHECK(kv::pos_max(ctx, seq) == -1);
+  CHECK(store.kv_pressure().cells_used == parent_cells);
+  prune(sibling, store);
+  prune(parent, store);
+  CHECK(store.kv_pressure().cells_used == 0);
+  store.drain();
+  llama_free(ctx);
+}
+
+TEST_CASE("multimodal: an invalid video is refused before any decode") {
+  REQUIRE_VL();
+  LlamaBackendGuard guard;
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+  mtmd_context* mtmd = acquire_mtmd(model.get());
+  REQUIRE(mtmd);
+  const int32_t width = llama_model_n_embd_inp(model.get());
+  const std::string marker = mtmd_default_marker();
+  const auto refuse = [&](const MediaInput& input) {
+    const std::array media{input};
+    return MtmdSource(mtmd, marker, media, {}, width, {});
+  };
+
+  Clip clip;
+  const auto cat = read_fixture("cat.jpg");
+  REQUIRE(!cat.empty());
+
+  {
+    Clip mixed;
+    mixed.frames[3] = cat;
+    CHECK_THROWS_WITH(refuse(mixed.input()), "MtmdSource - video frames must share one size");
+  }
+  {
+    Clip empty;
+    empty.frames.clear();
+    empty.timestamps_ms.clear();
+    CHECK_THROWS_WITH(refuse(empty.input()), "MtmdSource - a video needs at least one frame");
+  }
+  {
+    Clip uneven;
+    uneven.timestamps_ms.pop_back();
+    CHECK_THROWS_WITH(refuse(uneven.input()), "MtmdSource - a video needs one timestamp per frame");
+  }
+  {
+    Clip backwards;
+    std::swap(backwards.timestamps_ms[4], backwards.timestamps_ms[5]);
+    CHECK_THROWS_WITH(refuse(backwards.input()), "MtmdSource - video timestamps must increase");
+  }
+  {
+    Clip negative;
+    negative.timestamps_ms[0] = -1;
+    CHECK_THROWS_WITH(refuse(negative.input()), "MtmdSource - video timestamps must increase");
+  }
+  {
+    Clip blank;
+    blank.frames[2] = {};
+    CHECK_THROWS_AS(refuse(blank.input()), std::runtime_error);
+  }
+  {
+    CHECK_THROWS_WITH(refuse(clip.input(-1)), "MtmdSource - video timestamp interval must not be negative");
+  }
+  {
+    Clip noted;
+    noted.notes.push_back({-5, "before the clip"});
+    CHECK_THROWS_WITH(refuse(noted.input()), "MtmdSource - video notes must not precede the clip");
+  }
+  {
+    const auto wav = read_fixture("asr-counting.wav");
+    REQUIRE(!wav.empty());
+    Clip audio;
+    audio.frames[0] = wav;
+    CHECK_THROWS_WITH(refuse(audio.input()), "MtmdSource - audio bytes require a typed audio input");
+  }
+  {
+    const auto mp4 = read_fixture("video/red-square-moves.mp4");
+    REQUIRE(!mp4.empty());
+    CHECK_THROWS_WITH(refuse(MediaInput{MediaInput::Kind::Image, mp4}),
+                      "MtmdSource - unsupported media bytes at input 0");
+  }
+  CHECK_NOTHROW(refuse(clip.input()));
+}
+
+TEST_CASE("multimodal: a video's transcript leaves frame fusion unchanged") {
+  REQUIRE_VL();
+  LlamaBackendGuard guard;
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+  mtmd_context* mtmd = acquire_mtmd(model.get());
+  REQUIRE(mtmd);
+  const auto* vocab = llama_model_get_vocab(model.get());
+
+  Clip silent;
+  auto plain = video_source(mtmd, model.get(), mtmd_default_marker(), silent);
+  const auto plain_walk = walk(plain);
+
+  Clip spoken;
+  spoken.notes = {{0, " \"One, two, three.\""}, {3000, " \"Thursday at nine.\""}};
+  auto noted = video_source(mtmd, model.get(), mtmd_default_marker(), spoken);
+  const auto noted_walk = walk(noted);
+
+  CHECK_MESSAGE(media_rows(noted_walk) == media_rows(plain_walk),
+                "notes never sit between frames, so the same frames fuse");
+
+  std::string text;
+  for (const auto& w : noted_walk) {
+    for (const auto t : w.tokens) text += tokenizer::detokenize(vocab, t, true);
+  }
+  INFO("layout: " << text);
+  const auto stamp = text.find("[0m0.00s]");
+  REQUIRE(stamp != std::string::npos);
+  CHECK_MESSAGE(text.find("One, two, three.") > stamp, "a note joins the first timestamp at or after it");
+  CHECK_MESSAGE(text.find("Thursday at nine.") > text.find("One, two, three."),
+                "a note past the last timestamp closes the video");
+}
+
+TEST_CASE("multimodal: a spoken video answers on sound and motion") {
+  REQUIRE_VL();
+  LlamaBackendGuard guard;
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+  mtmd_context* mtmd = acquire_mtmd(model.get());
+  REQUIRE(mtmd);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 8192;
+  cparams.n_batch = 512;
+  cparams.n_seq_max = 4;
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+  TestParams params;
+  const auto* vocab = llama_model_get_vocab(model.get());
+
+  BranchHandle spine = create(ctx, model.get(), store, 0, params, 512);
+  REQUIRE(spine != INVALID_HANDLE);
+  // The committed transcript of asr-counting.wav (fixtures/audio.md), as the
+  // transcription service hands it back: no second model in this process.
+  Clip spoken;
+  spoken.notes = {{0, " Speech: \"One, two, three, four, five. The meeting is on Thursday at nine thirty.\""}};
+  const auto turn = open_video_turn(model.get());
+  auto source = video_source(mtmd, model.get(), turn.head, spoken);
+  store.decode_segments(spine, source);
+
+  struct Ask { const char* question; std::vector<std::string> expect; };
+  const std::vector<Ask> asks = {
+      {"Which direction does the red square move? Answer in a few words.", {"right"}},
+      {"On which day is the meeting, according to the speech? Answer in one word.", {"thursday"}},
+  };
+  for (const auto& a : asks) {
+    BranchHandle child = fork(spine, store);
+    REQUIRE(child != INVALID_HANDLE);
+    auto suffix = close_turn(model.get(), turn, a.question);
+    DecodeScatterItem item{child, std::span<const llama_token>(suffix)};
+    store.decode_scatter(std::span<const DecodeScatterItem>(&item, 1));
+    const auto answer = generate(child, store, vocab, 24);
+    INFO("Q: " << a.question << "  |  A: " << answer);
+    if (vl_strict()) CHECK(contains_any(answer, a.expect));
+    prune(child, store);
+  }
+  prune(spine, store);
+  CHECK(store.kv_pressure().cells_used == 0);
+  store.drain();
+  llama_free(ctx);
+}
+
+// A projector without temporal merge encodes each frame on its own. The CI
+// vision model fuses, so this runs only against a non-fusing pair selected
+// explicitly in its own process (LLOYAL_VIDEO_UNFUSED=1, e.g. SmolVLM).
+static bool unfused_video_disabled() {
+  const char* flag = std::getenv("LLOYAL_VIDEO_UNFUSED");
+  return !flag || std::string(flag) != "1";
+}
+
+TEST_CASE("video: a projector without temporal merge encodes every frame alone"
+          * doctest::skip(unfused_video_disabled())) {
+  REQUIRE(MODEL_PATH);
+  REQUIRE(MMPROJ_PATH);
+  LlamaBackendGuard guard;
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+  mtmd_context* mtmd = acquire_mtmd(model.get());
+  REQUIRE(mtmd);
+
+  Clip clip;
+  auto source = video_source(mtmd, model.get(), mtmd_default_marker(), clip);
+  const size_t quote = source.cells();
+  const auto walked = walk(source);
+  std::vector<std::vector<uint8_t>> still{clip.bytes.front()};
+  MtmdSource alone(mtmd, mtmd_default_marker(), still, {}, llama_model_n_embd_inp(model.get()));
+  const auto per_frame = media_rows(walk(alone));
+  std::vector<int32_t> expected;
+  for (size_t i = 0; i < clip.frames.size(); ++i) {
+    expected.insert(expected.end(), per_frame.begin(), per_frame.end());
+  }
+  CHECK_MESSAGE(media_rows(walked) == expected,
+                "every frame encodes exactly as the same frame would as a still image");
+  size_t summed = 0;
+  for (const auto& w : walked) {
+    summed += w.kind == decode::Segment::Kind::Text ? w.tokens.size() : static_cast<size_t>(w.n_rows);
+  }
+  CHECK(quote == summed);
 }

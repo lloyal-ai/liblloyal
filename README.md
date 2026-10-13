@@ -154,6 +154,8 @@ auto result = store.decode_segments(branch.handle(), source);
 
 `MtmdSource` is the optional llama.cpp adapter, behind `<lloyal/mtmd.hpp>`. Its **constructor** validates marker/image counts, decodes the image bytes, tokenizes the interleaved prompt, and rejects unsupported media. The **projector runs lazily**, per segment, during the walk — which is exactly what lets an encoder reuse one output buffer: each segment is dispatched before the next is requested.
 
+A video is one input too: `MediaInput::Kind::Video` takes the sampled frames of one clip, each an encoded image, with the time each was sampled. The source lays them out as llama.cpp's own video helper does (`"Video:"`, every frame mergeable, a timestamp after each interval), so projectors with temporal merge (the Qwen-VL family) fuse adjacent frames in pairs. Notes on the timeline, such as a transcript, join the timestamp text and never sit between frames. Decoding the container is the caller's job; the source refuses one.
+
 Consumers that neither include the header nor link `mtmd` carry no multimodal dependency.
 
 ### One ordered prefill, two rails
