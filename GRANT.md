@@ -1,11 +1,18 @@
-# Lloyal Harness Builder Grant
+# Developer Grant
 
-**Version 1.0 — Effective 2026-06-12.** Lloyal may publish revised versions for
+**Version 1.1 — Effective 2026-10-08.** Lloyal may publish revised versions for
 future releases of the Software; under Section 5, no revision affects any
 version already published.
 
-This Grant accompanies the Functional Source License, Version 1.1, with Apache 2.0
-Future License (**FSL-1.1-Apache-2.0**), under which Lloyal Labs Pty Ltd
+**Revision 1.1:** Updated for FSL-1.1-MIT, with the Developer Grant title and
+current package inventory. The permissions and covenants in Sections 2–4 are
+unchanged. Previously published versions retain the grant and future-license
+rights supplied with them, including Version 1.0 effective 2026-06-12 and any
+promised Apache 2.0 future license. This revision does not restart their
+two-year period.
+
+This Grant accompanies the Functional Source License, Version 1.1, with MIT
+Future License (**FSL-1.1-MIT**), under which Lloyal Labs Pty Ltd
 (**"Lloyal," "we," "us"**) makes the Covered Packages available. It applies to each
 version of the Covered Packages published while this Grant is in effect.
 
@@ -20,17 +27,30 @@ while this Grant is in effect, including all transitive inclusion of one Covered
 Package within another:
 
 - `liblloyal` (C++ inference kernel)
-- `@lloyal-labs/lloyal.node` (native bindings)
+- `@lloyal-labs/lloyal.node` (native bindings), including its
+  `@lloyal-labs/lloyal.node-*` platform binary packages
 - `@lloyal-labs/sdk`
 - `@lloyal-labs/lloyal-agents`
 - `@lloyal-labs/rig`
+- `@lloyal-labs/binding`
+- `@lloyal-labs/host`
+- `@lloyal-labs/relay`
+- `@lloyal-labs/desktop`
+- `@lloyal-labs/ui`
+- `@lloyal-labs/dev-tools`
+- `@lloyal-labs/media`
+- `@lloyal-labs/web-ability`
+- `@lloyal-labs/corpus-ability`
+- `@lloyal-labs/documents-ability`
+- `@lloyal-labs/wikipedia-ability`
 - `@lloyal-labs/web-app`, `@lloyal-labs/corpus-app`, `@lloyal-labs/wikipedia-app`
-- any other package Lloyal publishes under FSL-1.1-Apache-2.0 that identifies
+  (previously listed package names, retained for historical coverage)
+- any other package Lloyal publishes under FSL-1.1-MIT that identifies
   this Grant in its repository
 
 (together, the **"Software"**, matching the License's defined term for each
-package). Packages Lloyal publishes under Apache 2.0 (for example, the
-`harness.dev` CLI) carry no use restrictions and need no grant.
+package). Packages Lloyal publishes under MIT or Apache 2.0 (for example,
+the MIT-licensed `lloyal-ai` CLI) carry no use restrictions and need no grant.
 
 ## 2. Definitions
 
@@ -55,7 +75,7 @@ distributing, selling, licensing, hosting, and otherwise commercializing a
 Harness or an Ability is a Permitted Purpose under the License and is **never a
 Competing Use** — regardless of any overlap in category, functionality,
 market, audience, or business model with any product or service offered by
-Lloyal, now or in the future, including without limitation **reasoning.run**,
+Lloyal, now or in the future, including without limitation **Fieldnote**, **reasoning.run**,
 Lloyal's first-party Abilities, and any vertical or industry deployment by Lloyal.
 
 For clarity: a commercial deep-research product, a medical-practice product, a
@@ -107,8 +127,8 @@ own separate applications** with it.
 This Grant is irrevocable for every version of the Software published while it
 is in effect. We may amend this Grant for future versions only; no amendment
 affects any version already published. This Grant survives, and is in any case
-subsumed by, each version's conversion to Apache 2.0 under the License's
-Future License terms.
+subsumed by, the additional MIT license that takes effect for each covered
+version under the License's Future License terms.
 
 ## 6. No Other Changes
 
