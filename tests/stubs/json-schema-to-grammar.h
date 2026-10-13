@@ -3,12 +3,12 @@
 
 #pragma once
 
-#include <nlohmann/json.hpp>
+#include "json.h"
 #include <string>
 
 // Stub implementation - returns a simple grammar
 inline std::string json_schema_to_grammar(
-    const nlohmann::ordered_json& schema,
+    const common_json& schema,
     bool force_gbnf
 ) {
   (void)schema;

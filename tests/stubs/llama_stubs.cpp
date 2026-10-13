@@ -1,6 +1,7 @@
 #include "llama_stubs.h"
 #include <cmath>
 #include <atomic>
+#include <unordered_map>
 
 // Global configuration instance
 static LlamaStubConfig g_stub_config;
@@ -12,6 +13,10 @@ static std::atomic<uintptr_t> g_context_counter{
 
 // Singleton memory handle (shared across all contexts for simplicity)
 static llama_memory_t g_memory_handle;
+
+// Capacity of every live stub batch, keyed by its token buffer, so the batch
+// struct itself stays byte-identical to llama.cpp's.
+static std::unordered_map<llama_token *, int32_t> g_batch_capacity;
 
 // Accessor for global stub configuration
 LlamaStubConfig &llamaStubConfig() { return g_stub_config; }
@@ -46,7 +51,7 @@ size_t llama_model_size(const llama_model * /*model*/) {
 llama_model_params llama_model_default_params() {
   llama_model_params params;
   params.n_gpu_layers = -1;
-  params.use_mmap = true;
+  params.load_mode = LLAMA_LOAD_MODE_AUTO;
   return params;
 }
 
@@ -197,13 +202,13 @@ llama_batch llama_batch_init(int32_t n_tokens, int32_t /*embd*/,
                              int32_t /*n_seq_max*/) {
   if (!g_stub_config.batch_init_succeeds) {
     // Return empty batch on failure
-    return llama_batch{0, nullptr, nullptr, nullptr, nullptr, nullptr, 0};
+    return llama_batch{0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
   }
 
   // Allocate arrays for batch (simplified stub version)
   llama_batch batch;
   batch.n_tokens = 0;
-  batch._capacity = n_tokens;
+  batch.embd = nullptr;
 
   // Allocate buffers
   batch.token = new llama_token[n_tokens];
@@ -216,6 +221,7 @@ llama_batch llama_batch_init(int32_t n_tokens, int32_t /*embd*/,
   for (int32_t i = 0; i < n_tokens; ++i) {
     batch.seq_id[i] = new llama_seq_id[1];
   }
+  g_batch_capacity[batch.token] = n_tokens;
 
   return batch;
 }
@@ -224,8 +230,10 @@ void llama_batch_free(llama_batch batch) {
   g_stub_config.batch_free_call_count++;
 
   if (batch.token) {
+    const int32_t capacity = g_batch_capacity[batch.token];
+    g_batch_capacity.erase(batch.token);
     // Free seq_id arrays first
-    for (int32_t i = 0; i < batch._capacity; ++i) {
+    for (int32_t i = 0; i < capacity; ++i) {
       delete[] batch.seq_id[i];
     }
 
@@ -512,7 +520,8 @@ llama_sampler *llama_sampler_init_typical(float /*p*/, size_t /*min_keep*/) {
   return reinterpret_cast<llama_sampler *>(0x8000); // Stub pointer
 }
 
-llama_sampler *llama_sampler_init_penalties(int32_t /*penalty_last_n*/,
+llama_sampler *llama_sampler_init_penalties(int32_t /*n_vocab*/,
+                                            int32_t /*penalty_last_n*/,
                                             float /*penalty_repeat*/,
                                             float /*penalty_freq*/,
                                             float /*penalty_present*/

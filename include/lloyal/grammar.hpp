@@ -8,6 +8,7 @@
 #include "tokenizer.hpp"
 #include <llama/llama.h>
 #include <json-schema-to-grammar.h>  // llama.cpp common library
+#include <json.h>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
@@ -51,7 +52,7 @@ inline std::string from_json_schema(const std::string &schema_json) {
 
   try {
     // Parse JSON schema
-    nlohmann::ordered_json schema = nlohmann::ordered_json::parse(schema_json);
+    common_json schema = common_json::parse(schema_json);
 
     LLOYAL_LOG_DEBUG("[grammar::from_json_schema] Schema parsed, calling "
                      "json_schema_to_grammar");
@@ -72,7 +73,7 @@ inline std::string from_json_schema(const std::string &schema_json) {
         grammar.size());
     return grammar;
 
-  } catch (const nlohmann::json::parse_error &e) {
+  } catch (const common_json_error &e) {
     std::string errorMsg = std::string("JSON parse error: ") + e.what();
     LLOYAL_LOG_DEBUG("[grammar::from_json_schema] ERROR: %s", errorMsg.c_str());
     throw std::runtime_error(errorMsg);

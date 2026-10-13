@@ -4,7 +4,7 @@
  * Tests the chat_out API using stubs:
  * - Plain content passthrough
  * - Format-specific parsing behavior
- * - Reasoning format forwarding
+ * - Generation prompt forwarding
  * - Partial output handling
  * - Error handling
  *
@@ -49,11 +49,10 @@ TEST_CASE("ChatOut: parse with GENERIC format") {
   CHECK(result.content == "Response with tools");
 }
 
-TEST_CASE("ChatOut: parse forwards reasoning_format") {
+TEST_CASE("ChatOut: parse under a thinking template's format") {
   auto result = lloyal::chat_out::parse(
     "thinking output",
-    COMMON_CHAT_FORMAT_DEEPSEEK_R1,
-    COMMON_REASONING_FORMAT_DEEPSEEK
+    COMMON_CHAT_FORMAT_DEEPSEEK_R1
   );
 
   // Stub doesn't extract reasoning, but verifies no crash
@@ -64,7 +63,6 @@ TEST_CASE("ChatOut: parse with is_partial true") {
   auto result = lloyal::chat_out::parse(
     "partial out",
     COMMON_CHAT_FORMAT_CONTENT_ONLY,
-    COMMON_REASONING_FORMAT_NONE,
     true  // is_partial
   );
 
@@ -85,7 +83,6 @@ TEST_CASE("ChatOut: parse with generation_prompt") {
   auto result = lloyal::chat_out::parse(
     "still thinking",
     COMMON_CHAT_FORMAT_DEEPSEEK_R1,
-    COMMON_REASONING_FORMAT_DEEPSEEK,
     false,        // is_partial
     "<think>"     // generation_prompt
   );

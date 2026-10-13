@@ -750,10 +750,10 @@ public:
    * @return Handle to the new sampler chain (never 0)
    */
   template <SamplingParamsLike P>
-  SamplerChainHandle create_sampler(const P& params) {
+  SamplerChainHandle create_sampler(const P& params, int32_t n_vocab) {
     SamplerChainHandle h = next_sampler_handle_++;
     SamplerChainEntry entry;
-    entry.chain = sampler::create_chain(params);
+    entry.chain = sampler::create_chain(params, n_vocab);
     float temperature = ::lloyal::detail::as_value(params.temperature, 0.8f);
     entry.has_dist = (temperature > 0.0f);
     sampler_chains_.emplace(h, std::move(entry));
@@ -1676,7 +1676,7 @@ inline BranchHandle create(
   state->has_logits = false;
   state->candidates_buffer.resize(state->n_vocab);
 
-  state->sampler_chain = s.create_sampler(params);
+  state->sampler_chain = s.create_sampler(params, n_vocab);
   state->cached_params = snapshot_params(params);
 
   if (grammar_str && grammar_str[0] != '\0') {
@@ -1977,7 +1977,7 @@ inline void set_sampler_params(BranchHandle handle, const P& params, BranchStore
   }
 
   // Create new chain
-  state->sampler_chain = s.create_sampler(params);
+  state->sampler_chain = s.create_sampler(params, state->n_vocab);
   state->cached_params = new_params;
 
   LLOYAL_LOG_DEBUG("[branch::set_sampler_params] Rebuilt chain on handle=%u temp=%.3f",

@@ -3111,3 +3111,330 @@ TEST_CASE("b9581 diagnostic: lloyal-node SessionContext full param combo") {
   llama_free(ctx);
 }
 
+
+// ============================================================================
+// Fork fidelity — the state that must survive llama_sampler_clone
+//
+// fork() advertises that a child continues from the parent's exact position:
+// penalty window, grammar parser position, and PRNG state. Every one of those
+// lives inside a llama_sampler that we clone via the public API, and losing
+// any of them fails SILENTLY — the child keeps generating, just from the wrong
+// state. Nothing else in this suite asserts it.
+//
+// These cannot run on the stub tier: llama_sampler_apply and _accept are
+// no-ops there and llama_sampler_clone returns a configured fake, so a stub
+// test could only assert that clone was CALLED, never that state came with it.
+// ============================================================================
+
+namespace {
+
+/// Greedy chain with repetition penalty and every filter disabled, so the
+/// only thing between logits and the sampled token is the penalty window.
+struct PenaltyOnlyParams {
+  float temperature = 0.0f;      // greedy — no dist, deterministic
+  int32_t top_k = 0;             // disabled
+  float top_p = 1.0f;            // disabled
+  float min_p = 0.0f;            // disabled
+  float typical_p = 1.0f;        // disabled
+  float penalty_repeat = 2.0f;   // active
+  float penalty_freq = 0.0f;
+  float penalty_present = 0.0f;
+  int32_t penalty_last_n = 64;
+  uint32_t seed = 7;
+};
+
+/// Flat over the first `n_flat` tokens so a draw is genuinely random —
+/// a peaked distribution would make every sampler agree by luck.
+std::vector<float> flat_logits(int32_t n_vocab, int32_t n_flat) {
+  std::vector<float> v(static_cast<size_t>(n_vocab), -60.0f);
+  for (int32_t i = 0; i < n_flat && i < n_vocab; ++i) v[i] = 1.0f;
+  return v;
+}
+
+std::vector<llama_token> legal_set(BranchHandle h, BranchStore& s) {
+  std::vector<llama_token> out;
+  for (const auto& [tok, prob] : get_legal_priors(h, s)) out.push_back(tok);
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("fork fidelity: the penalty window survives the clone") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+  llama_context_params cp = llama_context_default_params();
+  cp.n_ctx = 512;
+  cp.n_seq_max = 4;
+  llama_context* ctx = llama_init_from_model(model.get(), cp);
+  REQUIRE(ctx);
+
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+  PenaltyOnlyParams params;
+
+  BranchHandle parent = create(ctx, model.get(), store, 0, params);
+  REQUIRE(parent != INVALID_HANDLE);
+  const int32_t n_vocab = get_n_vocab(parent, store);
+  REQUIRE(n_vocab > 2);
+
+  // Token 0 wins outright on raw logits; token 1 wins once 0 is penalised.
+  // With penalty_repeat = 2.0 llama.cpp divides a positive logit, so an
+  // accepted 0 drops 10 -> 5, below 1's 6.
+  std::vector<float> logits(static_cast<size_t>(n_vocab), -60.0f);
+  logits[0] = 10.0f;
+  logits[1] = 6.0f;
+
+  set_logits(parent, std::span<const float>(logits), store);
+  for (int i = 0; i < 3; ++i) accept_token(parent, 0, store);
+
+  BranchHandle child = fork(parent, store);
+  REQUIRE(child != INVALID_HANDLE);
+  set_logits(child, std::span<const float>(logits), store);
+
+  // Control: same params, same logits, NO accept history.
+  BranchHandle fresh = create(ctx, model.get(), store, 0, params);
+  REQUIRE(fresh != INVALID_HANDLE);
+  set_logits(fresh, std::span<const float>(logits), store);
+
+  // Greedy sampling advances no PRNG and accepts nothing, so drawing from
+  // all three is free of ordering effects.
+  const llama_token from_fresh  = sample(fresh, store);
+  const llama_token from_parent = sample(parent, store);
+  const llama_token from_child  = sample(child, store);
+
+  // Control: without a penalty window token 0 is the argmax. If this fails
+  // the logit margin is wrong for this model and everything below is vacuous.
+  REQUIRE_MESSAGE(from_fresh == 0,
+                  "control: an unpenalised branch must pick the argmax");
+
+  // Does the penalty work at all on the branch that accepted the tokens?
+  // Separating this from the fork assertion is what tells us whether a
+  // failure is about cloning or about penalties generally.
+  REQUIRE_MESSAGE(from_parent == 1,
+                  "precondition: the accepting branch must itself be penalised");
+
+  CHECK_MESSAGE(from_child == from_parent,
+                "forked child must inherit the parent's penalty window");
+
+  prune(child, store);
+  prune(fresh, store);
+  prune(parent, store);
+  store.drain();
+  llama_free(ctx);
+}
+
+TEST_CASE("fork fidelity: the grammar parser position survives the clone") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+  llama_context_params cp = llama_context_default_params();
+  cp.n_ctx = 512;
+  cp.n_seq_max = 4;
+  llama_context* ctx = llama_init_from_model(model.get(), cp);
+  REQUIRE(ctx);
+
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+  TestParams params;
+
+  // A literal, so the legal set genuinely narrows as the parser advances.
+  // Asserted rather than assumed below — a grammar whose legal set did not
+  // change would make the fork assertion vacuous.
+  const char* GBNF = "root ::= \"hello world\"";
+
+  BranchHandle parent =
+      create(ctx, model.get(), store, 0, params, DEFAULT_N_BATCH, GBNF);
+  REQUIRE(parent != INVALID_HANDLE);
+  const int32_t n_vocab = get_n_vocab(parent, store);
+  REQUIRE(n_vocab > 0);
+
+  auto uniform = flat_logits(n_vocab, n_vocab);
+  set_logits(parent, std::span<const float>(uniform), store);
+
+  const auto at_start = legal_set(parent, store);
+  REQUIRE_MESSAGE(!at_start.empty(), "grammar must admit something at root");
+
+  // Advance the parser by one legal token.
+  accept_token(parent, at_start.front(), store);
+  const auto advanced = legal_set(parent, store);
+  REQUIRE_MESSAGE(advanced != at_start,
+                  "the legal set must change after one token, or this "
+                  "test cannot discriminate a cloned parser position");
+
+  BranchHandle child = fork(parent, store);
+  REQUIRE(child != INVALID_HANDLE);
+  set_logits(child, std::span<const float>(uniform), store);
+
+  const auto inherited = legal_set(child, store);
+  CHECK_MESSAGE(inherited == advanced,
+                "forked child must resume at the parent's grammar position");
+  CHECK_MESSAGE(inherited != at_start,
+                "forked child must NOT be back at the grammar root");
+
+  prune(child, store);
+  prune(parent, store);
+  store.drain();
+  llama_free(ctx);
+}
+
+TEST_CASE("fork fidelity: PRNG state is cloned, and reseed breaks it") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+  llama_context_params cp = llama_context_default_params();
+  cp.n_ctx = 512;
+  cp.n_seq_max = 8;
+  llama_context* ctx = llama_init_from_model(model.get(), cp);
+  REQUIRE(ctx);
+
+  BranchStore store(16);
+  store.init_tenancy(ctx);
+  TestParams params;   // temperature 0.8 → stochastic, ends with dist
+  params.top_k = 0;    // keep the flat distribution intact
+  params.min_p = 0.0f;
+  params.top_p = 1.0f;
+
+  BranchHandle parent = create(ctx, model.get(), store, 0, params);
+  REQUIRE(parent != INVALID_HANDLE);
+  const int32_t n_vocab = get_n_vocab(parent, store);
+  REQUIRE(n_vocab > 64);
+
+  // Flat over 64 tokens: agreement by luck is ~1/64 per child, so four
+  // children agreeing is decisive rather than lucky.
+  const auto uniform = flat_logits(n_vocab, 64);
+  set_logits(parent, std::span<const float>(uniform), store);
+
+  // Fork BEFORE sampling — sampling advances the PRNG, so the children must
+  // be taken from the same position the parent is about to draw from.
+  std::vector<BranchHandle> children;
+  for (int i = 0; i < 4; ++i) {
+    BranchHandle c = fork(parent, store);
+    REQUIRE(c != INVALID_HANDLE);
+    set_logits(c, std::span<const float>(uniform), store);
+    children.push_back(c);
+  }
+
+  const llama_token from_parent = sample(parent, store);
+  REQUIRE(from_parent >= 0);
+
+  for (size_t i = 0; i < children.size(); ++i) {
+    CHECK_MESSAGE(sample(children[i], store) == from_parent,
+                  "child " << i << " must draw from the cloned PRNG position");
+  }
+
+  // Reseeding is what MAKES forks diverge — if it stopped working, every
+  // agent in a pool would generate the same text.
+  BranchHandle reseeded = fork(parent, store);
+  REQUIRE(reseeded != INVALID_HANDLE);
+  set_logits(reseeded, std::span<const float>(uniform), store);
+  BranchState* rs = store.get(reseeded);
+  REQUIRE(rs);
+  llama_sampler* chain = store.get_sampler_chain(rs->sampler_chain);
+  REQUIRE(chain);
+  sampler::reseed_chain(chain, 9973);
+
+  // In lockstep with an unreseeded sibling: both stand at the same PRNG position
+  // (one draw past the fork), so an unreseeded clone would match it draw for
+  // draw, and only a real reseed can make the two sequences part.
+  BranchHandle control = fork(parent, store);
+  REQUIRE(control != INVALID_HANDLE);
+  int diverged = 0;
+  int control_tracks = 0;
+  for (int i = 0; i < 8; ++i) {
+    set_logits(reseeded, std::span<const float>(uniform), store);
+    set_logits(control, std::span<const float>(uniform), store);
+    set_logits(children[0], std::span<const float>(uniform), store);
+    const llama_token sibling = sample(children[0], store);
+    if (sample(control, store) == sibling) ++control_tracks;
+    if (sample(reseeded, store) != sibling) ++diverged;
+  }
+  CHECK_MESSAGE(control_tracks == 8,
+                "an unreseeded fork draws in lockstep with its sibling (" << control_tracks << " of 8)");
+  CHECK_MESSAGE(diverged > 0,
+                "a reseeded fork must part from its sibling's draws");
+  prune(control, store);
+
+  for (auto c : children) prune(c, store);
+  prune(reseeded, store);
+  prune(parent, store);
+  store.drain();
+  llama_free(ctx);
+}
+
+TEST_CASE("fork fidelity: state survives promote-then-fork (the README search loop)") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+
+  // The library's own advertised idiom (README "Lifecycle"): fork candidates,
+  // generate on them, retainOnly() the winner, promote it to root, repeat.
+  //
+  //   for (turn...) { leaf = root.fork(); generate; retainOnly(best); root = best; }
+  //
+  // Turn 0 is clean — the root was prefilled and never accepted. From turn 1
+  // the root IS a branch that generated and accepted, so every property fork()
+  // promises to carry is load-bearing on the promoted root. Nothing else in
+  // this suite exercises state across a retainOnly().
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+  llama_context_params cp = llama_context_default_params();
+  cp.n_ctx = 512;
+  cp.n_seq_max = 4;
+  llama_context* ctx = llama_init_from_model(model.get(), cp);
+  REQUIRE(ctx);
+
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+  PenaltyOnlyParams params;
+
+  BranchHandle root = create(ctx, model.get(), store, 0, params);
+  REQUIRE(root != INVALID_HANDLE);
+  const int32_t n_vocab = get_n_vocab(root, store);
+  REQUIRE(n_vocab > 2);
+
+  std::vector<float> logits(static_cast<size_t>(n_vocab), -60.0f);
+  logits[0] = 10.0f;
+  logits[1] = 6.0f;
+  set_logits(root, std::span<const float>(logits), store);
+
+  // --- turn 0: fork a candidate and "generate" on it ---
+  BranchHandle leaf = fork(root, store);
+  REQUIRE(leaf != INVALID_HANDLE);
+  set_logits(leaf, std::span<const float>(logits), store);
+  for (int i = 0; i < 3; ++i) accept_token(leaf, 0, store);
+
+  REQUIRE_MESSAGE(sample(leaf, store) == 1,
+                  "precondition: the candidate that generated must be penalised");
+
+  // --- promote the winner; every other branch is vaporised ---
+  store.retainOnly(leaf);
+
+  // retainOnly() rewrites topology and KV but must not disturb the winner's
+  // sampler registry entry. Asserted separately from the fork below so a future
+  // failure is attributable to promotion rather than to cloning.
+  set_logits(leaf, std::span<const float>(logits), store);
+  CHECK_MESSAGE(sample(leaf, store) == 1,
+                "retainOnly must preserve the promoted branch's own sampler state");
+
+  // --- turn 1: the promoted root is now the fork source ---
+  BranchHandle next = fork(leaf, store);
+  REQUIRE(next != INVALID_HANDLE);
+  set_logits(next, std::span<const float>(logits), store);
+
+  CHECK_MESSAGE(sample(next, store) == 1,
+                "a fork from the promoted root must inherit its penalty window; "
+                "without this every search turn silently discards the previous "
+                "turn's history");
+
+  prune(next, store);
+  prune(leaf, store);
+  store.drain();
+  llama_free(ctx);
+}

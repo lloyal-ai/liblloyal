@@ -22,7 +22,7 @@
  * ### Handle-Based APIs
  * Create reusable sampler chains and grammar handles for efficient token generation:
  * @code{.cpp}
- * auto chain = lloyal::sampler::create_chain(model, params);
+ * auto chain = lloyal::sampler::create_chain(params, llama_vocab_n_tokens(vocab));
  * lloyal::sampler::apply(chain, ctx, vocab);  // Reuse across tokens
  * @endcode
  *

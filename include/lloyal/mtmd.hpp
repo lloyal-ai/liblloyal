@@ -54,6 +54,18 @@
 
 namespace lloyal {
 
+// The text struct is filled field by field below; a new upstream field would be
+// value-initialised to zero without a word. Fail the build instead: the size on
+// 64-bit, and the member count, which padding cannot hide.
+#if INTPTR_MAX == INT64_MAX
+static_assert(sizeof(mtmd_input_text) == 24, "mtmd_input_text changed shape: revisit MtmdSource's construction");
+#endif
+namespace shape_guard {
+inline void mtmd_input_text_has_four_members() {
+  [[maybe_unused]] auto [text, text_len, add_special, parse_special] = mtmd_input_text{};
+}
+}  // namespace shape_guard
+
 /** A borrowed admitted representation. Bytes are consumed during construction. */
 struct MediaInput {
   enum class Kind { Image, Audio };
@@ -224,7 +236,8 @@ public:
     for (size_t i = 0; i < inputs.size(); ++i) {
       const auto& input = inputs[i];
       auto wrap = mtmd_helper_bitmap_init_from_buf(
-          ctx_, input.bytes.data(), input.bytes.size(), /*placeholder*/ false);
+          ctx_, input.bytes.data(), input.bytes.size(), /*placeholder*/ false,
+          mtmd_helper_init_opt_default());
       if (wrap.video_ctx) {
         mtmd_helper_video_free(wrap.video_ctx);
         if (wrap.bitmap) mtmd_bitmap_free(wrap.bitmap);
@@ -246,7 +259,13 @@ public:
     }
 
     chunks_.reset(mtmd_input_chunks_init());
-    mtmd_input_text txt{prompt.c_str(), /*add_special*/ false, /*parse_special*/ true};
+    // Named on purpose: a positional initialiser compiled unchanged when upstream
+    // inserted text_len and silently meant text length false, add_special true.
+    mtmd_input_text txt{};
+    txt.text = prompt.c_str();
+    txt.text_len = prompt.size();
+    txt.add_special = false;
+    txt.parse_special = true;
     if (mtmd_tokenize(ctx_, chunks_.get(), &txt, ptrs.data(), ptrs.size()) != 0) {
       throw std::runtime_error("MtmdSource - media preprocessing failed");
     }
