@@ -1,0 +1,16 @@
+{"baseline":"b9581","machine":"Apple M2 Pro, 16 GB, Metal","taken":"2026-10-12","model":"Qwen3.5-4B Q4_K_M + mmproj F16","flags":"n_ctx 32768, n_batch 512, n_ubatch 512, n_seq_max 10, n_gpu_layers 99, greedy","run":"warm, second of two back-to-back runs","note":"sample_no_grammar rows time branch::sample alone"}
+{"label":"b9581","item":"model_load","unit":"ms","p50":397.925,"p90":397.925,"min":397.925,"max":397.925,"n":1}
+{"label":"b9581","item":"context_init","unit":"ms","p50":130.392,"p90":130.392,"min":130.392,"max":130.392,"n":1}
+{"label":"b9581","item":"chat_in_format_with_tool","unit":"ms","p50":12.007,"p90":13.414,"min":11.895,"max":13.414,"n":5,"grammar_bytes":2203,"lazy":false}
+{"label":"b9581","item":"prefill","unit":"ms","p50":1684.361,"p90":1684.361,"min":1684.361,"max":1684.361,"n":1,"tokens":881,"tok_per_s":523.046928}
+{"label":"b9581","item":"fork","unit":"ms","p50":0.105,"p90":0.369,"min":0.099,"max":0.369,"n":8,"prefix_tokens":881}
+{"label":"b9581","item":"decode_each_step_n1","unit":"ms","p50":24.534,"p90":26.113,"min":23.451,"max":47.146,"n":40,"branches":1}
+{"label":"b9581","item":"sample_no_grammar_n1","unit":"ms_per_branch","p50":0.219,"p90":0.238,"min":0.215,"max":0.353,"n":40,"branches":1}
+{"label":"b9581","item":"decode_each_step_n3","unit":"ms","p50":61.635,"p90":63.283,"min":60.041,"max":71.531,"n":40,"branches":3}
+{"label":"b9581","item":"sample_no_grammar_n3","unit":"ms_per_branch","p50":0.226,"p90":0.381,"min":0.215,"max":0.432,"n":40,"branches":3}
+{"label":"b9581","item":"decode_each_step_n8","unit":"ms","p50":150.048,"p90":152.353,"min":146.258,"max":169.853,"n":40,"branches":8}
+{"label":"b9581","item":"sample_no_grammar_n8","unit":"ms_per_branch","p50":0.222,"p90":0.265,"min":0.216,"max":0.367,"n":40,"branches":8}
+{"label":"b9581","item":"sample_grammar_mask_first","unit":"ms","p50":51.010,"p90":52.708,"min":12.795,"max":88.838,"n":60,"n_vocab":248320}
+{"label":"b9581","item":"sample_grammar_sample_first","unit":"ms","p50":0.262,"p90":0.409,"min":0.231,"max":13.077,"n":60,"n_vocab":248320}
+{"label":"b9581","item":"image_prefill_total","unit":"ms","p50":1778.411,"p90":1778.514,"min":1776.570,"max":1778.514,"n":3,"cells":576,"advance":44}
+{"label":"b9581","item":"image_decode_and_tokenize","unit":"ms","p50":9.936,"p90":10.563,"min":8.650,"max":10.563,"n":3}
