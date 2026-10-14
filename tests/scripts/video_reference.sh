@@ -18,10 +18,9 @@ fixtures="$root/tests/fixtures/video"
 : "${LLAMA_TEST_MODEL:?set LLAMA_TEST_MODEL to Qwen3.5-4B-Q4_K_M.gguf}"
 : "${LLAMA_MMPROJ_MODEL:?set LLAMA_MMPROJ_MODEL to its mmproj-F16.gguf}"
 
-if [ ! -f "$build/CMakeCache.txt" ]; then
-  cmake -S "$llama" -B "$build" -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TOOLS=ON \
-    -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DMTMD_VIDEO=ON
-fi
+# Configured every run, so a reused build dir cannot keep MTMD_VIDEO off; CMake keeps what is cached.
+cmake -S "$llama" -B "$build" -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TOOLS=ON \
+  -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DMTMD_VIDEO=ON
 cmake --build "$build" --target mtmd -j
 
 libs="$(dirname "$(find "$build" -name 'libmtmd.*' -print -quit)")"
@@ -31,6 +30,8 @@ c++ -std=c++17 -O2 "$here/video_reference.cpp" -o "$build/video_reference" \
   -lmtmd -lllama -lggml -lggml-base -Wl,-rpath,"$libs" -Wl,-rpath,"$build/bin"
 
 prompt="$(printf '<__media__>\nWhich direction does the red square move?')"
+# Written aside and moved into place only on success, so a failed run keeps the last good reference.
 "$build/video_reference" "$LLAMA_TEST_MODEL" "$LLAMA_MMPROJ_MODEL" \
-  "$fixtures/red-square-moves.mp4" "$prompt" > "$fixtures/video-reference.json"
+  "$fixtures/red-square-moves.mp4" "$prompt" > "$fixtures/video-reference.json.tmp"
+mv "$fixtures/video-reference.json.tmp" "$fixtures/video-reference.json"
 echo "wrote $fixtures/video-reference.json"

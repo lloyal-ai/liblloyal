@@ -202,10 +202,11 @@ inline size_t wav_sample_bound(std::span<const uint8_t> bytes, uint32_t target_r
 // The helper's timestamp text, character for character ("[%dm%.2fs]").
 inline std::string timestamp_text(int64_t ms) {
   const float elapsed_s = static_cast<float>(ms) / 1000.0f;
-  const int minutes = static_cast<int>(elapsed_s / 60);
+  // Minutes as 64-bit: any int64 millisecond count fits, where the helper's int would overflow.
+  const int64_t minutes = static_cast<int64_t>(elapsed_s / 60);
   const float seconds = elapsed_s - static_cast<float>(minutes) * 60.0f;
-  char buf[32];
-  std::snprintf(buf, sizeof buf, "[%dm%.2fs]", minutes, seconds);
+  char buf[48];
+  std::snprintf(buf, sizeof buf, "[%lldm%.2fs]", static_cast<long long>(minutes), seconds);
   return buf;
 }
 
@@ -250,7 +251,10 @@ inline VideoLayout video_layout(std::vector<::mtmd::bitmap_ptr> frames, const Vi
     if (video.timestamp_interval_ms > 0 && t >= next_timestamp_ms) {
       layout.parts.push_back({nullptr, timestamp_text(t) +
                                        notes_until([t](const VideoNote& n) { return n.at_ms <= t; })});
-      next_timestamp_ms += video.timestamp_interval_ms;
+      // Saturating: a threshold past the last representable time is never crossed again.
+      next_timestamp_ms = next_timestamp_ms > std::numeric_limits<int64_t>::max() - video.timestamp_interval_ms
+                              ? std::numeric_limits<int64_t>::max()
+                              : next_timestamp_ms + video.timestamp_interval_ms;
     }
   }
   if (auto closing = notes_until([](const VideoNote&) { return true; }); !closing.empty()) {

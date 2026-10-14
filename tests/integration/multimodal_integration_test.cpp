@@ -1381,6 +1381,68 @@ TEST_CASE("multimodal: a video's frames tokenize as the server's video does") {
   }
 }
 
+/// The layout's text, read back in order, and how many media chunks it holds.
+struct Layout {
+  std::string text;
+  size_t media_chunks = 0;
+};
+
+static Layout read_layout(decode::SegmentSource& source, const llama_vocab* vocab) {
+  Layout out;
+  for (const auto& w : walk(source)) {
+    if (w.kind == decode::Segment::Kind::Embd) {
+      ++out.media_chunks;
+      out.text += "<frames>";
+    }
+    for (const auto t : w.tokens) out.text += tokenizer::detokenize(vocab, t, true);
+  }
+  return out;
+}
+
+TEST_CASE("multimodal: a video crossing its timestamp interval is stamped after each crossing frame") {
+  REQUIRE_VL();
+  LlamaBackendGuard guard;
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+  mtmd_context* mtmd = acquire_mtmd(model.get());
+  REQUIRE(mtmd);
+  const auto* vocab = llama_model_get_vocab(model.get());
+
+  // 16 frames a second apart: thresholds at 0, 5, 10 and 15 s are crossed by
+  // frames 0, 5, 10 and 15, each followed by its stamp. Between stamps, frames
+  // fuse in pairs and an odd one closes its run: 1 + 3 runs of (2 + 2 + 1).
+  Clip clip(1000);
+  auto source = video_source(mtmd, model.get(), mtmd_default_marker(), clip);
+  const auto layout = read_layout(source, vocab);
+  INFO("layout: " << layout.text);
+  CHECK(layout.media_chunks == 10);
+  size_t at = 0;
+  for (const char* stamp : {"<frames><|vision_end|>[0m0.00s]", "<frames><|vision_end|>[0m5.00s]",
+                            "<frames><|vision_end|>[0m10.00s]", "<frames><|vision_end|>[0m15.00s]"}) {
+    const auto found = layout.text.find(stamp, at);
+    CHECK_MESSAGE(found != std::string::npos, "stamped after its crossing frame, in order: " << stamp);
+    if (found != std::string::npos) at = found;
+  }
+}
+
+TEST_CASE("multimodal: frames sampled farther apart than the interval are each stamped, so none fuse") {
+  REQUIRE_VL();
+  LlamaBackendGuard guard;
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+  mtmd_context* mtmd = acquire_mtmd(model.get());
+  REQUIRE(mtmd);
+  const auto* vocab = llama_model_get_vocab(model.get());
+
+  // The helper's rule, unchanged: the threshold advances one interval per stamp,
+  // so a frame every 6 s crosses a threshold every time and text follows each.
+  Clip sparse(6000);
+  auto source = video_source(mtmd, model.get(), mtmd_default_marker(), sparse);
+  const auto layout = read_layout(source, vocab);
+  INFO("layout: " << layout.text);
+  CHECK(layout.media_chunks == sparse.frames.size());
+}
+
 TEST_CASE("multimodal: a video answers grounded on motion") {
   REQUIRE_VL();
   LlamaBackendGuard guard;
