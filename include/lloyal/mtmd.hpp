@@ -17,6 +17,7 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -248,17 +249,16 @@ inline VideoLayout video_layout(std::vector<::mtmd::bitmap_ptr> frames, const Vi
 
   VideoLayout layout;
   layout.parts.push_back({nullptr, "Video:"});
-  int64_t next_timestamp_ms = 0;
+  // The next threshold, or none once it would lie past any time an int64 can hold.
+  std::optional<int64_t> next_timestamp_ms = video.timestamp_interval_ms > 0 ? std::optional<int64_t>{0} : std::nullopt;
   for (size_t i = 0; i < frames.size(); ++i) {
     layout.parts.push_back({std::move(frames[i]), {}});
     const int64_t t = video.timestamps_ms[i];
-    if (video.timestamp_interval_ms > 0 && t >= next_timestamp_ms) {
+    if (next_timestamp_ms && t >= *next_timestamp_ms) {
       layout.parts.push_back({nullptr, timestamp_text(t) +
                                        notes_until([t](const VideoNote& n) { return n.at_ms <= t; })});
-      // Saturating: a threshold past the last representable time is never crossed again.
-      next_timestamp_ms = next_timestamp_ms > std::numeric_limits<int64_t>::max() - video.timestamp_interval_ms
-                              ? std::numeric_limits<int64_t>::max()
-                              : next_timestamp_ms + video.timestamp_interval_ms;
+      const bool exhausted = *next_timestamp_ms > std::numeric_limits<int64_t>::max() - video.timestamp_interval_ms;
+      next_timestamp_ms = exhausted ? std::nullopt : std::optional<int64_t>{*next_timestamp_ms + video.timestamp_interval_ms};
     }
   }
   if (auto closing = notes_until([](const VideoNote&) { return true; }); !closing.empty()) {

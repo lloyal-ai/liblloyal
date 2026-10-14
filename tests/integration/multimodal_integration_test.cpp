@@ -1452,6 +1452,29 @@ TEST_CASE("multimodal: frames sampled farther apart than the interval are each s
   CHECK(layout.media_chunks == sparse.frames.size());
 }
 
+TEST_CASE("multimodal: no timestamp follows a frame past the last threshold time can hold") {
+  REQUIRE_VL();
+  LlamaBackendGuard guard;
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+  mtmd_context* mtmd = acquire_mtmd(model.get());
+  REQUIRE(mtmd);
+  const auto* vocab = llama_model_get_vocab(model.get());
+
+  // Thresholds 0, 5e18, then 1e19, which no int64 time reaches: the last frame, at INT64_MAX, crosses nothing.
+  constexpr int64_t interval = 5'000'000'000'000'000'000;
+  Clip edge;
+  edge.timestamps_ms[edge.timestamps_ms.size() - 2] = interval;
+  edge.timestamps_ms.back() = std::numeric_limits<int64_t>::max();
+  const std::array media{edge.input(interval)};
+  MtmdSource source(mtmd, mtmd_default_marker(), media, {}, llama_model_n_embd_inp(model.get()), {});
+  const auto layout = read_layout(source, vocab);
+  INFO("layout: " << layout.text);
+  size_t stamps = 0;
+  for (size_t at = layout.text.find("<|vision_end|>["); at != std::string::npos; at = layout.text.find("<|vision_end|>[", at + 1)) ++stamps;
+  CHECK(stamps == 2);
+}
+
 TEST_CASE("multimodal: a video answers grounded on motion") {
   REQUIRE_VL();
   LlamaBackendGuard guard;
