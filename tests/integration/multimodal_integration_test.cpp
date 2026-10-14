@@ -1274,13 +1274,17 @@ struct Walked {
   decode::Segment::Kind kind;
   std::vector<llama_token> tokens;
   int32_t n_rows = 0;
+  /// How far this chunk advances the decoder position: a text token each, a media chunk its own count.
+  llama_pos n_pos = 0;
 };
 
 static std::vector<Walked> walk(decode::SegmentSource& source) {
   std::vector<Walked> out;
   for (size_t i = 0; i < source.size(); ++i) {
     const auto seg = source.at(i);
-    out.push_back({seg.kind, {seg.tokens.begin(), seg.tokens.end()}, seg.n_rows});
+    const bool text = seg.kind == decode::Segment::Kind::Text;
+    out.push_back({seg.kind, {seg.tokens.begin(), seg.tokens.end()}, seg.n_rows,
+                   text ? static_cast<llama_pos>(seg.tokens.size()) : seg.n_pos});
   }
   return out;
 }
@@ -1369,6 +1373,7 @@ TEST_CASE("multimodal: a video's frames tokenize as the server's video does") {
   const auto walked = walk(source);
   const auto& chunks = reference["chunks"];
   REQUIRE(walked.size() == chunks.size());
+  llama_pos positions = 0;
   for (size_t i = 0; i < walked.size(); ++i) {
     INFO("chunk " << i);
     const bool text = chunks[i]["type"] == "text";
@@ -1378,7 +1383,11 @@ TEST_CASE("multimodal: a video's frames tokenize as the server's video does") {
     } else {
       CHECK(walked[i].n_rows == chunks[i]["n_tokens"].get<int32_t>());
     }
+    // The KV position advance, which M-RoPE makes smaller than the rows for a media chunk.
+    CHECK(walked[i].n_pos == chunks[i]["n_pos"].get<llama_pos>());
+    positions += walked[i].n_pos;
   }
+  CHECK(positions == reference["n_pos"].get<llama_pos>());
 }
 
 /// The layout's text, read back in order, and how many media chunks it holds.
