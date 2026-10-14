@@ -1696,6 +1696,14 @@ TEST_CASE("multimodal: an invalid video is refused before any decode") {
     CHECK_THROWS_WITH(refuse(noted.input()), "MtmdSource - video notes must not precede the clip");
   }
   {
+    Clip late;
+    for (auto& t : late.timestamps_ms) t += 1000;
+    late.notes.push_back({500, "before the first frame"});
+    CHECK_THROWS_WITH(refuse(late.input()), "MtmdSource - video notes must not precede the clip");
+    late.notes = {{1000, "at the first frame"}};
+    CHECK_NOTHROW(refuse(late.input()));
+  }
+  {
     const auto wav = read_fixture("asr-counting.wav");
     REQUIRE(!wav.empty());
     Clip audio;

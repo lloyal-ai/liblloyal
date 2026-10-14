@@ -535,7 +535,8 @@ private:
     if (video.timestamp_interval_ms < 0) {
       throw std::runtime_error("MtmdSource - video timestamp interval must not be negative");
     }
-    if (std::any_of(video.notes.begin(), video.notes.end(), [](const VideoNote& n) { return n.at_ms < 0; })) {
+    const int64_t start = t.front();
+    if (std::any_of(video.notes.begin(), video.notes.end(), [start](const VideoNote& n) { return n.at_ms < start; })) {
       throw std::runtime_error("MtmdSource - video notes must not precede the clip");
     }
     for (const auto& frame : video.frames) {
