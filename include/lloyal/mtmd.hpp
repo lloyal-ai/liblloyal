@@ -226,8 +226,12 @@ struct VideoLayout {
       *out_bitmap = part.frame.release();
       return 0;
     }
-    *out_text = strdup(part.text.c_str());
-    return *out_text ? 0 : -2;
+    // mtmd frees the text with free(); malloc is the portable strdup (MSVC deprecates the POSIX name).
+    const size_t size = part.text.size() + 1;
+    *out_text = static_cast<char*>(std::malloc(size));
+    if (!*out_text) return -2;
+    std::memcpy(*out_text, part.text.c_str(), size);
+    return 0;
   }
 };
 

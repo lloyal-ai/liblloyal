@@ -1738,10 +1738,13 @@ TEST_CASE("multimodal: a video's transcript leaves frame fusion unchanged") {
   }
   INFO("layout: " << text);
   const auto stamp = text.find("[0m0.00s]");
+  const auto first = text.find("One, two, three.");
+  const auto closing = text.find("Thursday at nine.");
   REQUIRE(stamp != std::string::npos);
-  CHECK_MESSAGE(text.find("One, two, three.") > stamp, "a note joins the first timestamp at or after it");
-  CHECK_MESSAGE(text.find("Thursday at nine.") > text.find("One, two, three."),
-                "a note past the last timestamp closes the video");
+  REQUIRE(first != std::string::npos);
+  REQUIRE(closing != std::string::npos);
+  CHECK_MESSAGE(first > stamp, "a note joins the first timestamp at or after it");
+  CHECK_MESSAGE(closing > first, "a note past the last timestamp closes the video");
 }
 
 TEST_CASE("multimodal: a spoken video answers on sound and motion") {
