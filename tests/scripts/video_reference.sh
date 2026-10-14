@@ -19,7 +19,8 @@ fixtures="$root/tests/fixtures/video"
 : "${LLAMA_MMPROJ_MODEL:?set LLAMA_MMPROJ_MODEL to its mmproj-F16.gguf}"
 
 # Configured every run, so a reused build dir cannot keep MTMD_VIDEO off; CMake keeps what is cached.
-cmake -S "$llama" -B "$build" -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TOOLS=ON \
+# Shared libraries, so libmtmd carries its own dependencies (llama.cpp's vendor archives) into the link below.
+cmake -S "$llama" -B "$build" -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TOOLS=ON -DBUILD_SHARED_LIBS=ON \
   -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DMTMD_VIDEO=ON
 cmake --build "$build" --target mtmd -j
 
