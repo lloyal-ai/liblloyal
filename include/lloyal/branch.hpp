@@ -2263,7 +2263,8 @@ inline void pruneSubtree(BranchHandle h, BranchStore& s) {
  * @brief Reseed a branch's sampling PRNG, the way forks are made to diverge
  *
  * Only a stochastic chain (one ending in dist) has a PRNG; reseeding a greedy
- * chain would change nothing, so it is left alone.
+ * chain would change nothing, so it is left alone. The cached params record
+ * the new seed, so set_sampler_params() compares against the chain as it is.
  *
  * @param handle Branch to reseed
  * @param seed   New seed
@@ -2277,6 +2278,7 @@ inline void reseed_sampler(BranchHandle handle, uint32_t seed, BranchStore& s) {
   }
   if (!s.sampler_has_dist(state->sampler_chain)) return;
   sampler::reseed_chain(s.get_sampler_chain(state->sampler_chain), seed);
+  state->cached_params.seed = seed;
   ++state->revision;
 }
 

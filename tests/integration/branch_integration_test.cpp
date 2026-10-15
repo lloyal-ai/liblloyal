@@ -4010,6 +4010,113 @@ TEST_CASE("fast forward: a parent reseeded after the fork has changed since it")
   pruneSubtree(g, r.store);
 }
 
+// ============================================================================
+// A reseed is what set_sampler_params compares against. The memo compares
+// against cached_params, so a reseed that leaves the cached seed behind makes
+// the memo skip a real change and rebuild for none.
+// ============================================================================
+
+namespace {
+
+/// A wide distribution, so two different seeds draw different streams.
+struct WideParams {
+  float temperature = 1.5f;
+  int32_t top_k = 0;
+  float top_p = 1.0f;
+  float min_p = 0.0f;
+  float typical_p = 1.0f;
+  float penalty_repeat = 1.3f;
+  float penalty_freq = 0.0f;
+  float penalty_present = 0.0f;
+  int32_t penalty_last_n = 64;
+  uint32_t seed = 42;
+};
+
+WideParams seeded(uint32_t seed) {
+  WideParams p;
+  p.seed = seed;
+  return p;
+}
+
+/// The next `n` draws from a branch's sampler over the same logits: the PRNG
+/// advances, nothing is accepted or decoded.
+std::vector<llama_token> draws(BranchHandle h, BranchStore& s, int n) {
+  std::vector<llama_token> out;
+  for (int i = 0; i < n; ++i) out.push_back(sample(h, s));
+  return out;
+}
+
+SamplerChainHandle chain_of(FastForwardRig& r, BranchHandle h) { return r.store.get(h)->sampler_chain; }
+
+}  // namespace
+
+TEST_CASE("branch integration: set_sampler_params after a reseed applies the seed it asks for") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  FastForwardRig r(512, 64);
+
+  BranchHandle a = r.root(PROMPT, seeded(42));
+  BranchHandle fresh = fork(a, r.store);  // the chain as seed 42 made it, over the same logits
+  REQUIRE(fresh != INVALID_HANDLE);
+
+  reseed_sampler(a, 9973, r.store);
+  const SamplerChainHandle reseeded = chain_of(r, a);
+  set_sampler_params(a, seeded(42), r.store);
+
+  CHECK(chain_of(r, a) != reseeded);
+  CHECK(draws(a, r.store, 8) == draws(fresh, r.store, 8));
+
+  pruneSubtree(a, r.store);
+}
+
+TEST_CASE("branch integration: set_sampler_params after a reseed keeps a chain already on that seed") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  FastForwardRig r(512, 64);
+
+  BranchHandle a = r.root(PROMPT, seeded(42));
+  for (int i = 0; i < 4; ++i) {  // tokens in the penalty window a rebuild would forget
+    const llama_token t = sample(a, r.store);
+    accept_token(a, t, r.store);
+    step(a, t, r.store);
+  }
+  reseed_sampler(a, 9973, r.store);
+  BranchHandle twin = fork(a, r.store);  // the same window and the same PRNG
+  REQUIRE(twin != INVALID_HANDLE);
+
+  const SamplerChainHandle before = chain_of(r, a);
+  set_sampler_params(a, seeded(9973), r.store);
+
+  CHECK(chain_of(r, a) == before);
+  CHECK(draws(a, r.store, 8) == draws(twin, r.store, 8));
+
+  pruneSubtree(a, r.store);
+}
+
+TEST_CASE("fast forward: a reseeded seed travels with fork and fast-forward") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  FastForwardRig r(512, 64);
+
+  BranchHandle a = r.root(PROMPT, seeded(42));
+  reseed_sampler(a, 9973, r.store);
+  BranchHandle c = fork(a, r.store);
+  REQUIRE(c != INVALID_HANDLE);
+  CHECK(r.store.get(c)->cached_params.seed == 9973);
+
+  BranchHandle p = fork(a, r.store);
+  REQUIRE(p != INVALID_HANDLE);
+  reseed_sampler(p, 7, r.store);
+  fast_forward(a, p, r.store);
+  CHECK(r.store.get(a)->cached_params.seed == 7);
+
+  const SamplerChainHandle adopted = chain_of(r, a);
+  set_sampler_params(a, seeded(7), r.store);
+  CHECK(chain_of(r, a) == adopted);
+
+  pruneSubtree(a, r.store);
+}
+
 TEST_CASE("fast forward: a poisoned child is refused and the parent goes on untouched") {
   // The decode-failure suite's rig: one 256-cell pool, so a later chunk finds
   // no slot on demand while earlier chunks stand.
