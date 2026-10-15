@@ -228,6 +228,8 @@ jobs:
       working-directory: tests
       env:
         LLAMA_TEST_MODEL: ${{ github.workspace }}/tests/fixtures/SmolLM2-1.7B-Instruct-Q4_K_M.gguf
+        # UBSan recovers by default: without this a finding prints and the run passes.
+        UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
       run: |
         set -o pipefail
         echo "Running integration tests with SmolLM2-1.7B..."
@@ -246,6 +248,7 @@ jobs:
       env:
         LLAMA_TEST_MODEL: ${{ github.workspace }}/tests/fixtures/SmolLM2-1.7B-Instruct-Q4_K_M.gguf
         LLAMA_EMBED_MODEL: ${{ github.workspace }}/tests/fixtures/nomic-embed-text-v1.5.Q4_K_M.gguf
+        UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
       run: |
         set -o pipefail
         echo "Running embedding tests with nomic-embed-text-v1.5..."
@@ -274,9 +277,12 @@ jobs:
         echo "Projector path: $LLAMA_MMPROJ_MODEL"
         ls -lh "$LLAMA_TEST_MODEL" "$LLAMA_MMPROJ_MODEL"
         # The embedding-rail failure case needs the projector too; the plain
-        # run above skips it, so this run must select it by name.
+        # run above skips it, so this run must select it by name. The
+        # fast-forward cases run here again because Qwen3.5 is hybrid
+        # recurrent: a fork shares the parent's recurrent cell until one of
+        # them decodes, which SmolLM2's attention-only cache never exercises.
         ./build_integration/IntegrationRunner --success \
-          --test-case="*multimodal*,decode failure: an image*" 2>&1 | tee test_output.txt
+          --test-case="*multimodal*,decode failure: an image*,fast forward:*" 2>&1 | tee test_output.txt
         # Fail if no tests actually executed (all filtered/skipped)
         if grep -qE "test cases:.*\| 0 passed \| 0 failed \|" test_output.txt; then
           echo "::error::No tests executed — all were skipped or filtered out"
@@ -309,6 +315,132 @@ jobs:
           tests/build_integration/
           tests/audio_output.txt
 
+  # AddressSanitizer on real weights. The stub tier's sanitizer job never
+  # touches a KV cache, a recurrent cell or llama.cpp's own allocations, and
+  # the UBSan integration build excludes ASan because a plain libllama is not
+  # instrumented. Here llama.cpp is built WITH ASan too, so both sides of the
+  # boundary are, and the branch operations that move state between slots
+  # (fork, prune, retainOnly, fast_forward) run under it on both kinds of
+  # memory: SmolLM2's attention-only cache and Qwen3.5's hybrid recurrent one.
+  integration-asan:
+    name: Integration Tests under ASan (Linux)
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake build-essential nlohmann-json3-dev
+
+    - name: Read llama.cpp version
+      id: llama_version
+      run: |
+        LLAMA_VERSION=$(grep -v '^#' .llama-cpp-version | head -n1 | tr -d '[:space:]')
+        echo "version=$LLAMA_VERSION" >> $GITHUB_OUTPUT
+
+    - name: Checkout llama.cpp
+      run: git clone --depth 1 --branch ${{ steps.llama_version.outputs.version }} https://github.com/ggml-org/llama.cpp
+
+    - name: Cache the ASan llama.cpp build
+      uses: actions/cache@v4
+      with:
+        path: llama.cpp/build-asan
+        key: llama-linux-asan-${{ runner.arch }}-${{ steps.llama_version.outputs.version }}
+
+    # Static archives linked straight into the runner (the plain build tree
+    # tests/CMakeLists.txt accepts), every one compiled with ASan. OpenMP off:
+    # the static link adds no -fopenmp, and ggml's threadpool serves the same.
+    - name: Build llama.cpp with AddressSanitizer
+      run: |
+        cmake -B llama.cpp/build-asan -S llama.cpp \
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+          -DBUILD_SHARED_LIBS=OFF \
+          -DLLAMA_SANITIZE_ADDRESS=ON \
+          -DGGML_OPENMP=OFF \
+          -DLLAMA_BUILD_TOOLS=ON -DMTMD_VIDEO=OFF \
+          -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF \
+          -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_COMMON=ON -DLLAMA_CURL=OFF
+        cmake --build llama.cpp/build-asan --target llama mtmd llama-common -j$(nproc)
+
+    - name: Cache test models
+      uses: actions/cache@v4
+      with:
+        path: tests/fixtures/*.gguf
+        key: test-models-v3-${{ hashFiles('.github/workflows/tests.yml', 'tests/fixtures/*-models.sha256') }}
+        restore-keys: |
+          test-models-v3-
+
+    - name: Download and verify models
+      working-directory: tests
+      run: |
+        set -euo pipefail
+        mkdir -p fixtures
+        if [ ! -f fixtures/SmolLM2-1.7B-Instruct-Q4_K_M.gguf ]; then
+          curl -fsSL --retry 3 --retry-delay 2 \
+            "https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF/resolve/main/smollm2-1.7b-instruct-q4_k_m.gguf" \
+            -o fixtures/SmolLM2-1.7B-Instruct-Q4_K_M.gguf
+        fi
+        while read -r expected file; do
+          if ! printf '%s  %s\n' "$expected" "fixtures/$file" | sha256sum -c --status; then
+            curl -fsSL --retry 3 --retry-delay 2 \
+              "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/e87f176479d0855a907a41277aca2f8ee7a09523/$file" \
+              -o "fixtures/$file.part"
+            printf '%s  %s\n' "$expected" "fixtures/$file.part" | sha256sum -c -
+            mv "fixtures/$file.part" "fixtures/$file"
+          fi
+        done < fixtures/vision-models.sha256
+
+    - name: Configure the runner with AddressSanitizer
+      working-directory: tests
+      run: |
+        cmake -S . -B build_asan \
+          -DLLOYAL_BUILD_INTEGRATION_TESTS=ON \
+          -DLLAMA_CPP_DIR=${{ github.workspace }}/llama.cpp \
+          -DLLAMA_CPP_BUILD_DIR=${{ github.workspace }}/llama.cpp/build-asan \
+          -DNLOHMANN_JSON_DIR=/usr/include \
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+          "-DCMAKE_CXX_FLAGS=-fsanitize=address -fno-omit-frame-pointer" \
+          "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address"
+        cmake --build build_asan --target IntegrationRunner -j$(nproc)
+
+    # Leaks are the stub job's to find: this runner keeps the model loaded in a
+    # static for the whole suite on purpose, so a leak report here is noise.
+    - name: Branch operations under ASan (SmolLM2, attention-only)
+      working-directory: tests
+      env:
+        LLAMA_TEST_MODEL: ${{ github.workspace }}/tests/fixtures/SmolLM2-1.7B-Instruct-Q4_K_M.gguf
+        LLAMA_N_GPU_LAYERS: "0"
+        ASAN_OPTIONS: halt_on_error=1:detect_leaks=0:print_stacktrace=1
+      run: |
+        set -o pipefail
+        ./build_asan/IntegrationRunner --success \
+          --test-case="fast forward:*,fork fidelity:*,branch integration:*,branch scoping:*,decode failure:*" \
+          --test-case-exclude="decode failure: an image*" 2>&1 | tee asan_smollm.txt
+        if ! grep -qE 'test cases:.*\| +[1-9][0-9]* passed \| +0 failed \|' asan_smollm.txt; then
+          echo "::error::No passing cases were reported"
+          exit 1
+        fi
+
+    - name: Branch operations under ASan (Qwen3.5, hybrid recurrent, with its projector)
+      working-directory: tests
+      env:
+        LLAMA_TEST_MODEL: ${{ github.workspace }}/tests/fixtures/Qwen3.5-4B-Q4_K_M.gguf
+        LLAMA_MMPROJ_MODEL: ${{ github.workspace }}/tests/fixtures/mmproj-F16.gguf
+        LLAMA_N_GPU_LAYERS: "0"
+        LLOYAL_VL_STRICT: "1"
+        ASAN_OPTIONS: halt_on_error=1:detect_leaks=0:print_stacktrace=1
+      run: |
+        set -o pipefail
+        ./build_asan/IntegrationRunner --success \
+          --test-case="fast forward:*,decode failure:*,multimodal: a fast-forwarded*,multimodal: a cohort*,multimodal: a prepared video*" \
+          2>&1 | tee asan_qwen.txt
+        if ! grep -qE 'test cases:.*\| +[1-9][0-9]* passed \| +0 failed \|' asan_qwen.txt; then
+          echo "::error::No passing cases were reported"
+          exit 1
+        fi
+
   lint:
     name: Code Style Check
     runs-on: ubuntu-latest
@@ -332,7 +464,7 @@ jobs:
   summary:
     name: Test Summary
     runs-on: ubuntu-latest
-    needs: [unit-tests, sanitizer-tests, integration-tests, lint]
+    needs: [unit-tests, sanitizer-tests, integration-tests, integration-asan, lint]
     if: always()
 
     steps:
@@ -342,6 +474,7 @@ jobs:
         echo "Unit Tests: ${{ needs.unit-tests.result }}"
         echo "Sanitizer Tests: ${{ needs.sanitizer-tests.result }}"
         echo "Integration Tests (Linux): ${{ needs.integration-tests.result }}"
+        echo "Integration Tests under ASan (Linux): ${{ needs.integration-asan.result }}"
         echo "Lint: ${{ needs.lint.result }}"
 
         FAILED=0
@@ -358,6 +491,11 @@ jobs:
 
         if [ "${{ needs.integration-tests.result }}" != "success" ]; then
           echo "❌ Integration tests failed"
+          FAILED=1
+        fi
+
+        if [ "${{ needs.integration-asan.result }}" != "success" ]; then
+          echo "❌ Integration tests under ASan failed (memory errors on real weights)"
           FAILED=1
         fi
 
