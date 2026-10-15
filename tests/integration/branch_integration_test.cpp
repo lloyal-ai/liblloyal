@@ -3938,6 +3938,24 @@ TEST_CASE("fast forward: refused, with nothing changed, unless the child is the 
   changed("set_logits", [&] { set_logits(a, std::span<const float>(logits_of(sibling, r.store)), r.store); });
   changed("set_grammar", [&] { set_grammar(a, r.model.get(), "root ::= \"x\"", r.store); });
   changed("set_sampler_params", [&] { TestParams t2; t2.seed = 1234; set_sampler_params(a, t2, r.store); });
+  changed("merge_logits", [&] {
+    const BranchHandle experts[] = {sibling};
+    r.store.merge_logits(a, experts, 0.5f);
+  });
+
+  // A merge refused partway changes nothing, so a child forked before it still fast-forwards.
+  {
+    BranchHandle before_merge = fork(a, r.store);
+    BranchHandle stale = fork(a, r.store);
+    REQUIRE(before_merge != INVALID_HANDLE);
+    REQUIRE(stale != INVALID_HANDLE);
+    prune(stale, r.store);
+    const std::vector<float> logits = logits_of(a, r.store);
+    const BranchHandle experts[] = {sibling, stale};
+    CHECK_THROWS_WITH(r.store.merge_logits(a, experts, 0.5f), doctest::Contains("invalid expert handle at index 1"));
+    CHECK(logits_of(a, r.store) == logits);
+    CHECK_NOTHROW(fast_forward(a, before_merge, r.store));
+  }
 
   // A memoized no-op changes nothing, so it does not refuse.
   BranchHandle same = fork(a, r.store);

@@ -1547,7 +1547,7 @@ public:
    * @param expert_handles Span of expert branches (all must have captured logits)
    * @param alpha         Expert weight (additive in log space)
    * @throws std::runtime_error if any handle invalid, logits not captured,
-   *         or n_vocab mismatch across branches
+   *         or n_vocab mismatch across branches; a refusal changes nothing
    */
   void merge_logits(
       BranchHandle dst_handle,
@@ -1565,8 +1565,10 @@ public:
     }
 
     const int32_t n_vocab = dst->n_vocab;
-    float* dst_logits = dst->logits_snapshot.data();
 
+    // Every expert is checked before dst is written, so a refusal changes nothing.
+    std::vector<const float*> sources;
+    sources.reserve(expert_handles.size());
     for (size_t i = 0; i < expert_handles.size(); ++i) {
       BranchState* src = get(expert_handles[i]);
       if (!src) {
@@ -1584,8 +1586,11 @@ public:
             "BranchStore::merge_logits - n_vocab mismatch at index " +
             std::to_string(i));
       }
+      sources.push_back(src->logits_snapshot.data());
+    }
 
-      const float* src_logits = src->logits_snapshot.data();
+    float* dst_logits = dst->logits_snapshot.data();
+    for (const float* src_logits : sources) {
       for (int32_t t = 0; t < n_vocab; ++t) {
         dst_logits[t] += alpha * src_logits[t];
       }
