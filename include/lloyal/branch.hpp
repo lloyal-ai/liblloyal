@@ -471,8 +471,9 @@ inline void require_distinct_handles(std::span<const BranchHandle> handles, cons
  *          allocate() acquires both a slot and a lease atomically;
  *          release()/drain() return both resources symmetrically.
  *
- * @warning Thread safety: External synchronization required (caller's mutex).
- *          Typically SessionContext holds _decodeMutex for decode operations.
+ * @warning Thread safety: External synchronization required. The store holds
+ *          no lock: callers must not touch a branch, or the shared context,
+ *          while native work on it is in flight.
  *
  * @see branch::create() to initialize a branch in this store
  * @see branch::fork() to clone a branch into a new sequence
@@ -676,8 +677,10 @@ public:
    * slot, and cells_used is unchanged: the child's cells were counted when they
    * were decoded, and the parent's are all shared with the child.
    *
-   * No native work may be in flight on either branch (external synchronization,
-   * as for every BranchStore operation).
+   * No native work may be in flight on the context while it runs, on these
+   * branches or any other: evicting the parent's former sequence is a KV
+   * operation on the shared context (external synchronization, as for every
+   * BranchStore operation).
    *
    * @throws std::runtime_error, changing nothing, unless the child was forked
    *         from this parent, the parent has neither decoded nor changed since,
@@ -1701,8 +1704,9 @@ private:
   std::vector<uint16_t> freelist_;  ///< Available slot indices (LIFO — locality heuristic)
 
   /// KV lease manager. Initialized by init_tenancy(), drained by drain().
-  /// seq_id ownership invariant: only the BranchState that received a seq_id
-  /// from allocate() may hold it, and only while its handle+generation is live.
+  /// seq_id ownership invariant: a seq_id leased by allocate() is held by
+  /// exactly one live BranchState at a time, and returns to the pool when that
+  /// state is released. fast_forward() moves the child's seq_id to the parent.
   kv::tenancy::State tenancy_;
 
   /// KV cells consumed. Incremented by decode_each/decode_scatter/add_cells_used,

@@ -87,7 +87,8 @@ struct VideoNote {
  * frame mergeable, and a "[XmY.YYs]" timestamp after the frame that crosses
  * each `timestamp_interval_ms` (0 disables them). A note joins the first
  * timestamp at or after its time; notes past the last one close the video.
- * Text never lands between frames, so notes leave temporal fusion unchanged.
+ * Notes only join timestamp text the layout already has, so they add no text
+ * between frames and leave temporal fusion unchanged.
  */
 struct VideoFrames {
   std::span<const std::span<const uint8_t>> frames;

@@ -18,8 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `BranchState::revision` counts every change to the state a fast-forward moves,
   and `fork_revision` records the parent's at fork time.
 - `BranchState::poisoned` (read with `is_poisoned()`) marks a branch whose
-  failed decode left its KV ahead of its books, under `DecodeError`'s rule
-  (`decode::leaves_branch_intact`). A fork inherits it. Prune and replay.
+  failed decode left its KV ahead of its books. It is per branch: in a
+  `decode_scatter` across branches, the error's `partial` is about the whole
+  operation, and this flag says which branches were hurt. A fork inherits it.
+  Prune and replay.
 
 - Video input: `MediaInput::Kind::Video` carries the sampled frames of one clip
   (`VideoFrames`: encoded frames, their timestamps, the timestamp interval and
