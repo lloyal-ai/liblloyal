@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- `fast_forward(parent, child)`: the child's state becomes the parent's, which
+  keeps its handle, place in the tree and steer callback (`git merge --ff-only`).
+  Fork, work on the fork, then fast-forward the parent to it or prune it: a
+  checkpoint any branch can keep or discard while siblings and descendants run
+  on. Everything that follows the child's tokens moves, sampler and grammar
+  included; no cells move, and `cells_used` is unchanged. Refused, with nothing
+  changed, unless the child was forked from this parent, the parent has neither
+  decoded nor changed since, and the child has no children and is not poisoned.
+- `BranchState::revision` counts every change to the state a fast-forward moves,
+  and `fork_revision` records the parent's at fork time.
+- `BranchState::poisoned` (read with `is_poisoned()`) marks a branch whose
+  failed decode left its KV ahead of its books, under `DecodeError`'s rule
+  (`decode::leaves_branch_intact`). A fork inherits it. Prune and replay.
+
 - Video input: `MediaInput::Kind::Video` carries the sampled frames of one clip
   (`VideoFrames`: encoded frames, their timestamps, the timestamp interval and
   optional `VideoNote`s). `MtmdSource` lays them out as llama.cpp's video helper

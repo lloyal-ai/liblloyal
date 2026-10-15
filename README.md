@@ -15,7 +15,8 @@ So the operations are the ones you already know:
 |---|---|
 | <code>git&nbsp;branch</code> | `fork()` — from the current position |
 | <code>git&nbsp;branch&nbsp;&#8209;d</code> / <code>&#8209;D</code> | `prune()` / `pruneSubtree()`, descendants included |
-| <code>git&nbsp;merge&nbsp;&#8209;&#8209;ff&#8209;only</code> | `retainOnly(winner)` — the winner's KV *becomes* the trunk, in one pass |
+| <code>git&nbsp;merge&nbsp;&#8209;&#8209;ff&#8209;only</code> | `fast_forward(parent, child)`: the parent takes the child's state and keeps its name; every other branch keeps running |
+| <code>&#8209;&#8209;ff&#8209;only</code>, then <code>branch&nbsp;&#8209;D</code> on the rest | `retainOnly(winner)`: the winner's KV *becomes* the trunk and every other branch is deleted, in one pass |
 | <code>git&nbsp;merge&nbsp;&#8209;&#8209;squash</code> | `decode_scatter()` onto the parent — **hard**: the child's KV is dropped, its output re-decoded |
 | <code>git&nbsp;rebase</code> | `create()` + `decode_scatter()` — **replay from content**; re-decodes onto a new base rather than moving cells, the only form that survives recurrent state |
 | *no equivalent* | `merge_logits(dst, experts, α)` — **soft**: distributions blend, both KVs stay live |
