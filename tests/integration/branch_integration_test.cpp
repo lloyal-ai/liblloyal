@@ -3957,6 +3957,14 @@ TEST_CASE("fast forward: refused, with nothing changed, unless the child is the 
     CHECK_NOTHROW(fast_forward(a, before_merge, r.store));
   }
 
+  // A merge of no experts changes nothing, so it does not refuse either.
+  {
+    BranchHandle before_empty = fork(a, r.store);
+    REQUIRE(before_empty != INVALID_HANDLE);
+    r.store.merge_logits(a, std::span<const BranchHandle>{}, 0.5f);
+    CHECK_NOTHROW(fast_forward(a, before_empty, r.store));
+  }
+
   // A memoized no-op changes nothing, so it does not refuse.
   BranchHandle same = fork(a, r.store);
   REQUIRE(same != INVALID_HANDLE);

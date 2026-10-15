@@ -1588,6 +1588,7 @@ public:
       }
       sources.push_back(src->logits_snapshot.data());
     }
+    if (sources.empty()) return;  // nothing merged, nothing changed
 
     float* dst_logits = dst->logits_snapshot.data();
     for (const float* src_logits : sources) {
