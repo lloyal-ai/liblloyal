@@ -137,6 +137,11 @@ inline void batch_add(llama_batch& batch, llama_token id, llama_pos pos,
  * The message also carries `rc=N` (and `partial` when set) for humans reading
  * logs; nothing parses it.
  */
+/// The rule above as a predicate: whether a failed call left its branch intact.
+inline bool leaves_branch_intact(int32_t rc, bool partial) {
+  return (rc == 1 || rc == -1) && !partial;
+}
+
 struct DecodeError : std::runtime_error {
   int32_t rc;
   bool partial;

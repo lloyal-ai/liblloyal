@@ -1838,6 +1838,222 @@ TEST_CASE("multimodal: a spoken video answers on sound and motion") {
   llama_free(ctx);
 }
 
+// ============================================================================
+// Fast-forward over media — a turn prepared on a fork, kept by fast-forwarding
+// the parent to it, or discarded by pruning the fork. The parent keeps its
+// handle; a failed prefill on the fork never reaches it.
+// ============================================================================
+
+static llama_context* media_ctx(const llama_model* model, uint32_t n_ctx, uint32_t n_seq_max) {
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = n_ctx;
+  cparams.n_batch = 512;
+  cparams.n_seq_max = n_seq_max;
+  cparams.kv_unified = true;
+  return llama_init_from_model(const_cast<llama_model*>(model), cparams);
+}
+
+TEST_CASE("multimodal: a fast-forwarded image prefill merges its slack and the parent answers on the image") {
+  REQUIRE_VL();
+  LlamaBackendGuard guard;
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+  mtmd_context* mtmd = acquire_mtmd(model.get());
+  REQUIRE(mtmd);
+  auto image = read_fixture("cat.jpg");
+  REQUIRE(!image.empty());
+
+  llama_context* ctx = media_ctx(model.get(), 4096, 4);
+  REQUIRE(ctx);
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+  TestParams params;
+  const auto* vocab = llama_model_get_vocab(model.get());
+
+  BranchHandle a = create(ctx, model.get(), store, 0, params, 512);
+  REQUIRE(a != INVALID_HANDLE);
+  BranchHandle p = fork(a, store);
+  REQUIRE(p != INVALID_HANDLE);
+
+  std::vector<std::vector<uint8_t>> images{image};
+  MtmdSource source(mtmd, image_prompt(model.get(), "Study this image."), images,
+                    std::span<const llama_token>(), llama_model_n_embd_inp(model.get()));
+  const auto r = store.decode_segments(p, source);
+  REQUIRE(r.cells > r.advance);  // an M-RoPE image: cells outrun position
+  const uint32_t cells = store.kv_pressure().cells_used;
+
+  fast_forward(a, p, store);
+
+  CHECK(store.get(p) == nullptr);
+  CHECK(store.kv_pressure().cells_used == cells);
+  CHECK(get_position(a, store) == r.advance);
+  CHECK(store.get(a)->img_slack_own == static_cast<uint32_t>(r.cells - r.advance));
+  CHECK(store.get(a)->img_slack_total == static_cast<uint32_t>(r.cells - r.advance));
+
+  auto ask = question_tokens(model.get(), "What animal is in this picture? Answer in one word.");
+  DecodeScatterItem item{a, std::span<const llama_token>(ask)};
+  store.decode_scatter(std::span<const DecodeScatterItem>(&item, 1));
+  const auto answer = generate(a, store, vocab, 12);
+  INFO("answer: " << answer);
+  CHECK(!answer.empty());
+  if (vl_strict()) CHECK(contains_any(answer, {"cat", "kitten", "feline"}));
+
+  // The parent owns the image now, slack included: releasing it recovers every cell.
+  prune(a, store);
+  CHECK(store.kv_pressure().cells_used == 0);
+  store.drain();
+  llama_free(ctx);
+}
+
+TEST_CASE("multimodal: a cohort of agents each keeps its own prepared turn over one shared clip") {
+  REQUIRE_VL();
+  LlamaBackendGuard guard;
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+  mtmd_context* mtmd = acquire_mtmd(model.get());
+  REQUIRE(mtmd);
+
+  llama_context* ctx = media_ctx(model.get(), 8192, 8);
+  REQUIRE(ctx);
+  BranchStore store(16);
+  store.init_tenancy(ctx);
+  TestParams params;
+  const auto* vocab = llama_model_get_vocab(model.get());
+
+  BranchHandle spine = create(ctx, model.get(), store, 0, params, 512);
+  REQUIRE(spine != INVALID_HANDLE);
+  Clip clip;
+  const auto turn = open_video_turn(model.get());
+  auto source = video_source(mtmd, model.get(), turn.head, clip);
+  CountedSource counted(source);
+  store.decode_segments(spine, counted);
+  const uint32_t after_video = store.kv_pressure().cells_used;
+
+  struct Ask { const char* question; std::vector<std::string> expect; };
+  const std::vector<Ask> asks = {
+      {"Which direction does the red square move? Answer in a few words.", {"right"}},
+      {"What color is the moving square? Answer in one word.", {"red"}},
+      {"What color is the background? Answer in one word.", {"white"}},
+  };
+
+  // Each agent prepares its question on its own fork; all three prefill in one dispatch.
+  std::vector<BranchHandle> agents, prepared;
+  std::vector<std::vector<llama_token>> suffixes;
+  std::vector<DecodeScatterItem> items;
+  size_t suffix_total = 0;
+  for (const auto& a : asks) suffixes.push_back(close_turn(model.get(), turn, a.question));
+  for (size_t i = 0; i < asks.size(); ++i) {
+    agents.push_back(fork(spine, store));
+    REQUIRE(agents.back() != INVALID_HANDLE);
+    prepared.push_back(fork(agents.back(), store));
+    REQUIRE(prepared.back() != INVALID_HANDLE);
+  }
+  for (size_t i = 0; i < asks.size(); ++i) {
+    items.push_back({prepared[i], std::span<const llama_token>(suffixes[i])});
+    suffix_total += suffixes[i].size();
+  }
+  store.decode_scatter(std::span<const DecodeScatterItem>(items));
+
+  // Kept in any order, independently of one another.
+  for (size_t i : {size_t{2}, size_t{0}, size_t{1}}) fast_forward(agents[i], prepared[i], store);
+  CHECK(store.kv_pressure().cells_used == after_video + suffix_total);
+  for (size_t i = 0; i < asks.size(); ++i) {
+    CHECK(store.get(prepared[i]) == nullptr);
+    CHECK(store.parent(agents[i]) == spine);
+  }
+
+  std::vector<std::string> answers(agents.size());
+  std::vector<bool> done(agents.size(), false);
+  for (int step = 0; step < 24; ++step) {
+    std::vector<DecodeEachItem> batch;
+    for (size_t i = 0; i < agents.size(); ++i) {
+      if (done[i]) continue;
+      const llama_token t = sample(agents[i], store);
+      if (t < 0 || tokenizer::is_eog(vocab, t)) { done[i] = true; continue; }
+      accept_token(agents[i], t, store);
+      answers[i] += tokenizer::detokenize(vocab, t, false);
+      batch.push_back({agents[i], t});
+    }
+    if (batch.empty()) break;
+    store.decode_each(std::span<const DecodeEachItem>(batch));
+  }
+  for (size_t i = 0; i < agents.size(); ++i) {
+    INFO("Q: " << asks[i].question << "  |  A: " << answers[i]);
+    CHECK(!answers[i].empty());
+    if (vl_strict()) CHECK(contains_any(answers[i], asks[i].expect));
+  }
+  CHECK_MESSAGE(counted.encodes == 9, "keeping a prepared turn never re-encodes the clip");
+
+  for (auto a : agents) prune(a, store);
+  CHECK(store.kv_pressure().cells_used == after_video);
+  prune(spine, store);
+  CHECK(store.kv_pressure().cells_used == 0);
+  store.drain();
+  llama_free(ctx);
+}
+
+TEST_CASE("multimodal: a prepared video that overflows is poisoned, refused, and the parent goes on") {
+  REQUIRE_VL();
+  LlamaBackendGuard guard;
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+  mtmd_context* mtmd = acquire_mtmd(model.get());
+  REQUIRE(mtmd);
+
+  llama_context* ctx = media_ctx(model.get(), 1024, 4);
+  REQUIRE(ctx);
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+  TestParams params;
+  const auto* vocab = llama_model_get_vocab(model.get());
+
+  BranchHandle parent = create(ctx, model.get(), store, 0, params, 512);
+  REQUIRE(parent != INVALID_HANDLE);
+  const auto lead = tokenizer::tokenize(vocab, "A short clip follows.", false, false);
+  prefill(parent, lead.data(), lead.size(), store);
+  const auto parent_cells = store.kv_pressure().cells_used;
+  const auto parent_position = get_position(parent, store);
+  const auto parent_kv = kv::pos_max(ctx, store.get(parent)->seq_id);
+
+  // Room on the fork for the opening text and two frame chunks, not the whole clip.
+  BranchHandle p = fork(parent, store);
+  REQUIRE(p != INVALID_HANDLE);
+  const auto seq = store.get(p)->seq_id;
+  const auto dot = tokenizer::tokenize(vocab, ".", false, false);
+  const std::vector<llama_token> padding(llama_n_ctx(ctx) - parent_cells - 200, dot.front());
+  prefill(p, padding.data(), padding.size(), store);
+
+  Clip clip;
+  auto source = video_source(mtmd, model.get(), mtmd_default_marker(), clip);
+  REQUIRE(source.cells() > 200);
+  bool partial = false;
+  try {
+    store.decode_segments(p, source);
+  } catch (const decode::DecodeError& e) {
+    partial = e.partial;
+  }
+  REQUIRE(partial);
+  CHECK(is_poisoned(p, store));
+
+  CHECK_THROWS_WITH(fast_forward(parent, p, store), doctest::Contains("poisoned"));
+  CHECK(get_position(parent, store) == parent_position);
+  CHECK(kv::pos_max(ctx, store.get(parent)->seq_id) == parent_kv);
+  CHECK_FALSE(is_poisoned(parent, store));
+
+  prune(p, store);
+  CHECK(kv::pos_max(ctx, seq) == -1);
+  CHECK(store.kv_pressure().cells_used == parent_cells);
+  auto ask = question_tokens(model.get(), "Say hello in one word.");
+  DecodeScatterItem item{parent, std::span<const llama_token>(ask)};
+  CHECK_NOTHROW(store.decode_scatter(std::span<const DecodeScatterItem>(&item, 1)));
+  CHECK(!generate(parent, store, vocab, 4).empty());
+
+  prune(parent, store);
+  CHECK(store.kv_pressure().cells_used == 0);
+  store.drain();
+  llama_free(ctx);
+}
+
 // A projector without temporal merge encodes each frame on its own. The CI
 // vision model fuses, so this runs only against a non-fusing pair selected
 // explicitly in its own process (LLOYAL_VIDEO_UNFUSED=1, e.g. SmolVLM).
