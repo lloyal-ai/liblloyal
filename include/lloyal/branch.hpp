@@ -30,7 +30,11 @@
  * Fork semantics:
  * - fork() clones: KV, grammar, sampler chain, metrics, logits, logit_bias
  * - fork() does NOT clone: steer callback (captures references, unsafe to copy)
- * - Each branch is fully independent after fork
+ * - Each branch is fully independent after fork. On a recurrent layer the
+ *   child shares the parent's recurrent cell until one of them decodes, which
+ *   copies it; attention cells stay shared, tagged by both sequences.
+ * - fast_forward(parent, child) keeps a child's work in the parent's place;
+ *   prune(child) discards it. Together with fork() that is a checkpoint.
  *
  * These primitives compose into inference patterns including:
  * - Best-of-N sampling (fork N candidates, select by perplexity)
@@ -286,6 +290,22 @@ struct BranchState {
   llama_pos position = 0;    ///< Current decode position in the sequence
   llama_pos fork_head = 0;   ///< Parent's position at fork time (0 for root branches)
 
+  /// Counts every change to the state fast_forward() moves: decodes, logits,
+  /// sampling, grammar and bias. Compared for equality only, so a fork can tell
+  /// whether its parent is still the branch it was forked from.
+  uint64_t revision = 0;
+  /// The parent's revision at fork time (0 for root branches).
+  uint64_t fork_revision = 0;
+  /// A decode failed and left the KV ahead of these books (see
+  /// decode::leaves_branch_intact). Prune and replay; a fork shares the damage
+  /// and inherits the mark.
+  bool poisoned = false;
+
+  void poison() {
+    poisoned = true;
+    ++revision;
+  }
+
   /// Embedding-row slack: cells beyond position-delta from decode_embd()
   /// (an M-RoPE image adds nx*ny cells but advances position by max(nx,ny)).
   /// `own` = slack accrued on THIS branch since its fork (release() adds it
@@ -451,8 +471,9 @@ inline void require_distinct_handles(std::span<const BranchHandle> handles, cons
  *          allocate() acquires both a slot and a lease atomically;
  *          release()/drain() return both resources symmetrically.
  *
- * @warning Thread safety: External synchronization required (caller's mutex).
- *          Typically SessionContext holds _decodeMutex for decode operations.
+ * @warning Thread safety: External synchronization required. The store holds
+ *          no lock: callers must not touch a branch, or the shared context,
+ *          while native work on it is in flight.
  *
  * @see branch::create() to initialize a branch in this store
  * @see branch::fork() to clone a branch into a new sequence
@@ -631,6 +652,85 @@ public:
     // prefix's real cell count: position-delta + embedding-row slack.
     w->img_slack_own = w->img_slack_total;
     cells_used_ = static_cast<uint32_t>(w->position) + w->img_slack_total;
+    ++w->revision;
+  }
+
+  /**
+   * @brief Fast-forward `parent` to `child`: the child's state becomes the parent's
+   *
+   * git's `merge --ff-only`. With fork() and prune() it gives any branch a
+   * checkpoint it can keep or discard while the rest of the tree runs on: fork,
+   * work on the fork, then fast-forward the parent to it or prune it.
+   *
+   * The parent keeps its identity (handle, parent, children, fork_head, n_batch,
+   * steer_fn) and takes everything that follows the child's token trajectory:
+   * its sequence and KV, position, image slack, logits snapshot, sampler chain
+   * and parameters, grammar and grammar order, last sample, metrics and logit
+   * bias. A grammar holds its rules and its parser position in one sampler, and
+   * the chain holds its parameters with the penalty window and PRNG, so they
+   * move whole: configuration set on the child after the fork comes with it.
+   * The child's steer_fn is dropped with the child.
+   *
+   * No cells move. The parent's former sequence is evicted whole, which is
+   * safe on recurrent layers; siblings still sharing its cells keep them. The
+   * parent's former sampler, grammar and metrics are freed with the child's
+   * slot, and cells_used is unchanged: the child's cells were counted when they
+   * were decoded, and the parent's are all shared with the child.
+   *
+   * No native work may be in flight on the context while it runs, on these
+   * branches or any other: evicting the parent's former sequence is a KV
+   * operation on the shared context (external synchronization, as for every
+   * BranchStore operation).
+   *
+   * @throws std::runtime_error, changing nothing, unless the child was forked
+   *         from this parent, the parent has neither decoded nor changed since,
+   *         the child has no children and is not poisoned, and both hold a lease
+   */
+  void fast_forward(BranchHandle parent, BranchHandle child) {
+    BranchState* a = get(parent);
+    if (!a) throw std::runtime_error("fast_forward: invalid parent handle");
+    BranchState* p = get(child);
+    if (!p) throw std::runtime_error("fast_forward: invalid child handle");
+    if (p->parent != parent) {
+      throw std::runtime_error("fast_forward: the child was not forked from this parent");
+    }
+    if (a->seq_id == NO_LEASE || p->seq_id == NO_LEASE) {
+      throw std::runtime_error("fast_forward: a branch has no lease");
+    }
+    if (!p->children.empty()) {
+      throw std::runtime_error("fast_forward: the child has children of its own");
+    }
+    if (p->poisoned) {
+      throw std::runtime_error("fast_forward: the child is poisoned by a failed decode; prune it");
+    }
+    if (p->fork_head != a->position) {
+      throw std::runtime_error("fast_forward: the parent has decoded since the fork");
+    }
+    if (p->fork_revision != a->revision) {
+      throw std::runtime_error("fast_forward: the parent has changed since the fork");
+    }
+
+    std::swap(a->seq_id, p->seq_id);
+    std::swap(a->logits_snapshot, p->logits_snapshot);
+    std::swap(a->has_logits, p->has_logits);
+    std::swap(a->sampler_chain, p->sampler_chain);
+    std::swap(a->cached_params, p->cached_params);
+    std::swap(a->grammar, p->grammar);
+    std::swap(a->grammar_sample_first, p->grammar_sample_first);
+    std::swap(a->last_token, p->last_token);
+    std::swap(a->last_candidates, p->last_candidates);
+    std::swap(a->metrics, p->metrics);
+    std::swap(a->logit_bias, p->logit_bias);
+    a->position = p->position;
+    a->img_slack_own += p->img_slack_own;
+    a->img_slack_total = p->img_slack_total;
+    ++a->revision;
+
+    // The child's range is the parent's now, so its release subtracts nothing;
+    // it evicts the sequence and frees the resources the parent held before.
+    p->position = p->fork_head;
+    p->img_slack_own = 0;
+    release(child);
   }
 
   // ===== TOPOLOGY QUERIES =====
@@ -1033,6 +1133,9 @@ public:
 
     // Single GPU dispatch
     if (const int32_t rc = decode::each(states[0]->ctx, decode_items.data(), n, scratch_); rc != 0) {
+      if (!decode::leaves_branch_intact(rc, /*partial*/ false)) {
+        for (auto* st : states) st->poison();
+      }
       throw decode::DecodeError(rc, /*partial*/ false, "BranchStore::decode_each - llama_decode failed");
     }
 
@@ -1040,6 +1143,7 @@ public:
     for (int32_t i = 0; i < n; ++i) {
       states[i]->capture_logits(i);
       states[i]->position += 1;
+      ++states[i]->revision;
     }
     cells_used_ += static_cast<uint32_t>(items.size());
   }
@@ -1121,12 +1225,14 @@ public:
         if (const int32_t rc = decode::many(ctx, items[idx].tokens.data(), tc,
                                             states[idx]->position, batch_limit,
                                             states[idx]->seq_id, &committed); rc != 0) {
+          if (!decode::leaves_branch_intact(rc, committed > 0)) states[idx]->poison();
           throw decode::DecodeError(rc, landed > 0 || committed > 0,
               "BranchStore::decode_scatter - decode::many failed for oversized item " + std::to_string(idx));
         }
 
         states[idx]->capture_logits(-1);
         states[idx]->position += tc;
+        ++states[idx]->revision;
         cells_used_ += static_cast<uint32_t>(tc);
         ++landed;
         continue;
@@ -1145,6 +1251,10 @@ public:
       if (const int32_t rc = decode::scatter(ctx, scatter_items.data(),
                                              static_cast<int32_t>(scatter_items.size()),
                                              scratch_); rc != 0) {
+        // Each branch in the failing chunk lost only this call: intact iff it restored.
+        if (!decode::leaves_branch_intact(rc, /*partial*/ false)) {
+          for (const int32_t idx : chunk.indices) states[idx]->poison();
+        }
         throw decode::DecodeError(rc, landed > 0, "BranchStore::decode_scatter - decode::scatter failed");
       }
 
@@ -1156,6 +1266,7 @@ public:
 
         states[idx]->capture_logits(cursor + item_n - 1);
         states[idx]->position += item_n;
+        ++states[idx]->revision;
         cells_used_ += static_cast<uint32_t>(item_n);
 
         cursor += item_n;
@@ -1267,6 +1378,7 @@ public:
     // refuse rather than half-commit.
     int32_t committed = 0;
     if (const int32_t rc = decode::embd(state->ctx, item, state->n_batch, scratch_, &committed); rc != 0) {
+      if (!decode::leaves_branch_intact(rc, committed > 0)) state->poison();
       throw decode::DecodeError(rc, committed > 0,
           "BranchStore::decode_embd - llama_decode failed; this branch is "
           "poisoned, prune it and replay onto a fresh one");
@@ -1277,6 +1389,7 @@ public:
     const uint32_t slack = static_cast<uint32_t>(n_tokens - n_pos);
     state->img_slack_own += slack;
     state->img_slack_total += slack;
+    ++state->revision;
 
     if (want_logits) {
       state->capture_logits(-1);
@@ -1402,8 +1515,13 @@ public:
       // One operation to the caller: a failure after an earlier segment
       // landed is partial even when the failing call restored its own
       // chunks. Every segment is material, so a moved position is proof.
+      if (state->position != start_pos) state->poison();
       if (e.partial || state->position == start_pos) throw;
       throw e.as_partial();
+    } catch (...) {
+      // The source threw after a segment landed: the branch is part-way through.
+      if (state->position != start_pos) state->poison();
+      throw;
     }
 
     result.advance = state->position - start_pos;
@@ -1432,7 +1550,7 @@ public:
    * @param expert_handles Span of expert branches (all must have captured logits)
    * @param alpha         Expert weight (additive in log space)
    * @throws std::runtime_error if any handle invalid, logits not captured,
-   *         or n_vocab mismatch across branches
+   *         or n_vocab mismatch across branches; a refusal changes nothing
    */
   void merge_logits(
       BranchHandle dst_handle,
@@ -1450,8 +1568,10 @@ public:
     }
 
     const int32_t n_vocab = dst->n_vocab;
-    float* dst_logits = dst->logits_snapshot.data();
 
+    // Every expert is checked before dst is written, so a refusal changes nothing.
+    std::vector<const float*> sources;
+    sources.reserve(expert_handles.size());
     for (size_t i = 0; i < expert_handles.size(); ++i) {
       BranchState* src = get(expert_handles[i]);
       if (!src) {
@@ -1469,12 +1589,17 @@ public:
             "BranchStore::merge_logits - n_vocab mismatch at index " +
             std::to_string(i));
       }
+      sources.push_back(src->logits_snapshot.data());
+    }
+    if (sources.empty()) return;  // nothing merged, nothing changed
 
-      const float* src_logits = src->logits_snapshot.data();
+    float* dst_logits = dst->logits_snapshot.data();
+    for (const float* src_logits : sources) {
       for (int32_t t = 0; t < n_vocab; ++t) {
         dst_logits[t] += alpha * src_logits[t];
       }
     }
+    ++dst->revision;
   }
 
 private:
@@ -1507,6 +1632,9 @@ private:
     slot.seq_id = NO_LEASE;
     slot.position = 0;
     slot.fork_head = 0;
+    slot.revision = 0;
+    slot.fork_revision = 0;
+    slot.poisoned = false;
     slot.img_slack_own = 0;
     slot.img_slack_total = 0;
     slot.sampler_chain = 0;
@@ -1576,8 +1704,9 @@ private:
   std::vector<uint16_t> freelist_;  ///< Available slot indices (LIFO — locality heuristic)
 
   /// KV lease manager. Initialized by init_tenancy(), drained by drain().
-  /// seq_id ownership invariant: only the BranchState that received a seq_id
-  /// from allocate() may hold it, and only while its handle+generation is live.
+  /// seq_id ownership invariant: a seq_id leased by allocate() is held by
+  /// exactly one live BranchState at a time, and returns to the pool when that
+  /// state is released. fast_forward() moves the child's seq_id to the parent.
   kv::tenancy::State tenancy_;
 
   /// KV cells consumed. Incremented by decode_each/decode_scatter/add_cells_used,
@@ -1756,6 +1885,8 @@ inline BranchHandle fork(BranchHandle source, BranchStore& s, ForkOpts opts = {}
   dst->seq_id = new_seq_id;
   dst->position = src->position;
   dst->fork_head = src->position;
+  dst->fork_revision = src->revision;
+  dst->poisoned = src->poisoned;
   // Inherit the prefix's embedding-row slack; the child owns none yet.
   dst->img_slack_total = src->img_slack_total;
   dst->img_slack_own = 0;
@@ -1853,6 +1984,7 @@ inline void set_logit_bias(
 
   // Replace existing biases with new set
   state->logit_bias.assign(biases, biases + n_biases);
+  ++state->revision;
 
   LLOYAL_LOG_DEBUG("[branch::set_logit_bias] Set %zu biases on handle=%u",
                    n_biases, handle);
@@ -1876,6 +2008,7 @@ inline void clear_logit_bias(
   }
 
   state->logit_bias.clear();
+  ++state->revision;
 
   LLOYAL_LOG_DEBUG("[branch::clear_logit_bias] Cleared biases on handle=%u", handle);
 }
@@ -1979,6 +2112,7 @@ inline void set_sampler_params(BranchHandle handle, const P& params, BranchStore
   // Create new chain
   state->sampler_chain = s.create_sampler(params, state->n_vocab);
   state->cached_params = new_params;
+  ++state->revision;
 
   LLOYAL_LOG_DEBUG("[branch::set_sampler_params] Rebuilt chain on handle=%u temp=%.3f",
                    handle, new_params.temperature);
@@ -2017,6 +2151,7 @@ inline void set_grammar(
   if (grammar_str && grammar_str[0] != '\0') {
     state->grammar = s.create_grammar(model, grammar_str);
   }
+  ++state->revision;
 
   LLOYAL_LOG_DEBUG("[branch::set_grammar] %s grammar on handle=%u",
                    state->grammar != 0 ? "Set" : "Cleared", handle);
@@ -2058,6 +2193,7 @@ inline void set_grammar_lazy(
     state->grammar = s.create_grammar_lazy(
         model, grammar_str, trigger_patterns, trigger_tokens);
   }
+  ++state->revision;
 
   LLOYAL_LOG_DEBUG("[branch::set_grammar_lazy] %s grammar on handle=%u",
                    state->grammar != 0 ? "Set" : "Cleared", handle);
@@ -2082,7 +2218,10 @@ inline void set_grammar_order(BranchHandle handle, bool sample_first, BranchStor
   if (!state) {
     throw std::runtime_error("set_grammar_order: invalid branch handle");
   }
-  state->grammar_sample_first = sample_first;
+  if (state->grammar_sample_first != sample_first) {
+    state->grammar_sample_first = sample_first;
+    ++state->revision;
+  }
 }
 
 /**
@@ -2125,6 +2264,45 @@ inline void pruneSubtree(BranchHandle h, BranchStore& s) {
 }
 
 /**
+ * @brief Reseed a branch's sampling PRNG, the way forks are made to diverge
+ *
+ * Only a stochastic chain (one ending in dist) has a PRNG; reseeding a greedy
+ * chain would change nothing, so it is left alone. The cached params record
+ * the new seed, so set_sampler_params() compares against the chain as it is.
+ *
+ * @param handle Branch to reseed
+ * @param seed   New seed
+ * @param s      Branch store
+ * @throws std::runtime_error if handle is invalid
+ */
+inline void reseed_sampler(BranchHandle handle, uint32_t seed, BranchStore& s) {
+  BranchState* state = s.get(handle);
+  if (!state) {
+    throw std::runtime_error("reseed_sampler: invalid branch handle");
+  }
+  if (!s.sampler_has_dist(state->sampler_chain)) return;
+  sampler::reseed_chain(s.get_sampler_chain(state->sampler_chain), seed);
+  state->cached_params.seed = seed;
+  ++state->revision;
+}
+
+/**
+ * @brief Fast-forward `parent` to `child`; see BranchStore::fast_forward()
+ */
+inline void fast_forward(BranchHandle parent, BranchHandle child, BranchStore& s) {
+  s.fast_forward(parent, child);
+}
+
+/**
+ * @brief Whether a failed decode left this branch's KV ahead of its books
+ * @return true if poisoned (prune it and replay); false if intact or invalid
+ */
+inline bool is_poisoned(BranchHandle handle, BranchStore& s) {
+  const BranchState* state = s.get(handle);
+  return state && state->poisoned;
+}
+
+/**
  * @brief Force-copy the shared llama.cpp logits buffer into this branch's private snapshot.
  *
  * Copies the logits from the llama_context into the branch's internal buffer
@@ -2152,6 +2330,7 @@ inline void force_snapshot_logits(BranchHandle handle, BranchStore& s) {
   }
 
   state->capture_logits(-1);
+  ++state->revision;
 }
 
 /**
@@ -2187,12 +2366,14 @@ inline void prefill(
   if (const int32_t rc = decode::many(state->ctx, tokens, static_cast<int32_t>(n_tokens),
                                       state->position, state->n_batch, state->seq_id,
                                       &committed); rc != 0) {
+    if (!decode::leaves_branch_intact(rc, committed > 0)) state->poison();
     throw decode::DecodeError(rc, committed > 0, "prefill: llama_decode failed");
   }
 
   state->position += static_cast<llama_pos>(n_tokens);
   s.add_cells_used(static_cast<uint32_t>(n_tokens));
   state->capture_logits(-1);
+  ++state->revision;
 }
 
 /**
@@ -2219,11 +2400,13 @@ inline void step(
   }
 
   if (const int32_t rc = decode::one(state->ctx, token, state->position, state->seq_id, true); rc != 0) {
+    if (!decode::leaves_branch_intact(rc, /*partial*/ false)) state->poison();
     throw decode::DecodeError(rc, /*partial*/ false, "step: llama_decode failed");
   }
   state->position += 1;
   s.add_cells_used(1);
   state->capture_logits(-1);
+  ++state->revision;
 }
 
 /**
@@ -2283,6 +2466,7 @@ inline void set_logits(BranchHandle handle, std::span<const float> data, BranchS
   std::memcpy(state->logits_snapshot.data(), data.data(),
               state->n_vocab * sizeof(float));
   state->has_logits = true;
+  ++state->revision;
 }
 
 /**
@@ -2428,6 +2612,7 @@ inline llama_token sample(BranchHandle handle, BranchStore& s) {
     cur_p = fill();
     token = shape(cur_p, /*mask_with_grammar=*/true);
   }
+  ++state->revision;  // the chain ran: its PRNG may have advanced
 
   if (token == -1) {
     return -1;
@@ -2468,6 +2653,7 @@ inline void accept_token(
 
   BranchState* state = s.get(handle);
   if (!state) return;
+  ++state->revision;
 
   // Accept in grammar (via anti-corruption layer)
   llama_sampler* gram = s.get_grammar_sampler(state->grammar);

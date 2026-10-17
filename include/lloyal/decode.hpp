@@ -120,11 +120,15 @@ inline void batch_add(llama_batch& batch, llama_token id, llama_pos pos,
  *   may have committed chunks before the one that failed, and the branch's
  *   books never move on failure.
  *
- * The rule, true at every throw site: the branch is INTACT iff the failing
- * call restored state (rc is 1 or -1) and nothing before it landed
+ * The rule, for an operation on one branch: the branch is INTACT iff the
+ * failing call restored state (rc is 1 or -1) and nothing before it landed
  * (!partial). Intact with rc 1 is a capacity wait — retry when the KV has
  * room; intact with rc -1 is the caller's input — do not resend the same
  * batch. Anything else ⇒ prune the branch and replay onto a fresh one.
+ *
+ * BranchStore::decode_scatter spans branches: its `partial` says an earlier
+ * chunk landed, for some branch, whose books moved with it. Whether a given
+ * branch is intact is its own `poisoned` flag (branch::is_poisoned()).
  *
  * The binding catches this type in C++ and forwards both fields structurally;
  * the exception itself never crosses N-API.
@@ -137,6 +141,11 @@ inline void batch_add(llama_batch& batch, llama_token id, llama_pos pos,
  * The message also carries `rc=N` (and `partial` when set) for humans reading
  * logs; nothing parses it.
  */
+/// The rule above as a predicate: whether a failed call left its branch intact.
+inline bool leaves_branch_intact(int32_t rc, bool partial) {
+  return (rc == 1 || rc == -1) && !partial;
+}
+
 struct DecodeError : std::runtime_error {
   int32_t rc;
   bool partial;

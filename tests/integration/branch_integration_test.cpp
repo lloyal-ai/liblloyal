@@ -3438,3 +3438,814 @@ TEST_CASE("fork fidelity: state survives promote-then-fork (the README search lo
   store.drain();
   llama_free(ctx);
 }
+
+
+// ============================================================================
+// Fast-forward — a child's state becomes its parent's, the parent keeping its
+// identity (git merge --ff-only). fork + prune + fast_forward give any branch
+// a checkpoint it can keep or discard while the rest of the tree runs on.
+//
+// Every case runs on each model the suite runs on. On a hybrid recurrent model
+// (Qwen3.5) a fork SHARES the parent's recurrent cell until one of the two
+// decodes, so a fork that never decoded and a sibling that never decoded are
+// the cases that reach that sharing; the KV is the witness throughout.
+// ============================================================================
+
+namespace {
+
+/// Greedy and penalty-free: the sampled token is the argmax of what the
+/// modifiers leave, so a branch's next tokens are data a case can compare.
+struct GreedyParams {
+  float temperature = 0.0f;
+  int32_t top_k = 0;
+  float top_p = 1.0f;
+  float min_p = 0.0f;
+  float typical_p = 1.0f;
+  float penalty_repeat = 1.0f;
+  float penalty_freq = 0.0f;
+  float penalty_present = 0.0f;
+  int32_t penalty_last_n = 64;
+  uint32_t seed = 3;
+};
+
+/// A context shaped like the binding's: one unified KV pool, room for a tree.
+struct FastForwardRig {
+  std::shared_ptr<llama_model> model = TestConfig::acquire_test_model();
+  llama_context* ctx = nullptr;
+  BranchStore store{16};
+  const llama_vocab* vocab = nullptr;
+
+  explicit FastForwardRig(uint32_t n_ctx = 2048, uint32_t n_batch = 256) {
+    REQUIRE(model);
+    auto cp = llama_context_default_params();
+    cp.n_ctx = n_ctx;
+    cp.n_batch = n_batch;
+    cp.n_ubatch = n_batch;
+    cp.n_seq_max = 8;
+    cp.kv_unified = true;
+    ctx = llama_init_from_model(model.get(), cp);
+    REQUIRE(ctx);
+    store.init_tenancy(ctx);
+    vocab = llama_model_get_vocab(model.get());
+  }
+  ~FastForwardRig() {
+    store.drain();
+    if (ctx) llama_free(ctx);
+  }
+
+  std::vector<llama_token> tokens(const std::string& text, bool bos) const {
+    return tokenizer::tokenize(vocab, text, bos, false);
+  }
+
+  /// A root holding `prompt`, created with `params` and an optional grammar.
+  template <class P = GreedyParams>
+  BranchHandle root(const std::string& prompt, P params = {}, const char* grammar = nullptr) {
+    BranchHandle h = create(ctx, model.get(), store, 0, params, DEFAULT_N_BATCH, grammar);
+    REQUIRE(h != INVALID_HANDLE);
+    if (!prompt.empty()) {
+      const auto t = tokens(prompt, true);
+      prefill(h, t.data(), t.size(), store);
+    }
+    return h;
+  }
+
+  void extend(BranchHandle h, const std::string& text) {
+    const auto t = tokens(text, false);
+    REQUIRE(!t.empty());
+    prefill(h, t.data(), t.size(), store);
+  }
+
+  llama_seq_id seq(BranchHandle h) { return store.get(h)->seq_id; }
+  uint32_t cells() const { return store.kv_pressure().cells_used; }
+};
+
+/// What a branch says next, as data: greedy tokens, each accepted and decoded.
+std::vector<llama_token> greedy_run(BranchHandle h, BranchStore& s, int n) {
+  std::vector<llama_token> out;
+  for (int i = 0; i < n; ++i) {
+    const llama_token t = sample(h, s);
+    REQUIRE(t >= 0);
+    accept_token(h, t, s);
+    step(h, t, s);
+    out.push_back(t);
+  }
+  return out;
+}
+
+std::vector<float> logits_of(BranchHandle h, BranchStore& s) {
+  const float* l = get_logits(h, s);
+  REQUIRE(l != nullptr);
+  return {l, l + get_n_vocab(h, s)};
+}
+
+/// Everything a refused fast-forward must leave exactly as it found it.
+struct Books {
+  llama_pos parent_position, child_position;
+  llama_pos parent_kv, child_kv;
+  llama_seq_id parent_seq, child_seq;
+  uint32_t cells;
+  std::vector<float> parent_logits;
+};
+
+Books books(FastForwardRig& r, BranchHandle parent, BranchHandle child) {
+  return {get_position(parent, r.store), get_position(child, r.store),
+          kv::pos_max(r.ctx, r.seq(parent)), kv::pos_max(r.ctx, r.seq(child)),
+          r.seq(parent), r.seq(child), r.cells(), logits_of(parent, r.store)};
+}
+
+void check_untouched(FastForwardRig& r, BranchHandle parent, BranchHandle child, const Books& before) {
+  REQUIRE(r.store.get(parent) != nullptr);
+  REQUIRE(r.store.get(child) != nullptr);
+  const Books after = books(r, parent, child);
+  CHECK(after.parent_position == before.parent_position);
+  CHECK(after.child_position == before.child_position);
+  CHECK(after.parent_kv == before.parent_kv);
+  CHECK(after.child_kv == before.child_kv);
+  CHECK(after.parent_seq == before.parent_seq);
+  CHECK(after.child_seq == before.child_seq);
+  CHECK(after.cells == before.cells);
+  CHECK(after.parent_logits == before.parent_logits);
+}
+
+constexpr const char* PROMPT = "The capital of France is";
+constexpr const char* SUFFIX = " Paris. The capital of Germany is";
+
+}  // namespace
+
+TEST_CASE("fast forward: the parent continues exactly as its child would have") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  FastForwardRig r;
+
+  BranchHandle a = r.root(PROMPT);
+  BranchHandle p = fork(a, r.store);
+  BranchHandle control = fork(a, r.store);  // the same work, never fast-forwarded
+  REQUIRE(p != INVALID_HANDLE);
+  REQUIRE(control != INVALID_HANDLE);
+  r.extend(p, SUFFIX);
+  r.extend(control, SUFFIX);
+
+  const auto p_logits = logits_of(p, r.store);
+  const llama_seq_id p_seq = r.seq(p);
+  const llama_seq_id a_seq = r.seq(a);
+  const llama_pos p_position = get_position(p, r.store);
+  const llama_pos a_fork_head = get_fork_head(a, r.store);
+  const uint32_t cells = r.cells();
+
+  fast_forward(a, p, r.store);
+
+  // The child is gone; the parent is the child, under its own handle.
+  CHECK(r.store.get(p) == nullptr);
+  REQUIRE(r.store.get(a) != nullptr);
+  CHECK(r.seq(a) == p_seq);
+  CHECK(get_position(a, r.store) == p_position);
+  CHECK(get_fork_head(a, r.store) == a_fork_head);
+  CHECK(logits_of(a, r.store) == p_logits);
+  CHECK(r.store.children(a) == std::vector<BranchHandle>{control});
+  CHECK(r.store.parent(control) == a);
+
+  // The parent's former sequence is clean, and nothing was charged or refunded.
+  CHECK(kv::pos_max(r.ctx, a_seq) == -1);
+  CHECK(r.cells() == cells);
+
+  // Lockstep with the control: one dispatch per token, the same KV content.
+  float max_diff = 0.0f;
+  for (int i = 0; i < 8; ++i) {
+    const llama_token ta = sample(a, r.store);
+    const llama_token tc = sample(control, r.store);
+    REQUIRE(ta >= 0);
+    CHECK(ta == tc);
+    accept_token(a, ta, r.store);
+    accept_token(control, tc, r.store);
+    DecodeEachItem items[] = {{a, ta}, {control, tc}};
+    r.store.decode_each(items);
+    const float* la = get_logits(a, r.store);
+    const float* lc = get_logits(control, r.store);
+    for (int k = 0; k < get_n_vocab(a, r.store); ++k) max_diff = std::max(max_diff, std::abs(la[k] - lc[k]));
+  }
+  MESSAGE("max |logit(a) - logit(control)| over 8 lockstep steps: " << max_diff);
+
+  pruneSubtree(a, r.store);
+  CHECK(r.cells() == 0);
+}
+
+TEST_CASE("fast forward: a sibling forked before the child is unaffected") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  FastForwardRig r;
+
+  BranchHandle a = r.root(PROMPT);
+  // Never decoded: on a recurrent model it shares the parent's cell.
+  BranchHandle sibling = fork(a, r.store);
+  REQUIRE(sibling != INVALID_HANDLE);
+
+  // What the sibling says next, recorded on a probe forked from it.
+  BranchHandle probe = fork(sibling, r.store);
+  REQUIRE(probe != INVALID_HANDLE);
+  const auto expected = greedy_run(probe, r.store, 8);
+  prune(probe, r.store);
+
+  BranchHandle p = fork(a, r.store);
+  REQUIRE(p != INVALID_HANDLE);
+  r.extend(p, SUFFIX);
+  const llama_pos sibling_head = get_fork_head(sibling, r.store);
+  const llama_pos sibling_kv = kv::pos_max(r.ctx, r.seq(sibling));
+
+  fast_forward(a, p, r.store);
+
+  CHECK(r.store.parent(sibling) == a);
+  CHECK(get_fork_head(sibling, r.store) == sibling_head);
+  CHECK(kv::pos_max(r.ctx, r.seq(sibling)) == sibling_kv);
+  CHECK(greedy_run(sibling, r.store, 8) == expected);
+  // And the parent goes on from the child's text, not the sibling's.
+  CHECK_NOTHROW(greedy_run(a, r.store, 2));
+
+  pruneSubtree(a, r.store);
+  CHECK(r.cells() == 0);
+}
+
+TEST_CASE("fast forward: a fork that never decoded leaves the parent as it was") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  FastForwardRig r;
+
+  BranchHandle a = r.root(PROMPT);
+  BranchHandle reference = fork(a, r.store);
+  REQUIRE(reference != INVALID_HANDLE);
+  const auto expected = greedy_run(reference, r.store, 8);
+  prune(reference, r.store);
+
+  const llama_pos position = get_position(a, r.store);
+  const uint32_t cells = r.cells();
+  const auto logits = logits_of(a, r.store);
+
+  // Shares the parent's recurrent cell outright: the parent's own tag is the one removed.
+  BranchHandle p = fork(a, r.store);
+  REQUIRE(p != INVALID_HANDLE);
+  fast_forward(a, p, r.store);
+
+  CHECK(get_position(a, r.store) == position);
+  CHECK(r.cells() == cells);
+  CHECK(logits_of(a, r.store) == logits);
+  CHECK(greedy_run(a, r.store, 8) == expected);
+
+  prune(a, r.store);
+  CHECK(r.cells() == 0);
+}
+
+TEST_CASE("fast forward: the child's penalty window becomes the parent's") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  FastForwardRig r(512, 64);
+  PenaltyOnlyParams params;
+
+  BranchHandle a = r.root("", params);
+  const int32_t n_vocab = get_n_vocab(a, r.store);
+  // Token 0 wins on raw logits; token 1 once 0 is penalised (10 -> 5 < 6).
+  std::vector<float> logits(static_cast<size_t>(n_vocab), -60.0f);
+  logits[0] = 10.0f;
+  logits[1] = 6.0f;
+  set_logits(a, std::span<const float>(logits), r.store);
+
+  BranchHandle untouched = fork(a, r.store);  // the parent's window, as it was
+  BranchHandle p = fork(a, r.store);
+  REQUIRE(untouched != INVALID_HANDLE);
+  REQUIRE(p != INVALID_HANDLE);
+  for (int i = 0; i < 3; ++i) accept_token(p, 0, r.store);
+  REQUIRE_MESSAGE(sample(untouched, r.store) == 0, "control: no window, the argmax wins");
+  REQUIRE_MESSAGE(sample(p, r.store) == 1, "precondition: the child's window penalises 0");
+
+  fast_forward(a, p, r.store);
+  set_logits(a, std::span<const float>(logits), r.store);
+  CHECK_MESSAGE(sample(a, r.store) == 1, "the parent samples under the child's window");
+
+  pruneSubtree(a, r.store);
+}
+
+TEST_CASE("fast forward: the child's grammar position becomes the parent's") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  FastForwardRig r(512, 64);
+
+  BranchHandle a = r.root("", TestParams{}, "root ::= \"hello world\"");
+  const int32_t n_vocab = get_n_vocab(a, r.store);
+  const auto uniform = flat_logits(n_vocab, n_vocab);
+  set_logits(a, std::span<const float>(uniform), r.store);
+  const auto at_start = legal_set(a, r.store);
+  REQUIRE(!at_start.empty());
+
+  BranchHandle p = fork(a, r.store);
+  REQUIRE(p != INVALID_HANDLE);
+  accept_token(p, at_start.front(), r.store);
+  const auto advanced = legal_set(p, r.store);
+  REQUIRE_MESSAGE(advanced != at_start, "the parser must have moved for this to discriminate");
+
+  fast_forward(a, p, r.store);
+  CHECK(legal_set(a, r.store) == advanced);
+
+  prune(a, r.store);
+}
+
+TEST_CASE("fast forward: the child's PRNG position, metrics and handles become the parent's") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  FastForwardRig r(512, 64);
+  TestParams params;   // stochastic: the chain ends in dist
+  params.top_k = 0;
+  params.top_p = 1.0f;
+  params.min_p = 0.0f;
+
+  BranchHandle a = r.root(PROMPT, params);
+  const int32_t n_vocab = get_n_vocab(a, r.store);
+  const auto flat = flat_logits(n_vocab, 64);
+
+  BranchState* as = r.store.get(a);
+  const SamplerChainHandle a_chain = as->sampler_chain;
+  const MetricsHandle a_metrics = as->metrics;
+
+  // Two forks taken together stand at one PRNG position.
+  BranchHandle p = fork(a, r.store);
+  BranchHandle twin = fork(a, r.store);
+  REQUIRE(p != INVALID_HANDLE);
+  REQUIRE(twin != INVALID_HANDLE);
+
+  // The child accepts from real logits, so its metrics move.
+  const llama_token t = sample(p, r.store);
+  REQUIRE(t >= 0);
+  accept_token(p, t, r.store);
+  step(p, t, r.store);
+  // Keep the twin in step: one draw, one accept.
+  const llama_token tt = sample(twin, r.store);
+  REQUIRE(tt == t);
+  accept_token(twin, tt, r.store);
+
+  const float p_ppl = get_perplexity(p, r.store);
+  REQUIRE(std::isfinite(p_ppl));
+  const SamplerChainHandle p_chain = r.store.get(p)->sampler_chain;
+  const MetricsHandle p_metrics = r.store.get(p)->metrics;
+
+  fast_forward(a, p, r.store);
+
+  as = r.store.get(a);
+  CHECK(as->sampler_chain == p_chain);
+  CHECK(as->metrics == p_metrics);
+  CHECK(r.store.get_sampler_chain(a_chain) == nullptr);
+  CHECK(get_perplexity(a, r.store) == p_ppl);
+  (void)a_metrics;
+
+  for (int i = 0; i < 6; ++i) {
+    set_logits(a, std::span<const float>(flat), r.store);
+    set_logits(twin, std::span<const float>(flat), r.store);
+    CHECK_MESSAGE(sample(a, r.store) == sample(twin, r.store),
+                  "draw " << i << ": the parent draws from the child's PRNG position");
+  }
+
+  pruneSubtree(a, r.store);
+}
+
+TEST_CASE("fast forward: configuration set on the child comes with it; the parent keeps its steer") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  FastForwardRig r(512, 64);
+
+  BranchHandle a = r.root("");
+  const int32_t n_vocab = get_n_vocab(a, r.store);
+  REQUIRE(n_vocab > 20);
+  // 10 > 11 > 12 > 13 on raw logits.
+  std::vector<float> logits(static_cast<size_t>(n_vocab), -60.0f);
+  logits[10] = 10.0f;
+  logits[11] = 9.0f;
+  logits[12] = 8.0f;
+  logits[13] = 7.0f;
+  const auto mask = [](llama_token banned) {
+    return [banned](llama_token_data_array& cur) {
+      for (size_t i = 0; i < cur.size; ++i)
+        if (cur.data[i].id == banned) cur.data[i].logit = -std::numeric_limits<float>::infinity();
+    };
+  };
+  set_steer(a, mask(10), r.store);  // the parent's own
+
+  BranchHandle p = fork(a, r.store);  // steer is not cloned
+  REQUIRE(p != INVALID_HANDLE);
+  llama_logit_bias ban{11, -std::numeric_limits<float>::infinity()};
+  set_logit_bias(p, &ban, 1, r.store);  // the child's configuration
+  set_steer(p, mask(12), r.store);      // the child's own, which dies with it
+  TestParams stochastic;
+  stochastic.seed = 77;
+  set_sampler_params(p, stochastic, r.store);
+  set_sampler_params(p, GreedyParams{}, r.store);  // back to greedy, as a rebuilt chain
+
+  fast_forward(a, p, r.store);
+  set_logits(a, std::span<const float>(logits), r.store);
+  // 10: the parent's steer. 11: the child's bias, adopted. 12: the child's steer, gone.
+  CHECK(sample(a, r.store) == 12);
+
+  BranchHandle q = fork(a, r.store);
+  REQUIRE(q != INVALID_HANDLE);
+  set_grammar(q, r.model.get(), "root ::= \"hello world\"", r.store);
+  fast_forward(a, q, r.store);
+  CHECK(r.store.get(a)->grammar != 0);
+  set_logits(a, std::span<const float>(flat_logits(n_vocab, n_vocab)), r.store);
+  CHECK(legal_set(a, r.store).size() < static_cast<size_t>(n_vocab));
+
+  prune(a, r.store);
+}
+
+TEST_CASE("fast forward: the search loop keeps its history and leaves other branches alive") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  FastForwardRig r(512, 64);
+  PenaltyOnlyParams params;
+
+  BranchHandle root = r.root("", params);
+  const int32_t n_vocab = get_n_vocab(root, r.store);
+  std::vector<float> logits(static_cast<size_t>(n_vocab), -60.0f);
+  logits[0] = 10.0f;
+  logits[1] = 6.0f;
+  set_logits(root, std::span<const float>(logits), r.store);
+
+  const auto prompt = r.tokens("Hello", true);
+  BranchHandle other = fork(root, r.store);  // unrelated work, still running
+  BranchHandle leaf = fork(root, r.store);
+  REQUIRE(other != INVALID_HANDLE);
+  REQUIRE(leaf != INVALID_HANDLE);
+  for (int i = 0; i < 3; ++i) accept_token(leaf, 0, r.store);
+
+  fast_forward(root, leaf, r.store);
+
+  set_logits(root, std::span<const float>(logits), r.store);
+  CHECK_MESSAGE(sample(root, r.store) == 1, "the root carries the leaf's window");
+  BranchHandle next = fork(root, r.store);
+  REQUIRE(next != INVALID_HANDLE);
+  set_logits(next, std::span<const float>(logits), r.store);
+  CHECK_MESSAGE(sample(next, r.store) == 1, "a fork from the root inherits it");
+
+  REQUIRE(r.store.get(other) != nullptr);
+  CHECK_NOTHROW(prefill(other, prompt.data(), prompt.size(), r.store));
+
+  pruneSubtree(root, r.store);
+}
+
+TEST_CASE("fast forward: refused, with nothing changed, unless the child is the parent's own and the parent is as it was") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  FastForwardRig r;
+
+  BranchHandle a = r.root(PROMPT);
+  BranchHandle p = fork(a, r.store);
+  BranchHandle sibling = fork(a, r.store);
+  REQUIRE(p != INVALID_HANDLE);
+  REQUIRE(sibling != INVALID_HANDLE);
+  r.extend(p, SUFFIX);
+  BranchHandle unrelated = r.root(PROMPT);
+
+  const auto refused = [&](BranchHandle parent, BranchHandle child, const char* why) {
+    INFO("refusal: " << why);
+    const Books before = books(r, parent, child);
+    CHECK_THROWS_WITH(fast_forward(parent, child, r.store), doctest::Contains(why));
+    check_untouched(r, parent, child, before);
+  };
+
+  refused(a, unrelated, "was not forked from this parent");
+  refused(sibling, p, "was not forked from this parent");
+  refused(p, a, "was not forked from this parent");
+  refused(a, a, "was not forked from this parent");
+
+  BranchHandle grandchild = fork(p, r.store);
+  REQUIRE(grandchild != INVALID_HANDLE);
+  refused(a, grandchild, "was not forked from this parent");
+  refused(a, p, "has children of its own");
+  prune(grandchild, r.store);
+
+  // The parent changed after the fork: decoded, or not decoded but no longer the same.
+  BranchHandle decoded = fork(a, r.store);
+  REQUIRE(decoded != INVALID_HANDLE);
+  const llama_token t = sample(a, r.store);
+  accept_token(a, t, r.store);
+  step(a, t, r.store);
+  refused(a, decoded, "the parent has decoded since the fork");
+  prune(decoded, r.store);
+
+  const auto changed = [&](const char* how, auto&& change) {
+    BranchHandle child = fork(a, r.store);
+    REQUIRE(child != INVALID_HANDLE);
+    change();
+    INFO("change: " << how);
+    refused(a, child, "the parent has changed since the fork");
+    prune(child, r.store);
+  };
+  changed("accept", [&] { accept_token(a, sample(a, r.store), r.store); });
+  changed("set_logits", [&] { set_logits(a, std::span<const float>(logits_of(sibling, r.store)), r.store); });
+  changed("set_grammar", [&] { set_grammar(a, r.model.get(), "root ::= \"x\"", r.store); });
+  changed("set_sampler_params", [&] { TestParams t2; t2.seed = 1234; set_sampler_params(a, t2, r.store); });
+  changed("merge_logits", [&] {
+    const BranchHandle experts[] = {sibling};
+    r.store.merge_logits(a, experts, 0.5f);
+  });
+
+  // A merge refused partway changes nothing, so a child forked before it still fast-forwards.
+  {
+    BranchHandle before_merge = fork(a, r.store);
+    BranchHandle stale = fork(a, r.store);
+    REQUIRE(before_merge != INVALID_HANDLE);
+    REQUIRE(stale != INVALID_HANDLE);
+    prune(stale, r.store);
+    const std::vector<float> logits = logits_of(a, r.store);
+    const BranchHandle experts[] = {sibling, stale};
+    CHECK_THROWS_WITH(r.store.merge_logits(a, experts, 0.5f), doctest::Contains("invalid expert handle at index 1"));
+    CHECK(logits_of(a, r.store) == logits);
+    CHECK_NOTHROW(fast_forward(a, before_merge, r.store));
+  }
+
+  // A merge of no experts changes nothing, so it does not refuse either.
+  {
+    BranchHandle before_empty = fork(a, r.store);
+    REQUIRE(before_empty != INVALID_HANDLE);
+    r.store.merge_logits(a, std::span<const BranchHandle>{}, 0.5f);
+    CHECK_NOTHROW(fast_forward(a, before_empty, r.store));
+  }
+
+  // A memoized no-op changes nothing, so it does not refuse.
+  BranchHandle same = fork(a, r.store);
+  REQUIRE(same != INVALID_HANDLE);
+  TestParams t2;
+  t2.seed = 1234;
+  set_sampler_params(a, t2, r.store);
+  CHECK_NOTHROW(fast_forward(a, same, r.store));
+
+  // A stale handle is refused by name, on either side.
+  BranchHandle gone = fork(a, r.store);
+  REQUIRE(gone != INVALID_HANDLE);
+  prune(gone, r.store);
+  CHECK_THROWS_WITH(fast_forward(a, gone, r.store), doctest::Contains("invalid child handle"));
+  CHECK_THROWS_WITH(fast_forward(gone, a, r.store), doctest::Contains("invalid parent handle"));
+
+  pruneSubtree(a, r.store);
+  pruneSubtree(unrelated, r.store);
+  CHECK(r.cells() == 0);
+}
+
+TEST_CASE("fast forward: a parent reseeded after the fork has changed since it") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  FastForwardRig r(512, 64);
+  TestParams stochastic;  // a chain with a PRNG to reseed
+
+  BranchHandle a = r.root(PROMPT, stochastic);
+  BranchHandle p = fork(a, r.store);
+  REQUIRE(p != INVALID_HANDLE);
+  reseed_sampler(a, 9973, r.store);
+  const Books before = books(r, a, p);
+  CHECK_THROWS_WITH(fast_forward(a, p, r.store), doctest::Contains("the parent has changed since the fork"));
+  check_untouched(r, a, p, before);
+
+  // A greedy chain has no PRNG: reseeding it changes nothing, so nothing refuses.
+  BranchHandle g = r.root(PROMPT);
+  BranchHandle q = fork(g, r.store);
+  REQUIRE(q != INVALID_HANDLE);
+  reseed_sampler(g, 9973, r.store);
+  CHECK_NOTHROW(fast_forward(g, q, r.store));
+
+  pruneSubtree(a, r.store);
+  pruneSubtree(g, r.store);
+}
+
+// ============================================================================
+// A reseed is what set_sampler_params compares against. The memo compares
+// against cached_params, so a reseed that leaves the cached seed behind makes
+// the memo skip a real change and rebuild for none.
+// ============================================================================
+
+namespace {
+
+/// A wide distribution, so two different seeds draw different streams.
+struct WideParams {
+  float temperature = 1.5f;
+  int32_t top_k = 0;
+  float top_p = 1.0f;
+  float min_p = 0.0f;
+  float typical_p = 1.0f;
+  float penalty_repeat = 1.3f;
+  float penalty_freq = 0.0f;
+  float penalty_present = 0.0f;
+  int32_t penalty_last_n = 64;
+  uint32_t seed = 42;
+};
+
+WideParams seeded(uint32_t seed) {
+  WideParams p;
+  p.seed = seed;
+  return p;
+}
+
+/// The next `n` draws from a branch's sampler over the same logits: the PRNG
+/// advances, nothing is accepted or decoded.
+std::vector<llama_token> draws(BranchHandle h, BranchStore& s, int n) {
+  std::vector<llama_token> out;
+  for (int i = 0; i < n; ++i) out.push_back(sample(h, s));
+  return out;
+}
+
+SamplerChainHandle chain_of(FastForwardRig& r, BranchHandle h) { return r.store.get(h)->sampler_chain; }
+
+}  // namespace
+
+TEST_CASE("branch integration: set_sampler_params after a reseed applies the seed it asks for") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  FastForwardRig r(512, 64);
+
+  BranchHandle a = r.root(PROMPT, seeded(42));
+  BranchHandle fresh = fork(a, r.store);  // the chain as seed 42 made it, over the same logits
+  REQUIRE(fresh != INVALID_HANDLE);
+
+  reseed_sampler(a, 9973, r.store);
+  const SamplerChainHandle reseeded = chain_of(r, a);
+  set_sampler_params(a, seeded(42), r.store);
+
+  CHECK(chain_of(r, a) != reseeded);
+  CHECK(draws(a, r.store, 8) == draws(fresh, r.store, 8));
+
+  pruneSubtree(a, r.store);
+}
+
+TEST_CASE("branch integration: set_sampler_params after a reseed keeps a chain already on that seed") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  FastForwardRig r(512, 64);
+
+  BranchHandle a = r.root(PROMPT, seeded(42));
+  for (int i = 0; i < 4; ++i) {  // tokens in the penalty window a rebuild would forget
+    const llama_token t = sample(a, r.store);
+    accept_token(a, t, r.store);
+    step(a, t, r.store);
+  }
+  reseed_sampler(a, 9973, r.store);
+  BranchHandle twin = fork(a, r.store);  // the same window and the same PRNG
+  REQUIRE(twin != INVALID_HANDLE);
+
+  const SamplerChainHandle before = chain_of(r, a);
+  set_sampler_params(a, seeded(9973), r.store);
+
+  CHECK(chain_of(r, a) == before);
+  CHECK(draws(a, r.store, 8) == draws(twin, r.store, 8));
+
+  pruneSubtree(a, r.store);
+}
+
+TEST_CASE("fast forward: a reseeded seed travels with fork and fast-forward") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  FastForwardRig r(512, 64);
+
+  BranchHandle a = r.root(PROMPT, seeded(42));
+  reseed_sampler(a, 9973, r.store);
+  BranchHandle c = fork(a, r.store);
+  REQUIRE(c != INVALID_HANDLE);
+  CHECK(r.store.get(c)->cached_params.seed == 9973);
+
+  BranchHandle p = fork(a, r.store);
+  REQUIRE(p != INVALID_HANDLE);
+  reseed_sampler(p, 7, r.store);
+  fast_forward(a, p, r.store);
+  CHECK(r.store.get(a)->cached_params.seed == 7);
+
+  const SamplerChainHandle adopted = chain_of(r, a);
+  set_sampler_params(a, seeded(7), r.store);
+  CHECK(chain_of(r, a) == adopted);
+
+  pruneSubtree(a, r.store);
+}
+
+TEST_CASE("fast forward: a poisoned child is refused and the parent goes on untouched") {
+  // The decode-failure suite's rig: one 256-cell pool, so a later chunk finds
+  // no slot on demand while earlier chunks stand.
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  FastForwardRig r(256, 64);
+
+  BranchHandle a = create(r.ctx, r.model.get(), r.store, 0, GreedyParams{}, 64);
+  REQUIRE(a != INVALID_HANDLE);
+  const auto prompt = r.tokens("Hello", true);
+  prefill(a, prompt.data(), prompt.size(), r.store);
+  const int32_t n_vocab = get_n_vocab(a, r.store);
+
+  BranchHandle p = fork(a, r.store);
+  REQUIRE(p != INVALID_HANDLE);
+  std::vector<llama_token> flood(300);
+  for (size_t j = 0; j < flood.size(); ++j) flood[j] = static_cast<llama_token>((1000 + j) % n_vocab);
+  bool partial = false;
+  try {
+    prefill(p, flood.data(), flood.size(), r.store);
+  } catch (const decode::DecodeError& e) {
+    partial = e.partial;
+  }
+  REQUIRE_MESSAGE(partial, "the prefill must have died with earlier chunks landed");
+  CHECK(is_poisoned(p, r.store));
+  CHECK_FALSE(is_poisoned(a, r.store));
+
+  // A fork of a poisoned branch shares the damage, and says so.
+  BranchHandle inherits = fork(p, r.store);
+  REQUIRE(inherits != INVALID_HANDLE);
+  CHECK(is_poisoned(inherits, r.store));
+  prune(inherits, r.store);
+
+  const Books before = books(r, a, p);
+  CHECK_THROWS_WITH(fast_forward(a, p, r.store), doctest::Contains("poisoned"));
+  check_untouched(r, a, p, before);
+
+  // Pruning reclaims the orphaned chunks, and the parent prefills where it could not.
+  prune(p, r.store);
+  CHECK(kv::pos_max(r.ctx, before.child_seq) == -1);
+  const auto more = r.tokens(" world", false);
+  CHECK_NOTHROW(prefill(a, more.data(), more.size(), r.store));
+  CHECK_FALSE(is_poisoned(a, r.store));
+
+  prune(a, r.store);
+  CHECK(r.cells() == 0);
+}
+
+TEST_CASE("fast forward: a refusal that left nothing behind does not poison") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  FastForwardRig r(256, 64);
+
+  BranchHandle a = create(r.ctx, r.model.get(), r.store, 0, GreedyParams{}, 64);
+  REQUIRE(a != INVALID_HANDLE);
+  const auto prompt = r.tokens("Hello", true);
+  prefill(a, prompt.data(), prompt.size(), r.store);
+  const int32_t n_vocab = get_n_vocab(a, r.store);
+
+  // Fill the pool to within a few cells of full on an unrelated root.
+  BranchHandle filler = create(r.ctx, r.model.get(), r.store, 0, GreedyParams{}, 64);
+  REQUIRE(filler != INVALID_HANDLE);
+  const int32_t room = 256 - static_cast<int32_t>(r.cells()) - 4;
+  for (int32_t done = 0; done < room;) {
+    const int32_t n = std::min<int32_t>(64, room - done);
+    std::vector<llama_token> chunk(static_cast<size_t>(n));
+    for (int32_t j = 0; j < n; ++j) chunk[static_cast<size_t>(j)] = static_cast<llama_token>((2000 + done + j) % n_vocab);
+    prefill(filler, chunk.data(), chunk.size(), r.store);
+    done += n;
+  }
+
+  // One chunk that cannot find a slot: the call restored itself, nothing landed.
+  BranchHandle p = fork(a, r.store);
+  REQUIRE(p != INVALID_HANDLE);
+  std::vector<llama_token> ten(10, static_cast<llama_token>(5000 % n_vocab));
+  int32_t rc = 0;
+  bool partial = true;
+  try {
+    prefill(p, ten.data(), ten.size(), r.store);
+  } catch (const decode::DecodeError& e) {
+    rc = e.rc;
+    partial = e.partial;
+  }
+  REQUIRE(rc == 1);
+  REQUIRE_FALSE(partial);
+  CHECK_FALSE(is_poisoned(p, r.store));
+  CHECK_NOTHROW(fast_forward(a, p, r.store));
+
+  pruneSubtree(a, r.store);
+  prune(filler, r.store);
+}
+
+TEST_CASE("fast forward: the child's slot is reused clean and its handle goes stale") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  FastForwardRig r(512, 64);
+
+  BranchHandle a = r.root(PROMPT);
+  BranchHandle reference = fork(a, r.store);
+  REQUIRE(reference != INVALID_HANDLE);
+  const llama_token greedy = sample(reference, r.store);
+  REQUIRE(greedy >= 0);
+  prune(reference, r.store);
+
+  BranchHandle p = fork(a, r.store);
+  REQUIRE(p != INVALID_HANDLE);
+  llama_logit_bias ban{greedy, -std::numeric_limits<float>::infinity()};
+  set_logit_bias(p, &ban, 1, r.store);
+  set_grammar(p, r.model.get(), "root ::= \"hello world\"", r.store);
+  const GrammarHandle p_grammar = r.store.get(p)->grammar;
+  const GrammarHandle a_grammar_before = r.store.get(a)->grammar;
+  CHECK(a_grammar_before == 0);
+
+  fast_forward(a, p, r.store);
+  CHECK(r.store.get(p) == nullptr);
+  CHECK(sample(p, r.store) < 0);
+  CHECK(r.store.get(a)->grammar == p_grammar);
+
+  // The freed slot comes back under a new generation and carries nothing over.
+  BranchHandle fresh = r.root(PROMPT);
+  CHECK(handle_index(fresh) == handle_index(p));
+  CHECK(handle_generation(fresh) != handle_generation(p));
+  CHECK(r.store.get(fresh)->grammar == 0);
+  CHECK(r.store.get(fresh)->logit_bias.empty());
+  CHECK(sample(fresh, r.store) == greedy);
+
+  const llama_seq_id a_seq = r.seq(a);
+  const llama_seq_id fresh_seq = r.seq(fresh);
+  r.store.drain();
+  CHECK(kv::pos_max(r.ctx, a_seq) == -1);
+  CHECK(kv::pos_max(r.ctx, fresh_seq) == -1);
+}

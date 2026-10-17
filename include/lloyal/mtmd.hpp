@@ -8,13 +8,20 @@
 #include <mtmd.h>
 #include <mtmd-helper.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
+#include <memory>
 #include <numeric>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 /**
@@ -66,11 +73,36 @@ inline void mtmd_input_text_has_four_members() {
 }
 }  // namespace shape_guard
 
+/** Text placed on a video's timeline, such as a transcript segment. Borrowed. */
+struct VideoNote {
+  int64_t at_ms = 0;
+  std::string_view text;
+};
+
+/**
+ * The sampled frames of one video, in order, each an encoded image with the
+ * time it was sampled at. Borrowed, and consumed during construction.
+ *
+ * Laid out as llama.cpp's video helper lays out a decoded clip: "Video:", every
+ * frame mergeable, and a "[XmY.YYs]" timestamp after the frame that crosses
+ * each `timestamp_interval_ms` (0 disables them). A note joins the first
+ * timestamp at or after its time; notes past the last one close the video.
+ * Notes only join timestamp text the layout already has, so they add no text
+ * between frames and leave temporal fusion unchanged.
+ */
+struct VideoFrames {
+  std::span<const std::span<const uint8_t>> frames;
+  std::span<const int64_t> timestamps_ms;
+  int64_t timestamp_interval_ms = 5000;
+  std::span<const VideoNote> notes;
+};
+
 /** A borrowed admitted representation. Bytes are consumed during construction. */
 struct MediaInput {
-  enum class Kind { Image, Audio };
+  enum class Kind { Image, Audio, Video };
   Kind kind;
   std::span<const uint8_t> bytes;
+  VideoFrames video{};
 };
 
 /** Per-source audio budgets, across all inputs. Samples are mono at projector rate. */
@@ -169,6 +201,73 @@ inline size_t wav_sample_bound(std::span<const uint8_t> bytes, uint32_t target_r
   return static_cast<size_t>(samples);
 }
 
+// The helper's timestamp text, character for character ("[%dm%.2fs]").
+inline std::string timestamp_text(int64_t ms) {
+  const float elapsed_s = static_cast<float>(ms) / 1000.0f;
+  // Minutes as 64-bit: any int64 millisecond count fits, where the helper's int would overflow.
+  const int64_t minutes = static_cast<int64_t>(elapsed_s / 60);
+  const float seconds = elapsed_s - static_cast<float>(minutes) * 60.0f;
+  char buf[48];
+  std::snprintf(buf, sizeof buf, "[%lldm%.2fs]", static_cast<long long>(minutes), seconds);
+  return buf;
+}
+
+/** One video expanded into the parts mtmd tokenizes: decoded frames and text. */
+struct VideoLayout {
+  struct Part {
+    ::mtmd::bitmap_ptr frame;
+    std::string text;
+  };
+  std::vector<Part> parts;
+
+  static int next(size_t i, void* self, mtmd_bitmap** out_bitmap, char** out_text) {
+    auto& parts = static_cast<VideoLayout*>(self)->parts;
+    if (i >= parts.size()) return -1;
+    auto& part = parts[i];
+    if (part.frame) {
+      *out_bitmap = part.frame.release();
+      return 0;
+    }
+    // mtmd frees the text with free(); malloc is the portable strdup (MSVC deprecates the POSIX name).
+    const size_t size = part.text.size() + 1;
+    *out_text = static_cast<char*>(std::malloc(size));
+    if (!*out_text) return -2;
+    std::memcpy(*out_text, part.text.c_str(), size);
+    return 0;
+  }
+};
+
+inline VideoLayout video_layout(std::vector<::mtmd::bitmap_ptr> frames, const VideoFrames& video) {
+  std::vector<VideoNote> notes(video.notes.begin(), video.notes.end());
+  std::stable_sort(notes.begin(), notes.end(),
+                   [](const VideoNote& a, const VideoNote& b) { return a.at_ms < b.at_ms; });
+  auto note = notes.begin();
+  const auto notes_until = [&](auto stop) {
+    std::string text;
+    for (; note != notes.end() && stop(*note); ++note) text += note->text;
+    return text;
+  };
+
+  VideoLayout layout;
+  layout.parts.push_back({nullptr, "Video:"});
+  // The next threshold, or none once it would lie past any time an int64 can hold.
+  std::optional<int64_t> next_timestamp_ms = video.timestamp_interval_ms > 0 ? std::optional<int64_t>{0} : std::nullopt;
+  for (size_t i = 0; i < frames.size(); ++i) {
+    layout.parts.push_back({std::move(frames[i]), {}});
+    const int64_t t = video.timestamps_ms[i];
+    if (next_timestamp_ms && t >= *next_timestamp_ms) {
+      layout.parts.push_back({nullptr, timestamp_text(t) +
+                                       notes_until([t](const VideoNote& n) { return n.at_ms <= t; })});
+      const bool exhausted = *next_timestamp_ms > std::numeric_limits<int64_t>::max() - video.timestamp_interval_ms;
+      next_timestamp_ms = exhausted ? std::nullopt : std::optional<int64_t>{*next_timestamp_ms + video.timestamp_interval_ms};
+    }
+  }
+  if (auto closing = notes_until([](const VideoNote&) { return true; }); !closing.empty()) {
+    layout.parts.push_back({nullptr, std::move(closing)});
+  }
+  return layout;
+}
+
 inline std::vector<MediaInput> image_inputs(const std::vector<std::vector<uint8_t>>& images) {
   std::vector<MediaInput> inputs;
   inputs.reserve(images.size());
@@ -231,31 +330,34 @@ public:
     validate_markers(prompt, inputs.size());
     const auto sample_bounds = validate_inputs(inputs, limits);
 
+    // A video is one lazy bitmap at its marker, expanded by mtmd_tokenize into
+    // its frames and timestamps: the mechanism llama.cpp's video helper uses.
+    std::vector<std::unique_ptr<mtmd_detail::VideoLayout>> videos;
     std::vector<const mtmd_bitmap*> ptrs;
     ptrs.reserve(inputs.size());
     for (size_t i = 0; i < inputs.size(); ++i) {
       const auto& input = inputs[i];
-      auto wrap = mtmd_helper_bitmap_init_from_buf(
-          ctx_, input.bytes.data(), input.bytes.size(), /*placeholder*/ false,
-          mtmd_helper_init_opt_default());
-      if (wrap.video_ctx) {
-        mtmd_helper_video_free(wrap.video_ctx);
-        if (wrap.bitmap) mtmd_bitmap_free(wrap.bitmap);
-        throw std::runtime_error("MtmdSource - video input is not supported");
+      if (input.kind == MediaInput::Kind::Video) {
+        videos.push_back(std::make_unique<mtmd_detail::VideoLayout>(
+            mtmd_detail::video_layout(decode_frames(input.video), input.video)));
+        auto* lazy = mtmd_bitmap_init_lazy(ctx_, "", videos.back().get(),
+                                           &mtmd_detail::VideoLayout::next);
+        if (!lazy) throw std::runtime_error("MtmdSource - video layout failed");
+        bitmaps_.emplace_back(lazy);
+        ptrs.push_back(lazy);
+        continue;
       }
-      if (!wrap.bitmap) {
-        throw std::runtime_error("MtmdSource - unsupported media bytes at input " + std::to_string(i));
-      }
-      bitmaps_.emplace_back(wrap.bitmap);
+      auto wrap = decode_media(input.bytes, i);
+      bitmaps_.emplace_back(wrap);
       const bool audio = input.kind == MediaInput::Kind::Audio;
-      if (mtmd_bitmap_is_audio(wrap.bitmap) != audio) {
+      if (mtmd_bitmap_is_audio(wrap) != audio) {
         throw std::runtime_error("MtmdSource - decoded media kind does not match input");
       }
-      if (audio && (mtmd_bitmap_get_nx(wrap.bitmap) < 2 ||
-                    mtmd_bitmap_get_nx(wrap.bitmap) > sample_bounds[i])) {
+      if (audio && (mtmd_bitmap_get_nx(wrap) < 2 ||
+                    mtmd_bitmap_get_nx(wrap) > sample_bounds[i])) {
         throw std::runtime_error("MtmdSource - decoded audio exceeds validated sample bound");
       }
-      ptrs.push_back(wrap.bitmap);
+      ptrs.push_back(wrap);
     }
 
     chunks_.reset(mtmd_input_chunks_init());
@@ -383,6 +485,68 @@ public:
   }
 
 private:
+  /** Decodes one encoded image or recording. Video containers are refused: frames arrive decoded. */
+  mtmd_bitmap* decode_media(std::span<const uint8_t> bytes, size_t index) const {
+    auto wrap = mtmd_helper_bitmap_init_from_buf(
+        ctx_, bytes.data(), bytes.size(), /*placeholder*/ false, mtmd_helper_init_opt_default());
+    if (wrap.video_ctx) {
+      mtmd_helper_video_free(wrap.video_ctx);
+      if (wrap.bitmap) mtmd_bitmap_free(wrap.bitmap);
+      throw std::runtime_error("MtmdSource - a video container is not an input; pass its frames");
+    }
+    if (!wrap.bitmap) {
+      throw std::runtime_error("MtmdSource - unsupported media bytes at input " + std::to_string(index));
+    }
+    return wrap.bitmap;
+  }
+
+  /** Every frame decoded, of one size, and marked for temporal merge. */
+  std::vector<::mtmd::bitmap_ptr> decode_frames(const VideoFrames& video) const {
+    std::vector<::mtmd::bitmap_ptr> frames;
+    frames.reserve(video.frames.size());
+    for (size_t k = 0; k < video.frames.size(); ++k) {
+      frames.emplace_back(decode_media(video.frames[k], k));
+      auto* frame = frames.back().get();
+      if (mtmd_bitmap_is_audio(frame)) {
+        throw std::runtime_error("MtmdSource - decoded media kind does not match input");
+      }
+      if (mtmd_bitmap_get_nx(frame) != mtmd_bitmap_get_nx(frames.front().get()) ||
+          mtmd_bitmap_get_ny(frame) != mtmd_bitmap_get_ny(frames.front().get())) {
+        throw std::runtime_error("MtmdSource - video frames must share one size");
+      }
+      mtmd_bitmap_set_mergeable(frame, true);
+    }
+    return frames;
+  }
+
+  void validate_video(const VideoFrames& video) const {
+    if (!mtmd_support_vision(ctx_)) {
+      throw std::runtime_error("MtmdSource - projector does not support image input");
+    }
+    if (video.frames.empty()) {
+      throw std::runtime_error("MtmdSource - a video needs at least one frame");
+    }
+    if (video.timestamps_ms.size() != video.frames.size()) {
+      throw std::runtime_error("MtmdSource - a video needs one timestamp per frame");
+    }
+    const auto& t = video.timestamps_ms;
+    if (t.front() < 0 || std::adjacent_find(t.begin(), t.end(), std::greater_equal<int64_t>()) != t.end()) {
+      throw std::runtime_error("MtmdSource - video timestamps must increase");
+    }
+    if (video.timestamp_interval_ms < 0) {
+      throw std::runtime_error("MtmdSource - video timestamp interval must not be negative");
+    }
+    const int64_t start = t.front();
+    if (std::any_of(video.notes.begin(), video.notes.end(), [start](const VideoNote& n) { return n.at_ms < start; })) {
+      throw std::runtime_error("MtmdSource - video notes must not precede the clip");
+    }
+    for (const auto& frame : video.frames) {
+      if (mtmd_detail::encoded_audio(frame)) {
+        throw std::runtime_error("MtmdSource - audio bytes require a typed audio input");
+      }
+    }
+  }
+
   void validate_markers(const std::string& prompt, size_t count) const {
     const std::string marker = mtmd_get_marker(ctx_);
     size_t markers = 0;
@@ -411,6 +575,9 @@ private:
           if (!mtmd_support_vision(ctx_)) {
             throw std::runtime_error("MtmdSource - projector does not support image input");
           }
+          break;
+        case MediaInput::Kind::Video:
+          validate_video(input.video);
           break;
         case MediaInput::Kind::Audio:
           if (!mtmd_support_audio(ctx_) || mtmd_get_audio_sample_rate(ctx_) <= 0) {

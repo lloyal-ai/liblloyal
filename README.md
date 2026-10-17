@@ -15,7 +15,8 @@ So the operations are the ones you already know:
 |---|---|
 | <code>git&nbsp;branch</code> | `fork()` — from the current position |
 | <code>git&nbsp;branch&nbsp;&#8209;d</code> / <code>&#8209;D</code> | `prune()` / `pruneSubtree()`, descendants included |
-| <code>git&nbsp;merge&nbsp;&#8209;&#8209;ff&#8209;only</code> | `retainOnly(winner)` — the winner's KV *becomes* the trunk, in one pass |
+| <code>git&nbsp;merge&nbsp;&#8209;&#8209;ff&#8209;only</code> | `fast_forward(parent, child)`: the parent takes the child's state and keeps its name; every other branch keeps running |
+| <code>branch&nbsp;&#8209;D</code> on every branch but one | `retainOnly(winner)`: the winner stays, under its own handle, and every other branch is deleted in one pass, the old trunk with them |
 | <code>git&nbsp;merge&nbsp;&#8209;&#8209;squash</code> | `decode_scatter()` onto the parent — **hard**: the child's KV is dropped, its output re-decoded |
 | <code>git&nbsp;rebase</code> | `create()` + `decode_scatter()` — **replay from content**; re-decodes onto a new base rather than moving cells, the only form that survives recurrent state |
 | *no equivalent* | `merge_logits(dst, experts, α)` — **soft**: distributions blend, both KVs stay live |
@@ -153,6 +154,8 @@ auto result = store.decode_segments(branch.handle(), source);
 ```
 
 `MtmdSource` is the optional llama.cpp adapter, behind `<lloyal/mtmd.hpp>`. Its **constructor** validates marker/image counts, decodes the image bytes, tokenizes the interleaved prompt, and rejects unsupported media. The **projector runs lazily**, per segment, during the walk — which is exactly what lets an encoder reuse one output buffer: each segment is dispatched before the next is requested.
+
+A video is one input too: `MediaInput::Kind::Video` takes the sampled frames of one clip, each an encoded image, with the time each was sampled. The source lays them out as llama.cpp's own video helper does (`"Video:"`, every frame mergeable, a timestamp after each interval), so projectors with temporal merge (the Qwen-VL family) fuse adjacent frames in pairs. Notes on the timeline, such as a transcript, join the timestamp text the layout already has, so they add no text between frames and leave fusion as it was. Decoding the container is the caller's job; the source refuses one.
 
 Consumers that neither include the header nor link `mtmd` carry no multimodal dependency.
 
