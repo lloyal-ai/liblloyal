@@ -214,11 +214,12 @@ struct GrammarEntry {
 };
 
 /**
- * @brief Concrete sampling params snapshot for memoization
+ * @brief The resolved sampling params a branch's chain was built from
  *
- * Captures resolved parameter values at chain creation time. Used by
- * set_sampler_params() to skip rebuilding the chain when params haven't changed.
- * Satisfies SamplingParamsLike for re-creation.
+ * Every field is a value, the seed included: the chain is built FROM this
+ * record, so it says exactly what the chain draws with, and
+ * set_sampler_params() compares like with like to skip a rebuild. Satisfies
+ * SamplingParamsLike for re-creation.
  */
 struct CachedSamplingParams {
   float temperature = 0.8f;
@@ -235,14 +236,18 @@ struct CachedSamplingParams {
 };
 
 /**
- * @brief Snapshot sampling params for memoization comparison
+ * @brief Resolve sampling params into the record a chain is built from
  *
- * Extracts resolved values from any SamplingParamsLike type using the same
- * defaults as sampler::create_chain(), except seed defaults to 0 (not time)
- * to avoid false cache misses from non-deterministic defaults.
+ * Every field takes the same default as sampler::create_chain(), except the
+ * seed, which has no default of its own: the caller says what an absent seed
+ * means. At creation it is a fresh clock seed; at set_sampler_params() it is
+ * the seed the chain already has, so a call that names no seed keeps it.
+ *
+ * @param p           Any SamplingParamsLike type; fields may be optional
+ * @param absent_seed The seed an absent `p.seed` resolves to
  */
 template <SamplingParamsLike P>
-inline CachedSamplingParams snapshot_params(const P& p) {
+inline CachedSamplingParams snapshot_params(const P& p, uint32_t absent_seed) {
   using ::lloyal::detail::as_value;
   return CachedSamplingParams{
     as_value(p.temperature, 0.8f),
@@ -254,9 +259,12 @@ inline CachedSamplingParams snapshot_params(const P& p) {
     as_value(p.penalty_freq, 0.0f),
     as_value(p.penalty_present, 0.0f),
     as_value(p.penalty_last_n, static_cast<int32_t>(64)),
-    as_value(p.seed, static_cast<uint32_t>(0)),
+    as_value(p.seed, absent_seed),
   };
 }
+
+/// A fresh seed for a chain created without one.
+inline uint32_t clock_seed() { return static_cast<uint32_t>(std::time(nullptr)); }
 
 // ===== BRANCH STATE =====
 
@@ -1805,8 +1813,10 @@ inline BranchHandle create(
   state->has_logits = false;
   state->candidates_buffer.resize(state->n_vocab);
 
-  state->sampler_chain = s.create_sampler(params, n_vocab);
-  state->cached_params = snapshot_params(params);
+  // The chain is built from the resolved record, so the cache says exactly
+  // what the chain draws with — a seedless branch's clock seed included.
+  state->cached_params = snapshot_params(params, clock_seed());
+  state->sampler_chain = s.create_sampler(state->cached_params, n_vocab);
 
   if (grammar_str && grammar_str[0] != '\0') {
     state->grammar = s.create_grammar(model, grammar_str);
@@ -2081,14 +2091,17 @@ inline void clear_steer(
  * @brief Replace a branch's sampler chain with new parameters
  *
  * Memoized: if the new params match the cached snapshot, this is a no-op.
- * Otherwise frees the old chain and creates a new one.
+ * Otherwise frees the old chain and creates a new one. An absent seed keeps
+ * the seed the chain has — a call that names only a temperature compares
+ * equal when nothing else changed, and a rebuild draws on the same seed, so
+ * a seeded branch stays the branch it was seeded as.
  *
  * Primary use case: Entropy-based Dynamic Temperature (EDT), where temperature
  * changes per-token based on model uncertainty.
  *
  * @tparam P Any type satisfying the SamplingParamsLike concept
  * @param handle Branch to modify
- * @param params New sampling parameters
+ * @param params New sampling parameters; an absent seed keeps the chain's
  * @param s Branch store
  * @throws std::runtime_error if handle is invalid
  */
@@ -2099,7 +2112,7 @@ inline void set_sampler_params(BranchHandle handle, const P& params, BranchStore
     throw std::runtime_error("set_sampler_params: invalid branch handle");
   }
 
-  CachedSamplingParams new_params = snapshot_params(params);
+  CachedSamplingParams new_params = snapshot_params(params, state->cached_params.seed);
   if (new_params == state->cached_params && state->sampler_chain != 0) {
     return;  // Memoized — no rebuild needed
   }
@@ -2109,8 +2122,8 @@ inline void set_sampler_params(BranchHandle handle, const P& params, BranchStore
     s.free_sampler(state->sampler_chain);
   }
 
-  // Create new chain
-  state->sampler_chain = s.create_sampler(params, state->n_vocab);
+  // Create new chain, from the resolved record so the chain draws with the seed the cache says.
+  state->sampler_chain = s.create_sampler(new_params, state->n_vocab);
   state->cached_params = new_params;
   ++state->revision;
 
