@@ -5,6 +5,18 @@ All notable changes to liblloyal will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 3.1.1 — 2026-10-17
+
+- An absent seed means the seed the chain has. A branch created without a seed
+  is seeded from the clock once, and its cached params record that seed instead
+  of 0; `set_sampler_params()` resolves an absent seed to the cached one before
+  comparing, so a call that names only a temperature keeps the chain, its
+  penalty window and its PRNG position when nothing else changed, and a rebuild
+  draws on the same seed rather than a new clock seed. The chain is built from
+  the resolved record in both places, so the cache says exactly what the chain
+  draws with. `snapshot_params(p, absent_seed)` makes the caller say what an
+  absent seed means.
+
 ## 3.1.0 — 2026-10-17
 
 - `fast_forward(parent, child)`: the child's state becomes the parent's, which
