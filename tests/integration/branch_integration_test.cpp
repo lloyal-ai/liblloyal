@@ -30,6 +30,7 @@
 #include <lloyal/model_registry.hpp>
 #include <lloyal/tokenizer.hpp>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -4248,4 +4249,169 @@ TEST_CASE("fast forward: the child's slot is reused clean and its handle goes st
   r.store.drain();
   CHECK(kv::pos_max(r.ctx, a_seq) == -1);
   CHECK(kv::pos_max(r.ctx, fresh_seq) == -1);
+}
+
+// ============================================================================
+// An absent seed keeps the chain's seed
+// ============================================================================
+//
+// A binding's params leave the seed absent on almost every call: a branch is
+// created without one, and a per-step temperature change names only the
+// temperature. The cached params must record the seed the chain actually draws
+// with, and an absent seed must mean "the seed the chain has", so that the memo
+// compares like with like: an unchanged call keeps the chain, its penalty window
+// and its PRNG position, and a changed call rebuilds on the same seed.
+
+namespace {
+
+/// The wide distribution with the seed left absent, as a binding's params leave it.
+struct UnseededWide {
+  float temperature = 1.5f;
+  int32_t top_k = 0;
+  float top_p = 1.0f;
+  float min_p = 0.0f;
+  float typical_p = 1.0f;
+  float penalty_repeat = 1.3f;
+  float penalty_freq = 0.0f;
+  float penalty_present = 0.0f;
+  int32_t penalty_last_n = 64;
+  std::optional<uint32_t> seed;
+};
+
+UnseededWide unseeded() { return {}; }
+
+/// The seed the branch's live chain draws with.
+uint32_t chain_seed(FastForwardRig& r, BranchHandle h) {
+  return llama_sampler_get_seed(r.store.get_sampler_chain(chain_of(r, h)));
+}
+
+/// Accept `n` greedy-free draws into the branch: tokens in its penalty window.
+void advance(BranchHandle h, BranchStore& s, int n) {
+  for (int i = 0; i < n; ++i) {
+    const llama_token t = sample(h, s);
+    accept_token(h, t, s);
+    step(h, t, s);
+  }
+}
+
+}  // namespace
+
+TEST_CASE("sampler seed: a seedless branch records the seed its chain draws with") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  FastForwardRig r(512, 64);
+
+  BranchHandle a = r.root(PROMPT, unseeded());
+  CHECK(r.store.get(a)->cached_params.seed == chain_seed(r, a));
+
+  pruneSubtree(a, r.store);
+}
+
+TEST_CASE("sampler seed: a seedless set_sampler_params with unchanged params keeps the chain, its window and its PRNG") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  FastForwardRig r(512, 64);
+
+  BranchHandle a = r.root(PROMPT, unseeded());
+  advance(a, r.store, 4);
+  BranchHandle twin = fork(a, r.store);  // the same window and the same PRNG
+  REQUIRE(twin != INVALID_HANDLE);
+
+  const SamplerChainHandle before = chain_of(r, a);
+  const uint32_t revision = r.store.get(a)->revision;
+  set_sampler_params(a, unseeded(), r.store);
+
+  CHECK(chain_of(r, a) == before);
+  CHECK(r.store.get(a)->revision == revision);
+  CHECK(draws(a, r.store, 8) == draws(twin, r.store, 8));
+
+  pruneSubtree(a, r.store);
+}
+
+TEST_CASE("sampler seed: a reseeded branch keeps its chain through a seedless set_sampler_params with unchanged params") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  FastForwardRig r(512, 64);
+
+  BranchHandle a = r.root(PROMPT, seeded(42));
+  advance(a, r.store, 4);
+  reseed_sampler(a, 9973, r.store);
+  BranchHandle twin = fork(a, r.store);
+  REQUIRE(twin != INVALID_HANDLE);
+
+  const SamplerChainHandle before = chain_of(r, a);
+  set_sampler_params(a, unseeded(), r.store);
+
+  CHECK(chain_of(r, a) == before);
+  CHECK(chain_seed(r, a) == 9973);
+  CHECK(draws(a, r.store, 8) == draws(twin, r.store, 8));
+
+  pruneSubtree(a, r.store);
+}
+
+TEST_CASE("sampler seed: a seedless rebuild keeps the seed the chain had") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  FastForwardRig r(512, 64);
+
+  BranchHandle a = r.root(PROMPT, seeded(42));
+  BranchHandle fresh = fork(a, r.store);  // the chain as seed 42 made it, over the same logits
+  REQUIRE(fresh != INVALID_HANDLE);
+
+  UnseededWide hotter = unseeded();
+  hotter.temperature = 0.9f;
+  const SamplerChainHandle before = chain_of(r, a);
+  set_sampler_params(a, hotter, r.store);
+  CHECK(chain_of(r, a) != before);
+  CHECK(r.store.get(a)->cached_params.seed == 42);
+  CHECK(chain_seed(r, a) == 42);
+
+  // Back to the distribution it started with: a fresh chain on the same seed draws as the fork does.
+  set_sampler_params(a, unseeded(), r.store);
+  CHECK(chain_seed(r, a) == 42);
+  CHECK(draws(a, r.store, 8) == draws(fresh, r.store, 8));
+
+  pruneSubtree(a, r.store);
+}
+
+TEST_CASE("sampler seed: an explicit seed takes effect, and a seedless call afterwards keeps it") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  FastForwardRig r(512, 64);
+
+  BranchHandle a = r.root(PROMPT, unseeded());
+  set_sampler_params(a, seeded(200), r.store);
+  CHECK(r.store.get(a)->cached_params.seed == 200);
+  CHECK(chain_seed(r, a) == 200);
+
+  const SamplerChainHandle before = chain_of(r, a);
+  set_sampler_params(a, unseeded(), r.store);
+  CHECK(chain_of(r, a) == before);
+
+  pruneSubtree(a, r.store);
+}
+
+TEST_CASE("sampler seed: fork and fast-forward carry the seed the chain draws with") {
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  FastForwardRig r(512, 64);
+
+  BranchHandle a = r.root(PROMPT, unseeded());
+  BranchHandle c = fork(a, r.store);
+  REQUIRE(c != INVALID_HANDLE);
+  CHECK(r.store.get(c)->cached_params.seed == r.store.get(a)->cached_params.seed);
+  CHECK(chain_seed(r, c) == r.store.get(c)->cached_params.seed);
+
+  BranchHandle p = fork(a, r.store);
+  REQUIRE(p != INVALID_HANDLE);
+  reseed_sampler(p, 7, r.store);
+  fast_forward(a, p, r.store);
+  CHECK(r.store.get(a)->cached_params.seed == 7);
+  CHECK(chain_seed(r, a) == 7);
+
+  const SamplerChainHandle adopted = chain_of(r, a);
+  set_sampler_params(a, unseeded(), r.store);
+  CHECK(chain_of(r, a) == adopted);
+
+  pruneSubtree(a, r.store);
 }

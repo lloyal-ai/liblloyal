@@ -198,7 +198,7 @@ The embedding rail enforces what keeps that lineage valid:
 
 ## Hot-Swap Sampler & Grammar
 
-Sampler chains, grammars and metrics live in handle-based registries on the store. `set_sampler_params()` memoizes — unchanged params are a no-op. `set_grammar()` swaps mid-generation.
+Sampler chains, grammars and metrics live in handle-based registries on the store. `set_sampler_params()` memoizes — unchanged params are a no-op, and a call that names no seed keeps the seed the chain has. `set_grammar()` swaps mid-generation.
 
 ```cpp
 // EDT: adapt temperature per token from model entropy
