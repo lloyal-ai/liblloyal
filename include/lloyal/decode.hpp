@@ -723,6 +723,26 @@ struct SegmentSource {
 };
 
 /**
+ * @brief A token span as a stream of one TEXT segment, so text is placed by the
+ * rail like any other input
+ */
+class TokenSource final : public SegmentSource {
+public:
+  explicit TokenSource(std::span<const llama_token> tokens) : tokens_(tokens) {}
+  size_t size() override { return 1; }
+  size_t cells() const override { return tokens_.size(); }
+  Segment at(size_t) override {
+    Segment seg;
+    seg.tokens = tokens_;
+    return seg;
+  }
+  void positions(size_t, llama_pos, llama_pos*) override {}
+
+private:
+  std::span<const llama_token> tokens_;
+};
+
+/**
  * @brief How far one input of a stream has landed: a reading of progress
  */
 struct SegmentProgress {
@@ -902,6 +922,8 @@ struct StreamReading {
 
   /// With no memory, attention that is not causal, or pooling, a dispatch sees
   /// only its own entries, so a stream placed in pieces would be read in pieces.
+  /// Any other context (a reasoning model's: memory, causal, no pooling) is
+  /// placed a segment at a time.
   bool whole() const { return !keeps_memory || !causal || pooled; }
 
   /// Whether a bidirectional block can ride inside one mixed batch. llama.cpp
@@ -1028,11 +1050,12 @@ void segments_whole(llama_context* ctx, const StreamReading& reading, llama_seq_
   if (!batch) {
     throw std::runtime_error("decode::segments - llama_batch_ext_init failed");
   }
-  // A pooling context reads every entry's output; any other reads the last.
+  // A stream placed whole is read whole: every entry's output is on, pooled or
+  // per entry, as llama.cpp's encoder computes them for such a context anyway.
   const auto entry = [&](int32_t idx, const llama_pos* pos) {
     if (idx >= 0 && static_cast<size_t>(idx) >= n_fit) throw too_large(static_cast<size_t>(idx) + 1);
     if (idx < 0 || !llama_batch_ext_set_pos(batch.get(), idx, pos) ||
-        !llama_batch_ext_set_output_embd(batch.get(), idx, reading.pooled)) {
+        !llama_batch_ext_set_output_embd(batch.get(), idx, true)) {
       throw std::runtime_error("decode::segments - the batch refused an entry (" + std::to_string(idx) + ")");
     }
     return idx;
@@ -1081,6 +1104,7 @@ void segments_whole(llama_context* ctx, const StreamReading& reading, llama_seq_
   }
 
   if (last < 0) return;
+  // The stream's last entry carries its logits, as a per-segment placement's does.
   llama_batch_ext_set_output_logits(batch.get(), last, true);
   placed.back().has_logits = true;
 

@@ -325,6 +325,62 @@ TEST_CASE("Embedding Integration: a pooled vector is the model's output width") 
   CHECK(emb.size() == static_cast<size_t>(out));
 }
 
+/// A text placed as `encode` placed one before the segments rail: one legacy
+/// batch, every token at sequence 0 with its output on, one llama_decode.
+static void encode_as_one_batch(llama_context *ctx, const std::vector<llama_token> &tokens) {
+  llama_batch batch = llama_batch_init(static_cast<int32_t>(tokens.size()), 0, 1);
+  for (size_t i = 0; i < tokens.size(); ++i) {
+    batch.token[i] = tokens[i];
+    batch.pos[i] = static_cast<llama_pos>(i);
+    batch.n_seq_id[i] = 1;
+    batch.seq_id[i][0] = 0;
+    batch.logits[i] = true;
+  }
+  batch.n_tokens = static_cast<int32_t>(tokens.size());
+  const int rc = llama_decode(ctx, batch);
+  llama_batch_free(batch);
+  REQUIRE(rc == 0);
+}
+
+TEST_CASE("Embedding Integration: a text embeds as one legacy batch embeds it") {
+  // Two placements in one process, on one backend: encode against the legacy
+  // single batch, so the comparison holds whatever backend runs it.
+  REQUIRE_EMBED_MODEL();
+  LlamaBackendGuard backend;
+
+  auto model_params = llama_model_default_params();
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
+  auto model = ModelRegistry::acquire(EMBED_MODEL, model_params);
+  REQUIRE(model != nullptr);
+
+  auto ctx_params = llama_context_default_params();
+  ctx_params.n_ctx = 512;
+  ctx_params.n_batch = 512;
+  ctx_params.n_ubatch = 512;
+  ctx_params.embeddings = true;
+  ctx_params.pooling_type = LLAMA_POOLING_TYPE_MEAN;
+  llama_context *ctx = llama_init_from_model(model.get(), ctx_params);
+  REQUIRE(ctx != nullptr);
+  ContextGuard ctx_guard(ctx);
+
+  const auto tokens = tokenizer::tokenize(llama_model_get_vocab(model.get()),
+      "search_document: The red square moves from left to right across a white frame.", true, true);
+  REQUIRE_FALSE(tokens.empty());
+
+  kv::clear_all(ctx);
+  embedding::encode(ctx, tokens, 512);
+  const auto placed = embedding::get(ctx, embedding::Normalize::L2);
+
+  kv::clear_all(ctx);
+  encode_as_one_batch(ctx, tokens);
+  const auto legacy = embedding::get(ctx, embedding::Normalize::L2);
+
+  REQUIRE(placed.size() == legacy.size());
+  float cosine = 0.0f;
+  for (size_t i = 0; i < placed.size(); ++i) cosine += placed[i] * legacy[i];
+  CHECK(cosine >= 0.9999f);
+}
+
 TEST_CASE(
     "Embedding Integration: similar sentences have high cosine similarity") {
   REQUIRE_EMBED_MODEL();
@@ -379,3 +435,4 @@ TEST_CASE(
   // Similar sentences should be reasonably similar (>0.5 for good embedding models)
   CHECK(sim_similar > 0.5f);
 }
+
