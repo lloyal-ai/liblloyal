@@ -384,6 +384,7 @@ if(LLOYAL_BUILD_INTEGRATION_TESTS)
     integration/chat_out_integration_test.cpp
     integration/kv_file_persistence_test.cpp
     integration/embedding_integration_test.cpp
+    integration/embedding_multimodal_integration_test.cpp
     integration/multi_sequence_integration_test.cpp
     integration/logits_integration_test.cpp
     integration/branch_integration_test.cpp

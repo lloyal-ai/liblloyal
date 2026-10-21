@@ -284,12 +284,14 @@ inline std::vector<MediaInput> image_inputs(const std::vector<std::vector<uint8_
  * `"<__media__>"`) per input; mtmd splits it into interleaved text and media
  * chunks. Text chunks come back as ready token ids — never re-tokenized.
  *
- * **Tokenization flags are a parity contract, not a choice.**
- * `add_special = false` (no mid-conversation BOS — matches the text path's
- * `tokenizer::tokenize(vocab, text, false, true)`) and
- * `parse_special = true` (template specials are real tokens). Diverging here
- * puts a spurious BOS around the image and desynchronizes the KV from what
- * the model was trained to see.
+ * **Framing is the caller's, as on the text path.** `add_special` says
+ * whether the model's special tokens (a BOS) frame the prompt, as
+ * `tokenizer::tokenize(vocab, text, add_special, true)` does for text: false
+ * for a chat prompt, which already carries its template's specials (a BOS
+ * there sits mid-conversation and desynchronizes the KV from what the model
+ * was trained to see); true for a standalone embedding input, as upstream
+ * tokenizes one. `parse_special = true` always: template specials are real
+ * tokens.
  *
  * **Lifetime.** Owns its bitmaps and chunk list. The input bytes are decoded
  * into those bitmaps during construction and never retained, so the caller may
@@ -310,20 +312,26 @@ public:
              const std::string& prompt,
              const std::vector<std::vector<uint8_t>>& images,
              std::span<const llama_token> sep,
-             int32_t n_embd_inp)
-      : MtmdSource(ctx, prompt, mtmd_detail::image_inputs(images), sep, n_embd_inp, {}) {}
+             int32_t n_embd_inp,
+             bool add_special = false)
+      : MtmdSource(ctx, prompt, mtmd_detail::image_inputs(images), sep, n_embd_inp, {}, add_special) {}
 
   /**
    * Inputs follow prompt marker order. Audio is integer PCM WAV, with optional
    * INFO/JUNK metadata. Limits apply before decoding or preprocessing; the
    * caller supplies policy. ctx and sep must outlive this source.
+   *
+   * `add_special` adds the model's special tokens (a BOS) around the prompt, as
+   * mtmd_tokenize does for an embedding input. A chat prompt already carries its
+   * template's, so the default leaves them out.
    */
   MtmdSource(mtmd_context* ctx,
              const std::string& prompt,
              std::span<const MediaInput> inputs,
              std::span<const llama_token> sep,
              int32_t n_embd_inp,
-             AudioLimits limits)
+             AudioLimits limits,
+             bool add_special = false)
       : ctx_(ctx), sep_(sep), n_embd_inp_(n_embd_inp) {
     if (!ctx_) throw std::runtime_error("MtmdSource - NULL mtmd context");
     if (n_embd_inp_ <= 0) throw std::runtime_error("MtmdSource - invalid embedding width");
@@ -366,7 +374,7 @@ public:
     mtmd_input_text txt{};
     txt.text = prompt.c_str();
     txt.text_len = prompt.size();
-    txt.add_special = false;
+    txt.add_special = add_special;
     txt.parse_special = true;
     if (mtmd_tokenize(ctx_, chunks_.get(), &txt, ptrs.data(), ptrs.size()) != 0) {
       throw std::runtime_error("MtmdSource - media preprocessing failed");

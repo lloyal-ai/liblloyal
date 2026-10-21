@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <doctest/doctest.h>
+#include "media_fixtures.hpp"
 #include "test_config.hpp"
 #include <llama/llama.h>
 #include <lloyal/branch.hpp>
@@ -75,44 +76,8 @@ struct TestParams {
 // Fixtures
 // ============================================================================
 
-static std::vector<uint8_t> read_fixture(const char* name) {
-  const std::string path = std::string(LLOYAL_TEST_FIXTURES_DIR) + "/" + name;
-  std::vector<uint8_t> bytes;
-  FILE* f = std::fopen(path.c_str(), "rb");
-  if (!f) return bytes;
-  std::fseek(f, 0, SEEK_END);
-  const long n = std::ftell(f);
-  std::fseek(f, 0, SEEK_SET);
-  if (n > 0) {
-    bytes.resize(static_cast<size_t>(n));
-    if (std::fread(bytes.data(), 1, bytes.size(), f) != bytes.size()) bytes.clear();
-  }
-  std::fclose(f);
-  return bytes;
-}
-
-/**
- * Shared mtmd context — the projector is ~700 MB and init runs a warmup
- * encode, so it is loaded once for the suite. Mirrors acquire_test_model();
- * constructed after the model, so it is destroyed before it (mtmd holds a
- * borrowed llama_model*).
- */
-struct MtmdDeleter {
-  void operator()(mtmd_context* c) const { if (c) mtmd_free(c); }
-};
-
-static mtmd_context* acquire_mtmd(const llama_model* model) {
-  static std::unique_ptr<mtmd_context, MtmdDeleter> cached;
-  if (!cached) {
-    auto p = mtmd_context_params_default();
-    p.use_gpu        = TestConfig::n_gpu_layers() != 0;
-    p.print_timings  = false;
-    p.n_threads      = 4;
-    p.warmup         = false;  // each media case executes the encoder
-    cached.reset(mtmd_init_from_file(MMPROJ_PATH, model, p));
-  }
-  return cached.get();
-}
+using TestConfig::acquire_mtmd;
+using TestConfig::read_fixture;
 
 /// The user turn carrying the image, as a media_marker content part.
 static std::string image_prompt(const llama_model* model, const std::string& ask) {
