@@ -1,0 +1,16 @@
+{"baseline":"b11559","machine":"Apple M2 Pro, 16 GB, Metal","taken":"2026-10-21","model":"Qwen3.5-4B Q4_K_M + mmproj F16","flags":"n_ctx 32768, n_batch 512, n_ubatch 512, n_seq_max 10, n_gpu_layers 99, greedy","run":"warm, second of two back-to-back runs","note":"liblloyal 4f996e0 (3.1.1 plus the embedding output width and MtmdSource add_special), before the segments rail; sample_no_grammar rows time branch::sample alone"}
+{"label":"b11559","item":"model_load","unit":"ms","p50":423.311,"p90":423.311,"min":423.311,"max":423.311,"n":1}
+{"label":"b11559","item":"context_init","unit":"ms","p50":141.008,"p90":141.008,"min":141.008,"max":141.008,"n":1}
+{"label":"b11559","item":"chat_in_format_with_tool","unit":"ms","p50":3.154,"p90":5.993,"min":2.970,"max":5.993,"n":5,"grammar_bytes":4220,"lazy":false}
+{"label":"b11559","item":"prefill","unit":"ms","p50":1637.712,"p90":1637.712,"min":1637.712,"max":1637.712,"n":1,"tokens":881,"tok_per_s":537.945745}
+{"label":"b11559","item":"fork","unit":"ms","p50":0.108,"p90":0.600,"min":0.099,"max":0.600,"n":8,"prefix_tokens":881}
+{"label":"b11559","item":"decode_each_step_n1","unit":"ms","p50":21.827,"p90":23.740,"min":21.299,"max":48.767,"n":40,"branches":1}
+{"label":"b11559","item":"sample_no_grammar_n1","unit":"ms_per_branch","p50":0.227,"p90":0.267,"min":0.209,"max":0.653,"n":40,"branches":1}
+{"label":"b11559","item":"decode_each_step_n3","unit":"ms","p50":41.347,"p90":41.775,"min":40.651,"max":76.002,"n":40,"branches":3}
+{"label":"b11559","item":"sample_no_grammar_n3","unit":"ms_per_branch","p50":0.219,"p90":0.238,"min":0.209,"max":0.314,"n":40,"branches":3}
+{"label":"b11559","item":"decode_each_step_n8","unit":"ms","p50":97.467,"p90":98.195,"min":96.365,"max":118.751,"n":40,"branches":8}
+{"label":"b11559","item":"sample_no_grammar_n8","unit":"ms_per_branch","p50":0.222,"p90":0.254,"min":0.211,"max":0.325,"n":40,"branches":8}
+{"label":"b11559","item":"sample_grammar_mask_first","unit":"ms","p50":17.316,"p90":18.010,"min":13.374,"max":25.413,"n":60,"n_vocab":248320}
+{"label":"b11559","item":"sample_grammar_sample_first","unit":"ms","p50":0.290,"p90":0.505,"min":0.229,"max":12.939,"n":60,"n_vocab":248320}
+{"label":"b11559","item":"image_prefill_total","unit":"ms","p50":1675.804,"p90":1705.262,"min":1662.663,"max":1705.262,"n":3,"cells":576,"advance":44}
+{"label":"b11559","item":"image_decode_and_tokenize","unit":"ms","p50":9.963,"p90":10.930,"min":7.965,"max":10.930,"n":3}

@@ -1709,6 +1709,45 @@ TEST_CASE("branch: decode_segments validates geometry BEFORE the callback") {
   prune(h, ts.store);
 }
 
+TEST_CASE("branch: decode_segments dispatches each segment on its own, rows chunked by the branch's n_batch") {
+  // The dispatch shape of a reasoning prefill: text through the context's
+  // batch, an image's rows in chunks of the branch's own n_batch, one
+  // llama_decode per chunk, never text and rows in one call. Vision and
+  // transcription depend on this shape staying exactly as it is.
+  resetStubConfig();
+  TestStore ts(8);
+  llamaStubConfig().vocab_size_value = 8;
+  llamaStubConfig().logits.assign(8, 0.0f);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+  const int32_t branch_n_batch = 8;
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, branch_n_batch);
+  REQUIRE(h != INVALID_HANDLE);
+  const uint32_t cells_before = ts.store.kv_pressure().cells_used;
+
+  llama_token lead[] = {1, 2, 3, 4, 5};
+  llama_token tail[] = {6, 7, 8};
+  std::vector<float> rows(20 * 2, 0.5f);
+  TestSource src;
+  src.segs.resize(3);
+  src.segs[0].kind = lloyal::decode::Segment::Kind::Text; src.segs[0].tokens = lead;
+  src.segs[1] = embd_seg(rows.data(), 20, 2, 20, 1);
+  src.segs[2].kind = lloyal::decode::Segment::Kind::Text; src.segs[2].tokens = tail;
+
+  const int calls_before = llamaStubConfig().decode_call_count;
+  const auto result = ts.store.decode_segments(h, src);
+
+  // 1 for the lead text, 3 for 20 rows at 8 per dispatch (8, 8, 4), 1 for the tail.
+  CHECK(llamaStubConfig().decode_call_count - calls_before == 5);
+  CHECK(result.cells == 5 + 20 + 3);
+  CHECK(result.advance == 5 + 20 + 3);
+  CHECK(get_position(h, ts.store) == 28);
+  CHECK(ts.store.kv_pressure().cells_used == cells_before + 28);
+  CHECK(llamaStubConfig().causal_attn_log.empty());  // causal rows never touch the context's mode
+
+  prune(h, ts.store);
+}
+
 TEST_CASE("branch: decode_segments rejects an empty segment") {
   resetStubConfig();
   TestStore ts(8);

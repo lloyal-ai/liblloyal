@@ -161,7 +161,7 @@ Consumers that neither include the header nor link `mtmd` carry no multimodal de
 
 ### One ordered prefill, two rails
 
-`decode_segments()` walks the sequence strictly in order, sending TEXT through `decode_scatter` and EMBD through `decode_embd`. Both advance the same branch. Placement stays in the store: the source describes how a segment is positioned *relative to a base*, and the store supplies the absolute base — so branch position never crosses into a binding or a codec.
+`decode::segments()` places the sequence strictly in order, sending TEXT through `decode::many` and EMBD through `decode::embd`, each segment its own dispatch. `decode_segments()` is the branch's side of it: the store supplies the absolute base and the branch's batch, and moves the branch's books as each segment lands. The source describes how a segment is positioned *relative to a base*, so branch position never crosses into a binding or a codec.
 
 ### KV cells and logical position are different quantities
 

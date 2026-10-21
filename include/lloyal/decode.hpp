@@ -10,6 +10,7 @@
 #include <llama/llama.h>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 /**
@@ -152,14 +153,7 @@ struct DecodeError : std::runtime_error {
   DecodeError(int32_t rc_, bool partial_, const std::string& msg)
       : std::runtime_error(msg + " (rc=" + std::to_string(rc_) +
                            (partial_ ? ", partial)" : ")")),
-        rc(rc_), partial(partial_), msg_(msg) {}
-
-  /// The same failure as an ENCLOSING operation reports it once work before
-  /// the failing call has landed — decode_segments over its segments.
-  DecodeError as_partial() const { return DecodeError(rc, true, msg_); }
-
-private:
-  std::string msg_;
+        rc(rc_), partial(partial_) {}
 };
 
 /**
@@ -614,10 +608,9 @@ struct EmbdItem {
 /**
  * @brief One run of input in a heterogeneous prefill
  *
- * A prefill is a sequence of segments, each entering the KV on one of two
- * rails: TEXT via the token rail (`decode_scatter`), EMBD via the embedding
- * rail (`decode_embd`). A `llama_batch` is token-XOR-embd, so the rails
- * never share a dispatch — the segment sequence is what interleaves them.
+ * A prefill is a sequence of segments, placed in order by `segments()`: TEXT
+ * through `many()`, EMBD through `embd()`, each segment its own dispatch, so
+ * the segment sequence is what interleaves tokens and rows.
  *
  * The store is deliberately blind to what produced an EMBD segment: rows are
  * rows, whether they came from a vision projector, an audio encoder, or a
@@ -842,6 +835,141 @@ struct SegmentSource {
   LLOYAL_LOG_DEBUG("[decode::embd] Decode complete (%d rows)", n);
   if (n_committed) *n_committed = n;
   return 0;
+}
+
+// ============================================================================
+// The segments rail
+// ============================================================================
+
+/**
+ * @brief A segment of a stream once it is in the KV: what moved, for the
+ * caller's books
+ */
+struct LandedSegment {
+  /// Its index in the source
+  size_t index = 0;
+  Segment::Kind kind = Segment::Kind::Text;
+  /// KV cells it took: tokens for TEXT, rows for EMBD
+  int32_t cells = 0;
+  /// Position it advanced: the token count for TEXT, `n_pos` for EMBD
+  llama_pos n_pos = 0;
+  /// Whether its last entry computed logits. Every TEXT segment does; an EMBD
+  /// segment only when it ends the stream.
+  bool has_logits = false;
+};
+
+/**
+ * @brief Place a source's segments into one sequence, in order
+ *
+ * The one owner of placement for a heterogeneous stream. Each segment is its
+ * own dispatch: TEXT through many() at the context's batch size, EMBD through
+ * embd() at `rows_n_batch` (a branch's own batch), so a reasoning prefill keeps
+ * exactly the dispatch shape it has always had.
+ *
+ * The source is untrusted input: every EMBD segment's geometry is checked
+ * before it sizes a buffer or reaches positions(). A segment is placed at the
+ * position the previous one ended, and `landed` is told once it is in the KV,
+ * so the caller moves its books per segment and a later failure finds them
+ * true to what landed.
+ *
+ * Moves nothing of the caller's itself. A failed dispatch throws DecodeError,
+ * `partial` when an earlier segment landed or a chunk of this one did: the
+ * stream is one operation to its caller. A throw from the source passes
+ * through unchanged.
+ *
+ * @param ctx          Llama context (must not be null)
+ * @param seq          Sequence the stream lands in
+ * @param base         Position of the stream's first entry
+ * @param source       Yields the segments; owns production, not placement
+ * @param rows_n_batch Most rows per dispatch for an EMBD segment
+ * @param scratch      Reusable batch buffers (shared with each()/scatter()/embd())
+ * @param positions    Reusable buffer for an EMBD segment's positions
+ * @param landed       Called with a LandedSegment after each segment lands
+ */
+template <typename OnLanded>
+inline void segments(llama_context* ctx, llama_seq_id seq, llama_pos base,
+                     SegmentSource& source, int32_t rows_n_batch,
+                     Scratch& scratch, std::vector<llama_pos>& positions,
+                     OnLanded&& landed) {
+  if (!ctx) {
+    throw std::runtime_error("decode::segments - NULL context");
+  }
+
+  const size_t n = source.size();
+  const int32_t text_n_batch = static_cast<int32_t>(llama_n_batch(ctx));
+  llama_pos at = base;
+  bool any_landed = false;
+
+  const auto failed = [&](int rc, int32_t committed, const std::string& what) {
+    return DecodeError(rc, any_landed || committed > 0, "decode::segments - " + what);
+  };
+
+  for (size_t i = 0; i < n; ++i) {
+    const Segment seg = source.at(i);
+    const bool is_last = (i + 1 == n);
+
+    if (seg.kind == Segment::Kind::Text) {
+      // Terminality comes from the index, so an empty trailing segment would
+      // make the real final one non-terminal: [EMBD, empty TEXT] would decode
+      // the image without logits and hand back nothing to sample.
+      if (seg.tokens.empty()) {
+        throw std::runtime_error(
+            "decode::segments - empty TEXT segment at " + std::to_string(i) +
+            "; a source must not yield empty segments");
+      }
+      const int32_t n_tokens = static_cast<int32_t>(seg.tokens.size());
+      int32_t committed = 0;
+      if (const int rc = many(ctx, seg.tokens.data(), n_tokens, at, text_n_batch, seq, &committed); rc != 0) {
+        throw failed(rc, committed, "TEXT segment " + std::to_string(i) + " failed");
+      }
+      at += n_tokens;
+      any_landed = true;
+      landed(LandedSegment{i, Segment::Kind::Text, n_tokens, n_tokens, true});
+      continue;
+    }
+
+    if (!seg.rows || seg.n_rows <= 0) {
+      throw std::runtime_error(
+          "decode::segments - empty embedding segment at " + std::to_string(i));
+    }
+    // n_pos_per_embd of -1 wraps the size_t multiply below into an enormous
+    // allocation, and 0 hands positions() a zero-length buffer to write into.
+    if (seg.n_pos_per_embd != 1 && seg.n_pos_per_embd != 4) {
+      throw std::runtime_error(
+          "decode::segments - segment " + std::to_string(i) + " has n_pos_per_embd " +
+          std::to_string(seg.n_pos_per_embd) + " (expected 1 or 4)");
+    }
+    if (seg.n_embd_inp <= 0) {
+      throw std::runtime_error(
+          "decode::segments - segment " + std::to_string(i) + " has non-positive n_embd_inp");
+    }
+    if (seg.n_pos <= 0 || seg.n_pos > seg.n_rows) {
+      throw std::runtime_error(
+          "decode::segments - segment " + std::to_string(i) + " has n_pos " +
+          std::to_string(seg.n_pos) + " outside (0, n_rows=" + std::to_string(seg.n_rows) + "]");
+    }
+
+    // The base is handed to the source, which applies its own model's rules.
+    positions.assign(static_cast<size_t>(seg.n_rows) * seg.n_pos_per_embd, 0);
+    source.positions(i, at, positions.data());
+
+    EmbdItem item;
+    item.rows           = seg.rows;
+    item.n_rows         = seg.n_rows;
+    item.n_embd_inp     = seg.n_embd_inp;
+    item.pos            = positions.data();
+    item.n_pos_per_embd = seg.n_pos_per_embd;
+    item.seq_id         = seq;
+    item.non_causal     = seg.non_causal;
+    item.output_logits  = is_last;
+    int32_t committed = 0;
+    if (const int rc = embd(ctx, item, rows_n_batch, scratch, &committed); rc != 0) {
+      throw failed(rc, committed, "EMBD segment " + std::to_string(i) + " failed");
+    }
+    at += seg.n_pos;
+    any_landed = true;
+    landed(LandedSegment{i, Segment::Kind::Embd, seg.n_rows, seg.n_pos, is_last});
+  }
 }
 
 // ============================================================================

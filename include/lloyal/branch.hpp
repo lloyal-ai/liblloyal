@@ -1238,10 +1238,7 @@ public:
               "BranchStore::decode_scatter - decode::many failed for oversized item " + std::to_string(idx));
         }
 
-        states[idx]->capture_logits(-1);
-        states[idx]->position += tc;
-        ++states[idx]->revision;
-        cells_used_ += static_cast<uint32_t>(tc);
+        land_tokens(*states[idx], tc, -1);
         ++landed;
         continue;
       }
@@ -1272,11 +1269,7 @@ public:
         int32_t idx = chunk.indices[k];
         int32_t item_n = static_cast<int32_t>(scatter_items[k].tokens.size());
 
-        states[idx]->capture_logits(cursor + item_n - 1);
-        states[idx]->position += item_n;
-        ++states[idx]->revision;
-        cells_used_ += static_cast<uint32_t>(item_n);
-
+        land_tokens(*states[idx], item_n, cursor + item_n - 1);
         cursor += item_n;
       }
       ++landed;
@@ -1392,40 +1385,24 @@ public:
           "poisoned, prune it and replay onto a fresh one");
     }
 
-    state->position += n_pos;
-    cells_used_ += static_cast<uint32_t>(n_tokens);
-    const uint32_t slack = static_cast<uint32_t>(n_tokens - n_pos);
-    state->img_slack_own += slack;
-    state->img_slack_total += slack;
-    ++state->revision;
-
-    if (want_logits) {
-      state->capture_logits(-1);
-    } else {
-      // The position advanced but no logits were computed for it. Leaving the
-      // previous snapshot in place would let sample() read logits belonging to
-      // an EARLIER position — wrong, and silently so. decode_each and
-      // decode_scatter always recapture, so this is the one rail that can
-      // strand them.
-      state->has_logits = false;
-    }
+    land_rows(*state, n_tokens, n_pos, want_logits);
   }
 
   /**
    * @brief Prefill a heterogeneous segment sequence into ONE branch
    *
-   * The composition of the two rails: TEXT segments dispatch through
-   * `decode_scatter`, EMBD segments through `decode_embd`, in the order the
-   * source yields them. Placement lives here because it is KV work —
-   * positions come from the branch's own state and never leave it, and the
-   * bookkeeping (cells, slack, logits) is already this class's job.
+   * The branch's side of `decode::segments`, the rail that places the stream:
+   * it starts at the branch's position, lands in the branch's sequence, chunks
+   * rows by the branch's n_batch, and moves the books (position, cells, slack,
+   * logits) as each segment lands, through the same helpers the token and
+   * embedding rails use. Positions come from the branch's own state and never
+   * leave it.
    *
    * Only the FINAL segment's logits survive: every `llama_decode` resets the
    * output buffer, so an interior segment's snapshot is immediately dead.
-   * TEXT segments go through `decode_scatter`, which captures on every
-   * dispatch — the interior captures happen and are simply overwritten. EMBD
-   * segments request output explicitly, so only a trailing one passes
-   * `want_logits`. Either way the branch ends holding the last segment's.
+   * Every TEXT segment computes logits and is captured, the interior captures
+   * simply overwritten. EMBD segments request output explicitly, so only a
+   * trailing one does. Either way the branch ends holding the last segment's.
    *
    * Segments are requested and dispatched strictly in order — see
    * SegmentSource's in-order contract; a source may reuse its row buffer
@@ -1445,8 +1422,7 @@ public:
    * @return Cells added and position advance (they differ under M-RoPE)
    * @throws std::runtime_error if the handle is invalid or a decode fails
    *
-   * @see decode_scatter() for the token rail
-   * @see decode_embd() for the embedding rail
+   * @see decode::segments() for the rail
    */
   DecodeSegmentsResult decode_segments(BranchHandle handle, decode::SegmentSource& source) {
     BranchState* state = get(handle);
@@ -1457,75 +1433,22 @@ public:
     const llama_pos start_pos = state->position;
     DecodeSegmentsResult result;
 
-    const size_t n = source.size();
     try {
-      for (size_t i = 0; i < n; ++i) {
-        const decode::Segment seg = source.at(i);
-        const bool is_last = (i + 1 == n);
-
+      decode::segments(state->ctx, state->seq_id, start_pos, source, state->n_batch,
+                       scratch_, segment_pos_, [&](const decode::LandedSegment& seg) {
         if (seg.kind == decode::Segment::Kind::Text) {
-          // Terminality comes from the index, so an empty trailing segment would
-          // make the real final one non-terminal: [EMBD, empty TEXT] would decode
-          // the image with want_logits=false, skip the tail, and hand back a
-          // branch with no logits to sample. Reject rather than silently skip.
-          if (seg.tokens.empty()) {
-            throw std::runtime_error(
-                "BranchStore::decode_segments - empty TEXT segment at " +
-                std::to_string(i) + "; a source must not yield empty segments");
-          }
-          DecodeScatterItem item{handle, seg.tokens};
-          decode_scatter(std::span<const DecodeScatterItem>(&item, 1));
-          result.cells += static_cast<int64_t>(seg.tokens.size());
-          continue;
+          land_tokens(*state, seg.cells, -1);
+        } else {
+          land_rows(*state, seg.cells, seg.n_pos, seg.has_logits);
         }
-
-        if (!seg.rows || seg.n_rows <= 0) {
-          throw std::runtime_error(
-              "BranchStore::decode_segments - empty embedding segment at " +
-              std::to_string(i));
-        }
-        // SegmentSource is a public extension point, so this geometry is
-        // untrusted input. It must be checked BEFORE it sizes the buffer or
-        // reaches positions(): n_pos_per_embd of -1 wraps the size_t multiply
-        // into an enormous allocation, and 0 hands positions() a zero-length
-        // buffer to write into. decode_embd's own checks come too late.
-        if (seg.n_pos_per_embd != 1 && seg.n_pos_per_embd != 4) {
-          throw std::runtime_error(
-              "BranchStore::decode_segments - segment " + std::to_string(i) +
-              " has n_pos_per_embd " + std::to_string(seg.n_pos_per_embd) +
-              " (expected 1 or 4)");
-        }
-        if (seg.n_embd_inp <= 0) {
-          throw std::runtime_error(
-              "BranchStore::decode_segments - segment " + std::to_string(i) +
-              " has non-positive n_embd_inp");
-        }
-        if (seg.n_pos <= 0 || seg.n_pos > seg.n_rows) {
-          throw std::runtime_error(
-              "BranchStore::decode_segments - segment " + std::to_string(i) +
-              " has n_pos " + std::to_string(seg.n_pos) +
-              " outside (0, n_rows=" + std::to_string(seg.n_rows) + "]");
-        }
-
-        // The base never leaves this scope: the source is handed the position
-        // and applies its own model's rules to it.
-        const llama_pos base = state->position;
-        segment_pos_.assign(
-            static_cast<size_t>(seg.n_rows) * seg.n_pos_per_embd, 0);
-        source.positions(i, base, segment_pos_.data());
-
-        decode_embd(handle, seg.rows, seg.n_rows, seg.n_embd_inp, seg.n_pos,
-                     segment_pos_.data(), seg.n_pos_per_embd, seg.non_causal,
-                     /*want_logits*/ is_last);
-        result.cells += static_cast<int64_t>(seg.n_rows);
-      }
+        result.cells += seg.cells;
+      });
     } catch (const decode::DecodeError& e) {
-      // One operation to the caller: a failure after an earlier segment
-      // landed is partial even when the failing call restored its own
-      // chunks. Every segment is material, so a moved position is proof.
-      if (state->position != start_pos) state->poison();
-      if (e.partial || state->position == start_pos) throw;
-      throw e.as_partial();
+      // One operation to the caller: the rail marks a failure partial when an
+      // earlier segment landed or a chunk of this one did, and either leaves
+      // the branch part-way through.
+      if (!decode::leaves_branch_intact(e.rc, e.partial)) state->poison();
+      throw;
     } catch (...) {
       // The source threw after a segment landed: the branch is part-way through.
       if (state->position != start_pos) state->poison();
@@ -1611,6 +1534,36 @@ public:
   }
 
 private:
+  /// @brief Move a branch's books for tokens that landed: position, revision and
+  /// cells, then the logits at `logits_index` in that dispatch (-1 for its last).
+  void land_tokens(BranchState& state, int32_t n_tokens, int32_t logits_index) {
+    state.capture_logits(logits_index);
+    state.position += n_tokens;
+    ++state.revision;
+    cells_used_ += static_cast<uint32_t>(n_tokens);
+  }
+
+  /// @brief Move a branch's books for embedding rows that landed: cells by
+  /// `n_rows`, position by `n_pos`, the gap kept as image slack.
+  void land_rows(BranchState& state, int32_t n_rows, llama_pos n_pos, bool with_logits) {
+    state.position += n_pos;
+    cells_used_ += static_cast<uint32_t>(n_rows);
+    const uint32_t slack = static_cast<uint32_t>(n_rows - n_pos);
+    state.img_slack_own += slack;
+    state.img_slack_total += slack;
+    ++state.revision;
+
+    if (with_logits) {
+      state.capture_logits(-1);
+    } else {
+      // The position advanced but no logits were computed for it. Leaving the
+      // previous snapshot in place would let sample() read logits belonging to
+      // an EARLIER position — wrong, and silently so. The token rails always
+      // recapture, so rows are the one place that can strand them.
+      state.has_logits = false;
+    }
+  }
+
   /// @brief Free owned resources (sampler, grammar, boundary tracker, metrics)
   void free_branch_resources(BranchState& slot) {
     if (slot.sampler_chain != 0) {
