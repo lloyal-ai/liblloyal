@@ -1197,36 +1197,7 @@ TEST_CASE("audio: position overflow is refused before filling decoder positions"
 // in pairs; still images never fuse.
 // ============================================================================
 
-static std::vector<std::vector<uint8_t>> video_frames() {
-  std::vector<std::vector<uint8_t>> frames;
-  for (int i = 0; i < 16; ++i) {
-    char name[32];
-    std::snprintf(name, sizeof name, "video/frame-%02d.png", i);
-    frames.push_back(read_fixture(name));
-    REQUIRE_MESSAGE(!frames.back().empty(), "fixtures/video frames missing");
-  }
-  return frames;
-}
-
-/// Borrowed views over sampled frames, in the shape MediaInput::Kind::Video takes.
-struct Clip {
-  std::vector<std::vector<uint8_t>> bytes = video_frames();
-  std::vector<std::span<const uint8_t>> frames;
-  std::vector<int64_t> timestamps_ms;
-  std::vector<VideoNote> notes;
-
-  explicit Clip(int64_t frame_ms = 250) {
-    for (size_t i = 0; i < bytes.size(); ++i) {
-      frames.emplace_back(bytes[i]);
-      timestamps_ms.push_back(static_cast<int64_t>(i) * frame_ms);
-    }
-  }
-
-  MediaInput input(int64_t interval_ms = 5000) const {
-    return MediaInput{MediaInput::Kind::Video, {},
-                      VideoFrames{frames, timestamps_ms, interval_ms, notes}};
-  }
-};
+using TestConfig::Clip;
 
 static MtmdSource video_source(mtmd_context* mtmd, const llama_model* model,
                                const std::string& prompt, const Clip& clip) {

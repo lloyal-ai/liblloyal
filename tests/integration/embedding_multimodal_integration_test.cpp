@@ -9,6 +9,7 @@
 #include <lloyal/tokenizer.hpp>
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <map>
 #include <memory>
@@ -67,7 +68,7 @@ nlohmann::json reference() {
   return nlohmann::json::parse(bytes.begin(), bytes.end());
 }
 
-/** An input as the reference describes it: an image, text, or text around an image. */
+/** An input as the reference describes it: an image, the committed clip, text, or text around an image. */
 std::vector<float> embed(llama_context* ctx, mtmd_context* mtmd, const llama_model* model,
                          const nlohmann::json& entry) {
   const std::string kind = entry["kind"];
@@ -76,12 +77,20 @@ std::vector<float> embed(llama_context* ctx, mtmd_context* mtmd, const llama_mod
     embedding::encode(ctx, tokens, static_cast<int32_t>(llama_n_batch(ctx)));
     return embedding::get(ctx, embedding::Normalize::L2);
   }
+  const bool embedding_framing = true;  // add_special: the model's own BOS and EOS
+  if (kind == "video") {
+    // The frames the server's video helper reads from the clip, at their sample times.
+    const TestConfig::Clip clip;
+    const std::array media{clip.input()};
+    MtmdSource source(mtmd, mtmd_default_marker(), media, {}, llama_model_n_embd_inp(model), {}, embedding_framing);
+    embedding::encode(ctx, source);
+    return embedding::get(ctx, embedding::Normalize::L2);
+  }
   const auto image = TestConfig::read_fixture(entry["image"].get<std::string>().c_str());
   REQUIRE_FALSE(image.empty());
   const std::string prompt = kind == "image"
       ? std::string(mtmd_default_marker())
       : entry["text_before"].get<std::string>() + mtmd_default_marker() + entry["text_after"].get<std::string>();
-  const bool embedding_framing = true;  // add_special: the model's own BOS and EOS
   MtmdSource source(mtmd, prompt, {image}, {}, llama_model_n_embd_inp(model), embedding_framing);
   embedding::encode(ctx, source);
   return embedding::get(ctx, embedding::Normalize::L2);
@@ -175,7 +184,7 @@ TEST_CASE("embedding multimodal: every fixture embeds as the reference server em
   }
 }
 
-TEST_CASE("embedding multimodal: each query finds its own image"
+TEST_CASE("embedding multimodal: each query finds its own image or clip"
           * doctest::skip(embedding_multimodal_disabled())) {
   LlamaBackendGuard backend;
   auto model = TestConfig::acquire_test_model();
@@ -185,17 +194,18 @@ TEST_CASE("embedding multimodal: each query finds its own image"
   auto* ctx = full_context(model.get());
   REQUIRE(ctx);
 
-  std::vector<std::pair<std::string, std::vector<float>>> images;
-  std::vector<std::pair<std::string, std::vector<float>>> queries;  // with the image each must find
+  std::vector<std::pair<std::string, std::vector<float>>> media;
+  std::vector<std::pair<std::string, std::vector<float>>> queries;  // with the input each must find
   const auto ref = reference();
   for (const auto& entry : ref["entries"]) {
-    if (entry["kind"] == "image") images.emplace_back(entry["image"], embedded(ctx, mtmd, model.get(), entry));
+    if (entry["kind"] == "image") media.emplace_back(entry["image"], embedded(ctx, mtmd, model.get(), entry));
+    if (entry["kind"] == "video") media.emplace_back(entry["video"], embedded(ctx, mtmd, model.get(), entry));
     if (entry["kind"] == "text") queries.emplace_back(entry["finds"], embedded(ctx, mtmd, model.get(), entry));
   }
-  REQUIRE(images.size() == 4);
-  REQUIRE(queries.size() == 4);
+  REQUIRE(media.size() == 5);
+  REQUIRE(queries.size() == 5);
   for (const auto& [finds, query] : queries) {
-    const auto best = std::max_element(images.begin(), images.end(), [&](const auto& a, const auto& b) {
+    const auto best = std::max_element(media.begin(), media.end(), [&](const auto& a, const auto& b) {
       return dot(query, a.second) < dot(query, b.second);
     });
     CHECK(best->first == finds);

@@ -3,14 +3,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
+#include <doctest/doctest.h>
 #include <llama/llama.h>
+#include <lloyal/mtmd.hpp>
 #include <mtmd.h>
 #include "test_config.hpp"
 
 /**
- * What the media cases share: fixture bytes, and one projector per process.
+ * What the media cases share: fixture bytes, the committed clip, and one
+ * projector per process.
  */
 namespace TestConfig {
 
@@ -55,5 +59,37 @@ inline mtmd_context* acquire_mtmd(const llama_model* model) {
   }
   return cached.get();
 }
+
+/** The committed clip's 16 frames, sampled at 4 per second (fixtures/video). */
+inline std::vector<std::vector<uint8_t>> video_frames() {
+  std::vector<std::vector<uint8_t>> frames;
+  for (int i = 0; i < 16; ++i) {
+    char name[32];
+    std::snprintf(name, sizeof name, "video/frame-%02d.png", i);
+    frames.push_back(read_fixture(name));
+    REQUIRE_MESSAGE(!frames.back().empty(), "fixtures/video frames missing");
+  }
+  return frames;
+}
+
+/// Borrowed views over sampled frames, in the shape MediaInput::Kind::Video takes.
+struct Clip {
+  std::vector<std::vector<uint8_t>> bytes = video_frames();
+  std::vector<std::span<const uint8_t>> frames;
+  std::vector<int64_t> timestamps_ms;
+  std::vector<lloyal::VideoNote> notes;
+
+  explicit Clip(int64_t frame_ms = 250) {
+    for (size_t i = 0; i < bytes.size(); ++i) {
+      frames.emplace_back(bytes[i]);
+      timestamps_ms.push_back(static_cast<int64_t>(i) * frame_ms);
+    }
+  }
+
+  lloyal::MediaInput input(int64_t interval_ms = 5000) const {
+    return lloyal::MediaInput{lloyal::MediaInput::Kind::Video, {},
+                              lloyal::VideoFrames{frames, timestamps_ms, interval_ms, notes}};
+  }
+};
 
 }  // namespace TestConfig

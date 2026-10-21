@@ -18,10 +18,13 @@ The three images in this folder were provided by the project's maintainer as tes
 `embeddinggemma2-reference.json` holds the vectors llama.cpp's server gives, at the pinned revision:
 
 - each image alone;
-- a search query for each image, with the model card's prefix (`task: search result | query: …`), naming the image it must find;
+- the clip `../video/red-square-moves.mp4`, read by llama.cpp's own video helper at its default 4 frames a second, which gives exactly the 16 frames committed beside it;
+- a search query for each image and for the clip, with the model card's prefix (`task: search result | query: …`), naming the input it must find;
 - one input with text around an image, which only reads right when the stream is placed whole.
 
-The server tokenizes each input with the model's own special tokens (BOS and EOS), pools it whole, and normalises it to unit length. At the pin, each query's best image is its own: 4 of 4.
+The server tokenizes each input with the model's own special tokens (BOS and EOS), pools it whole, and normalises it to unit length. At the pin, each query's best match among the four images and the clip is its own: 5 of 5.
+
+The file was made on the CPU, as CI runs these cases. The same server on Metal agrees with it to a cosine of 0.99988 or better on every entry, so the cases' bar of 0.999 holds on either backend.
 
 `tests/scripts/embedding_reference.sh` regenerates the file. It builds llama.cpp's server in its own build directory, runs it on the CPU (`-c 8192 -b 8192 -ub 8192`, mean pooling), and asks it for every vector through `embedding_reference.py`. It is run by hand, offline: no test and no CI job builds or calls the server. Regenerate the file whenever the pin moves.
 
@@ -42,4 +45,4 @@ LLAMA_MMPROJ_MODEL=/path/to/mmproj-BF16.gguf \
 tests/build_integration/IntegrationRunner --test-case='embedding multimodal:*'
 ```
 
-The infographic is over a thousand entries; on a CPU it takes minutes to encode, so each case shares one embedding of every input.
+The infographic and the clip are each over a thousand entries; on a CPU each takes minutes to encode, so the cases share one embedding of every input.

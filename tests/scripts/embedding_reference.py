@@ -27,6 +27,11 @@ IMAGES = [
 # Text and an image in one input: the case that needs the stream whole.
 INTERLEAVED = ("title: none | text: a photo of ", "cat.jpg", " sitting on a mat")
 
+# A video, read by llama.cpp's own video helper at its default 4 frames a
+# second: the frames committed beside it. Embedding the frames natively must
+# land where the server puts the clip.
+VIDEO = ("video/red-square-moves.mp4", "a red square moving from left to right across a white frame")
+
 
 def post(url, body):
     request = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
@@ -57,6 +62,12 @@ def main(url, fixtures, out):
         entries.append({"name": name, "kind": "image", "image": name, "vector": vector(url, media(marker, name))})
         entries.append({"name": f"query: {query}", "kind": "text", "text": QUERY + query,
                         "finds": name, "vector": vector(url, QUERY + query)})
+    clip, query = VIDEO
+    entries.append({"name": clip, "kind": "video", "video": clip,
+                    "vector": vector(url, {"content": [{"type": "input_video", "input_video": {
+                        "data": "data:video/mp4;base64," + image_bytes(fixtures, clip)}}]})})
+    entries.append({"name": f"query: {query}", "kind": "text", "text": QUERY + query,
+                    "finds": clip, "vector": vector(url, QUERY + query)})
     before, name, after = INTERLEAVED
     entries.append({"name": "text and image", "kind": "text+image", "text_before": before, "image": name,
                     "text_after": after, "vector": vector(url, media(before + marker + after, name))})
