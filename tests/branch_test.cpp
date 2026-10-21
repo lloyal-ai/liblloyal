@@ -1892,6 +1892,84 @@ TEST_CASE("decode::segments reports a model that cannot mix as a DecodeError") {
   CHECK(threw);
 }
 
+namespace {
+
+/// A source whose segments belong to inputs: prompt text, then one input's
+/// rows, the text inside it, and more of its rows, then prompt text again.
+struct InputSource : TestSource {
+  std::vector<int32_t> inputs;
+  int32_t input_of(size_t i) const override { return inputs[i]; }
+  size_t total_of(int32_t input) const override {
+    size_t n = 0;
+    for (size_t i = 0; i < segs.size(); ++i) {
+      if (inputs[i] != input) continue;
+      n += segs[i].kind == lloyal::decode::Segment::Kind::Text ? segs[i].tokens.size()
+                                                                : static_cast<size_t>(segs[i].n_rows);
+    }
+    return n;
+  }
+};
+
+}  // namespace
+
+TEST_CASE("branch: decode_segments reports each input's progress as its segments land") {
+  TestStore ts(8);
+  llamaStubConfig().vocab_size_value = 8;
+  llamaStubConfig().logits.assign(8, 0.0f);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 512);
+  REQUIRE(h != INVALID_HANDLE);
+
+  llama_token prompt[] = {1, 2};
+  llama_token inside[] = {3, 4};
+  llama_token tail[] = {5};
+  std::vector<float> rows(4 * 2, 0.5f);
+  InputSource src;
+  src.segs.resize(5);
+  src.segs[0].kind = lloyal::decode::Segment::Kind::Text; src.segs[0].tokens = prompt;
+  src.segs[1] = embd_seg(rows.data(), 4, 2, 4, 1);
+  src.segs[2].kind = lloyal::decode::Segment::Kind::Text; src.segs[2].tokens = inside;
+  src.segs[3] = embd_seg(rows.data(), 4, 2, 4, 1);
+  src.segs[4].kind = lloyal::decode::Segment::Kind::Text; src.segs[4].tokens = tail;
+  src.inputs = {-1, 0, 0, 0, -1};
+
+  std::vector<lloyal::decode::SegmentProgress> seen;
+  ts.store.decode_segments(h, src, [&](const lloyal::decode::SegmentProgress& p) { seen.push_back(p); });
+
+  // Only the input's own segments report, each with its running total.
+  REQUIRE(seen.size() == 3);
+  CHECK(seen[0].input == 0); CHECK(seen[0].landed == 4);  CHECK(seen[0].total == 10);
+  CHECK(seen[1].input == 0); CHECK(seen[1].landed == 6);  CHECK(seen[1].total == 10);
+  CHECK(seen[2].input == 0); CHECK(seen[2].landed == 10); CHECK(seen[2].total == 10);
+  prune(h, ts.store);
+}
+
+TEST_CASE("branch: decode_segments reports no progress past a failed dispatch") {
+  TestStore ts(8);
+  llamaStubConfig().vocab_size_value = 8;
+  llamaStubConfig().logits.assign(8, 0.0f);
+  TestSamplingParams params;
+  auto* fake_model = reinterpret_cast<llama_model*>(0x2000);
+  BranchHandle h = create(ts.ctx, fake_model, ts.store, 0, params, 512);
+  REQUIRE(h != INVALID_HANDLE);
+
+  std::vector<float> rows(4 * 2, 0.5f);
+  InputSource src;
+  src.segs = {embd_seg(rows.data(), 4, 2, 4, 1), embd_seg(rows.data(), 4, 2, 4, 1)};
+  src.inputs = {0, 0};
+  llamaStubConfig().decode_fail_on_call = 2;  // the second segment's only dispatch fails
+  llamaStubConfig().decode_fail_rc = 1;
+
+  std::vector<lloyal::decode::SegmentProgress> seen;
+  CHECK_THROWS_AS(ts.store.decode_segments(h, src, [&](const lloyal::decode::SegmentProgress& p) { seen.push_back(p); }),
+                  lloyal::decode::DecodeError);
+  REQUIRE(seen.size() == 1);
+  CHECK(seen[0].landed == 4);
+  CHECK(seen[0].total == 8);
+  prune(h, ts.store);
+}
+
 TEST_CASE("branch: decode_segments rejects an empty segment") {
   resetStubConfig();
   TestStore ts(8);

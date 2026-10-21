@@ -712,6 +712,26 @@ struct SegmentSource {
    * so a caller-side rebase would need the producer's model taxonomy.
    */
   virtual void positions(size_t i, llama_pos base, llama_pos* out) = 0;
+
+  /// The input segment `i` belongs to (an image, a video, a recording), or -1
+  /// for prompt text that belongs to none. A source without inputs has none.
+  virtual int32_t input_of(size_t /*i*/) const { return -1; }
+
+  /// KV cells input `input` takes, summed over its segments: what progress on
+  /// it counts towards. Known before anything decodes, like cells().
+  virtual size_t total_of(int32_t /*input*/) const { return 0; }
+};
+
+/**
+ * @brief How far one input of a stream has landed: a reading of progress
+ */
+struct SegmentProgress {
+  /// The input, as SegmentSource::input_of names it
+  int32_t input = -1;
+  /// Its cells in the KV so far
+  size_t landed = 0;
+  /// Its cells in all, as SegmentSource::total_of quotes them
+  size_t total = 0;
 };
 
 /**

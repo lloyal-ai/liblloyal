@@ -1419,12 +1419,16 @@ public:
    *
    * @param handle Branch to prefill (must be valid + leased)
    * @param source Yields the segments; owns production, not placement
+   * @param on_progress Told, as each segment of an input lands, how much of
+   *        that input is in the KV and of how much (SegmentProgress). The
+   *        prompt's own text reports nothing. Never called after a failure.
    * @return Cells added and position advance (they differ under M-RoPE)
    * @throws std::runtime_error if the handle is invalid or a decode fails
    *
    * @see decode::segments() for the rail
    */
-  DecodeSegmentsResult decode_segments(BranchHandle handle, decode::SegmentSource& source) {
+  DecodeSegmentsResult decode_segments(BranchHandle handle, decode::SegmentSource& source,
+                                       const std::function<void(const decode::SegmentProgress&)>& on_progress = {}) {
     BranchState* state = get(handle);
     if (!state) {
       throw std::runtime_error("BranchStore::decode_segments - invalid handle");
@@ -1432,6 +1436,15 @@ public:
 
     const llama_pos start_pos = state->position;
     DecodeSegmentsResult result;
+
+    std::vector<size_t> landed_by_input;
+    const auto report = [&](const decode::LandedSegment& seg) {
+      const int32_t input = source.input_of(seg.index);
+      if (!on_progress || input < 0) return;
+      if (landed_by_input.size() <= static_cast<size_t>(input)) landed_by_input.resize(input + 1, 0);
+      landed_by_input[input] += static_cast<size_t>(seg.cells);
+      on_progress(decode::SegmentProgress{input, landed_by_input[input], source.total_of(input)});
+    };
 
     try {
       decode::segments(state->ctx, state->seq_id, start_pos, source, state->n_batch,
@@ -1442,6 +1455,7 @@ public:
           land_rows(*state, seg.cells, seg.n_pos, seg.has_logits);
         }
         result.cells += seg.cells;
+        report(seg);
       });
     } catch (const decode::DecodeError& e) {
       // One operation to the caller: the rail marks a failure partial when an

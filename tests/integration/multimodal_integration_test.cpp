@@ -1437,6 +1437,61 @@ TEST_CASE("multimodal: no timestamp follows a frame past the last threshold time
   CHECK(stamps == 2);
 }
 
+TEST_CASE("multimodal: an image then a video report their progress in order, each to its own total") {
+  REQUIRE_VL();
+  LlamaBackendGuard guard;
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+  mtmd_context* mtmd = acquire_mtmd(model.get());
+  REQUIRE(mtmd);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 4096;
+  cparams.n_batch = 512;
+  cparams.n_seq_max = 4;
+  cparams.kv_unified = true;  // as lloyal.node creates every context: one KV the branches share
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+  TestParams params;
+  BranchHandle h = create(ctx, model.get(), store, 0, params, 512);
+  REQUIRE(h != INVALID_HANDLE);
+
+  const auto image = read_fixture("cat.jpg");
+  REQUIRE_FALSE(image.empty());
+  Clip clip;
+  const std::array media{MediaInput{MediaInput::Kind::Image, image}, clip.input()};
+  const std::string marker = mtmd_default_marker();
+  MtmdSource source(mtmd, "Compare these.\n" + marker + "\n" + marker, media, {},
+                    llama_model_n_embd_inp(model.get()), {});
+
+  std::vector<decode::SegmentProgress> seen;
+  const auto r = store.decode_segments(h, source, [&](const decode::SegmentProgress& p) { seen.push_back(p); });
+
+  // In order: every report of the image before any of the video, each running
+  // up to its own total, and the inputs plus the prompt's own text are the cost.
+  REQUIRE_FALSE(seen.empty());
+  CHECK(seen.front().input == 0);
+  CHECK(seen.back().input == 1);
+  const auto first_video = std::find_if(seen.begin(), seen.end(), [](const auto& p) { return p.input == 1; });
+  CHECK(std::all_of(first_video, seen.end(), [](const auto& p) { return p.input == 1; }));
+  size_t totals = 0;
+  for (const int32_t input : {0, 1}) {
+    const auto last = std::find_if(seen.rbegin(), seen.rend(), [&](const auto& p) { return p.input == input; });
+    REQUIRE(last != seen.rend());
+    CHECK(last->landed == last->total);
+    CHECK(last->total == source.total_of(input));
+    totals += last->total;
+  }
+  CHECK(totals > 0);
+  CHECK(totals < static_cast<size_t>(r.cells));  // the prompt's own text belongs to neither
+
+  prune(h, store);
+  store.drain();
+  llama_free(ctx);
+}
+
 TEST_CASE("multimodal: a video answers grounded on motion") {
   REQUIRE_VL();
   LlamaBackendGuard guard;
