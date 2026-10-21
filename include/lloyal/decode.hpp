@@ -33,6 +33,10 @@
  *    Embedding Rows  │  decode::embd   │        —        │
  *                    └─────────────────┴─────────────────┘
  *
+ * A stream of text and rows goes through decode::segments, which composes
+ * these a segment per dispatch, or places the whole stream as one mixed batch
+ * on a context that reads it only whole (see StreamReading).
+ *
  * Single-sequence primitives auto-chunk internally (many, embd); the
  * multi-sequence ones do not — packing across sequences is a policy decision
  * that lives in BranchStore (see bin_pack).
@@ -428,8 +432,8 @@ struct Scratch {
   }
 
   /// The embedding-rail twin of as_batch(): `embd` points at CALLER-owned
-  /// rows (never copied — that is the point), `token` is null. A llama_batch
-  /// is token-XOR-embd. `tokens_` is unused on this path.
+  /// rows (never copied — that is the point), `token` is null. A legacy
+  /// llama_batch carries tokens or rows, not both. `tokens_` is unused on this path.
   ///
   /// Same ABI sensitivity as as_batch() — audit together.
   llama_batch as_embd_batch(int32_t n_tokens, const float* rows) {
@@ -758,9 +762,10 @@ struct SegmentProgress {
  * @brief Decode pre-computed embedding rows into one sequence's KV cache
  *
  * The embedding rail beside the token rail: rows enter via `batch.embd` with
- * `batch.token = nullptr`. A llama_batch is token-XOR-embd, so rows never
- * share a dispatch with tokens — this is always its own llama_decode,
- * distinct from scatter().
+ * `batch.token = nullptr`, zero-copy from the caller's buffer. A legacy
+ * llama_batch carries tokens or rows, not both, so this is always its own
+ * llama_decode, distinct from scatter(). A stream that a context must read
+ * whole goes in one mixed batch through segments() instead.
  *
  * Auto-chunks by n_batch like many() — and this is the MAIN path, not an
  * edge: `image_min_tokens` metadata commonly puts an image above the default

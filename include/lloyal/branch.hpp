@@ -1291,9 +1291,9 @@ public:
    * `want_logits` (the rows-terminal prefill), in which case the final
    * row's logits land in logits_snapshot like a token prefill's would.
    *
-   * A llama_batch is token-XOR-embd, so this is always its own dispatch —
-   * a multimodal prefill interleaves sequential calls per branch:
-   * decode_scatter(text) → decode_embd(rows) → decode_scatter(text).
+   * Always its own dispatch: a legacy llama_batch carries rows or tokens,
+   * not both. A multimodal prefill goes through decode_segments, which places
+   * text and rows in order through the rail, with the same books.
    *
    * @param handle          Branch to decode into (must be valid + leased)
    * @param rows            Embedding rows, n_tokens x n_embd_inp floats

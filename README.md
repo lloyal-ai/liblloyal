@@ -89,7 +89,7 @@ store.decode_scatter({
 | **Multi Token**    | `decode::many`   | `decode::scatter` |
 | **Embedding Rows** | `decode::embd`   | —                 |
 
-> Embedding rows have no multi-sequence cell: a `llama_batch` is token-**XOR**-embd, so an image is always its own dispatch and never bin-packs with text.
+> Embedding rows have no multi-sequence cell: a legacy `llama_batch` carries tokens or rows, not both, so an image placed this way is its own dispatch and never bin-packs with text. A stream of text and rows goes through `decode::segments`, below.
 
 ## BranchStore
 
@@ -127,9 +127,10 @@ Three responsibilities, deliberately separated:
 
 | Layer | Owns |
 |---|---|
-| `SegmentSource` | Producing ordered TEXT / EMBD segments and their position geometry |
-| `BranchStore::decode_segments` | Placement: position, KV cells, slack, terminal logits |
-| `decode::` primitives | Packing the right `llama_batch` and dispatching it |
+| `SegmentSource` | Producing ordered TEXT / EMBD segments, their position geometry, and which input each belongs to |
+| `decode::segments` | Placement: the dispatch shape the context needs, positions, validation, when a segment has landed |
+| `BranchStore::decode_segments` | The branch's books as each segment lands: position, KV cells, slack, terminal logits, progress |
+| `decode::` primitives | Packing the right batch and dispatching it |
 
 ```mermaid
 flowchart TD
@@ -138,10 +139,11 @@ flowchart TD
     M -. implements .-> S["SegmentSource contract"]
     X -. implements .-> S
     S --> B["BranchStore::decode_segments"]
-    B --> T["token rail<br/>decode_scatter"]
-    B --> E["embedding rail<br/>decode_embd"]
+    B --> R["decode::segments"]
+    R --> T["a context that keeps what it is given<br/>a segment per dispatch: decode::many / decode::embd"]
+    R --> W["a context that reads it whole<br/>the whole stream as one mixed batch"]
     T --> K["one live KV lineage"]
-    E --> K
+    W --> V["one read of the whole input"]
 ```
 
 ### The portability seam
@@ -153,15 +155,29 @@ MtmdSource source(mtmd_ctx, prompt, images, separator, n_embd_inp);
 auto result = store.decode_segments(branch.handle(), source);
 ```
 
-`MtmdSource` is the optional llama.cpp adapter, behind `<lloyal/mtmd.hpp>`. Its **constructor** validates marker/image counts, decodes the image bytes, tokenizes the interleaved prompt, and rejects unsupported media. The **projector runs lazily**, per segment, during the walk — which is exactly what lets an encoder reuse one output buffer: each segment is dispatched before the next is requested.
+`MtmdSource` is the optional llama.cpp adapter, behind `<lloyal/mtmd.hpp>`. Its **constructor** validates marker/image counts, decodes the image bytes, tokenizes the interleaved prompt, and rejects unsupported media. The **projector runs lazily**, per segment, during the walk — which is exactly what lets an encoder reuse one output buffer: each segment is done with before the next is requested, either dispatched or copied into a mixed batch.
 
 A video is one input too: `MediaInput::Kind::Video` takes the sampled frames of one clip, each an encoded image, with the time each was sampled. The source lays them out as llama.cpp's own video helper does (`"Video:"`, every frame mergeable, a timestamp after each interval), so projectors with temporal merge (the Qwen-VL family) fuse adjacent frames in pairs. Notes on the timeline, such as a transcript, join the timestamp text the layout already has, so they add no text between frames and leave fusion as it was. Decoding the container is the caller's job; the source refuses one.
 
 Consumers that neither include the header nor link `mtmd` carry no multimodal dependency.
 
-### One ordered prefill, two rails
+### One ordered prefill, one rail
 
-`decode::segments()` places the sequence strictly in order, sending TEXT through `decode::many` and EMBD through `decode::embd`, each segment its own dispatch. `decode_segments()` is the branch's side of it: the store supplies the absolute base and the branch's batch, and moves the branch's books as each segment lands. The source describes how a segment is positioned *relative to a base*, so branch position never crosses into a binding or a codec.
+`decode::segments()` places the sequence strictly in order, and the context decides how. A context that keeps what it was given and attends causally, a reasoning model's, gets each segment as its own dispatch: TEXT through `decode::many`, EMBD through `decode::embd`, zero-copy from the encoder's buffer. A context that reads a stream only whole, with no memory, attention that is not causal, or pooling, gets the whole stream as one mixed batch: tokens and rows as entries of one `llama_batch_ext`, one `llama_process`. A stream larger than one ubatch is refused before anything runs.
+
+`decode_segments()` is the branch's side of it: the store supplies the absolute base and the branch's batch, and moves the branch's books as each segment lands. Given `on_progress`, it says as each segment of an input lands how much of that input is in the KV and of how much. The source describes how a segment is positioned *relative to a base*, so branch position never crosses into a binding or a codec.
+
+### Embedding text, images and video
+
+`embedding::encode(ctx, source)` embeds an input of text, an image, a video, or text around one, through the same rail. Build the source with `add_special`, so the model's own BOS and EOS frame the input as it does for text:
+
+```cpp
+MtmdSource source(mtmd_ctx, mtmd_default_marker(), media, {}, n_embd_inp, {}, /*add_special*/ true);
+embedding::encode(embed_ctx, source);
+auto vector = embedding::get(embed_ctx);
+```
+
+Text goes the same way: `embedding::encode(ctx, tokens, n_batch)` places the text as a one-segment stream. An embedding reads every entry of one dispatch, so the context must read its input whole: pooled, or a model without memory. A model that keeps memory and attends causally, created with embeddings on and pooling NONE, is refused by name.
 
 ### KV cells and logical position are different quantities
 
