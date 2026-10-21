@@ -53,26 +53,9 @@ enum class Normalize : int32_t {
 // ===== MODEL CAPABILITY CHECKS =====
 
 /**
- * Check if model supports embeddings
- *
- * @param model Llama model
- * @return true if model has non-zero embedding dimension
- *
- * NOTE: This checks dimension only. For proper embeddings, the context
- * must also be created with pooling enabled (LLAMA_POOLING_TYPE_MEAN, etc.)
- */
-inline bool has_embeddings(const llama_model *model) {
-  if (!model) {
-    LLOYAL_LOG_DEBUG("[embedding::has_embeddings] ERROR: model is null");
-    return false;
-  }
-
-  int32_t n_embd = llama_model_n_embd(model);
-  return n_embd > 0;
-}
-
-/**
- * Get embedding dimension for model
+ * Get embedding dimension for model: the width the model outputs, which a
+ * model with its own output head (EmbeddingGemma 2) reports apart from its
+ * hidden width. Every reader below takes the width from here.
  *
  * @param model Llama model
  * @return Embedding dimension (e.g., 384, 768, 1024, 4096)
@@ -83,7 +66,20 @@ inline int32_t dimension(const llama_model *model) {
     return 0;
   }
 
-  return llama_model_n_embd(model);
+  return llama_model_n_embd_out(model);
+}
+
+/**
+ * Check if model supports embeddings
+ *
+ * @param model Llama model
+ * @return true if model has non-zero embedding dimension
+ *
+ * NOTE: This checks dimension only. For proper embeddings, the context
+ * must also be created with pooling enabled (LLAMA_POOLING_TYPE_MEAN, etc.)
+ */
+inline bool has_embeddings(const llama_model *model) {
+  return dimension(model) > 0;
 }
 
 // ===== CONTEXT CAPABILITY CHECKS =====
@@ -311,7 +307,7 @@ inline std::vector<float> get(llama_context *ctx,
   }
 
   // Copy to vector
-  int32_t n_embd = llama_model_n_embd(model);
+  int32_t n_embd = dimension(model);
   std::vector<float> embeddings(embd_ptr, embd_ptr + n_embd);
 
   // Apply normalization
@@ -370,7 +366,7 @@ inline std::vector<float> get_seq(llama_context *ctx, llama_seq_id seq,
     throw std::runtime_error("embedding::get_seq: embeddings unavailable");
   }
 
-  int32_t n_embd = llama_model_n_embd(model);
+  int32_t n_embd = dimension(model);
   std::vector<float> embeddings(embd_ptr, embd_ptr + n_embd);
 
   if (normalize == Normalize::L2) {
@@ -418,7 +414,7 @@ inline std::vector<float> get_ith(llama_context *ctx, int32_t idx,
     throw std::runtime_error("embedding::get_ith: embeddings unavailable");
   }
 
-  int32_t n_embd = llama_model_n_embd(model);
+  int32_t n_embd = dimension(model);
   std::vector<float> embeddings(embd_ptr, embd_ptr + n_embd);
 
   if (normalize == Normalize::L2) {

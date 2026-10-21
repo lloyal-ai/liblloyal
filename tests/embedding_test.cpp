@@ -199,6 +199,33 @@ TEST_CASE("Embedding: get_ith - returns embeddings for token index") {
   CHECK(emb[1] == doctest::Approx(0.5f));
 }
 
+// ===== OUTPUT WIDTH =====
+// A model whose output head differs from its hidden width (EmbeddingGemma 2:
+// 768 out of a narrower backbone) is read at the width it outputs.
+
+TEST_CASE("Embedding: dimension - is the model's output width") {
+  resetStubConfig();
+  llamaStubConfig().n_embd = 2;
+  llamaStubConfig().n_embd_out = 3;
+
+  llama_model model{};
+  CHECK(dimension(&model) == 3);
+}
+
+TEST_CASE("Embedding: get, get_seq and get_ith - read the output width") {
+  resetStubConfig();
+  llamaStubConfig().n_embd = 2;
+  llamaStubConfig().n_embd_out = 3;
+  llamaStubConfig().pooling_type = LLAMA_POOLING_TYPE_MEAN;
+  llamaStubConfig().embeddings_available = true;
+  llamaStubConfig().embeddings = {1.0f, 2.0f, 3.0f};
+
+  llama_context ctx{};
+  CHECK(get(&ctx, Normalize::None).size() == 3);
+  CHECK(get_seq(&ctx, 0, Normalize::None).size() == 3);
+  CHECK(get_ith(&ctx, 0, Normalize::None).size() == 3);
+}
+
 // ===== COSINE SIMILARITY =====
 
 TEST_CASE("Embedding: cosine_similarity - identical vectors return 1.0") {

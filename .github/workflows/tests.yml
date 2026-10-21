@@ -209,6 +209,8 @@ jobs:
           e87f176479d0855a907a41277aca2f8ee7a09523 fixtures/vision-models.sha256
         download_pair ggml-org/Qwen3-ASR-0.6B-GGUF \
           928ab958557df9aa2ef1c93e0e83c7ad0933fae2 fixtures/asr-models.sha256
+        download_pair unsloth/embeddinggemma-2-GGUF \
+          031f0d4b35536f69ab3509d4893c923264fcf253 fixtures/embedding-models.sha256
 
     - name: Configure CMake for integration tests
       working-directory: tests
@@ -257,6 +259,22 @@ jobs:
         ./build_integration/IntegrationRunner --success \
           --test-case="*Embedding*" 2>&1 | tee test_output.txt
         # Fail if no tests actually executed (all filtered/skipped)
+        if grep -qE "test cases:.*\| 0 passed \| 0 failed \|" test_output.txt; then
+          echo "::error::No tests executed — all were skipped or filtered out"
+          exit 1
+        fi
+
+    - name: Run embedding tests (EmbeddingGemma 2)
+      working-directory: tests
+      env:
+        LLAMA_TEST_MODEL: ${{ github.workspace }}/tests/fixtures/SmolLM2-1.7B-Instruct-Q4_K_M.gguf
+        # A model whose output head is not its hidden width: 768 out of 512.
+        LLAMA_EMBED_MODEL: ${{ github.workspace }}/tests/fixtures/embeddinggemma-2-Q8_0.gguf
+        UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+      run: |
+        set -o pipefail
+        ./build_integration/IntegrationRunner --success \
+          --test-case="*Embedding*" 2>&1 | tee test_output.txt
         if grep -qE "test cases:.*\| 0 passed \| 0 failed \|" test_output.txt; then
           echo "::error::No tests executed — all were skipped or filtered out"
           exit 1

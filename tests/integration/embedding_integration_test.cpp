@@ -74,7 +74,7 @@ TEST_CASE("Embedding Integration: has_embeddings returns true for LLM models") {
   CHECK(dim > 0);
 }
 
-TEST_CASE("Embedding Integration: dimension returns model hidden size") {
+TEST_CASE("Embedding Integration: dimension is the model's output width") {
   REQUIRE_MODEL();
   LlamaBackendGuard backend;
 
@@ -86,11 +86,11 @@ TEST_CASE("Embedding Integration: dimension returns model hidden size") {
 
   int32_t dim = embedding::dimension(model.get());
 
-  // Common dimensions: 768 (BERT), 1024, 2048 (SmolLM2), 4096 (Llama)
-  // Note: CI uses tiny-random-llama.gguf with dim=32 for fast testing
+  // The width the model outputs. For most models it is the hidden width; a
+  // model with its own output head (EmbeddingGemma 2) reports its own.
   INFO("Embedding dimension: " << dim);
-  CHECK(dim > 0);     // Must have positive dimension
-  CHECK(dim <= 8192); // Maximum reasonable hidden size
+  CHECK(dim == llama_model_n_embd_out(model.get()));
+  CHECK(dim > 0);
 }
 
 // ===== CONTEXT WITHOUT POOLING =====
@@ -287,6 +287,42 @@ TEST_CASE("Embedding Integration: extract embeddings from embedding model") {
   }
   float norm = std::sqrt(norm_sq);
   CHECK(norm == doctest::Approx(1.0f).epsilon(0.01));
+}
+
+TEST_CASE("Embedding Integration: a pooled vector is the model's output width") {
+  REQUIRE_EMBED_MODEL();
+  LlamaBackendGuard backend;
+
+  auto model_params = llama_model_default_params();
+  model_params.n_gpu_layers = TestConfig::n_gpu_layers();
+
+  auto model = ModelRegistry::acquire(EMBED_MODEL, model_params);
+  REQUIRE(model != nullptr);
+
+  auto ctx_params = llama_context_default_params();
+  ctx_params.n_ctx = 512;
+  ctx_params.n_batch = 512;
+  ctx_params.embeddings = true;
+  ctx_params.pooling_type = LLAMA_POOLING_TYPE_MEAN;
+
+  llama_context *ctx = llama_init_from_model(model.get(), ctx_params);
+  REQUIRE(ctx != nullptr);
+  ContextGuard ctx_guard(ctx);
+
+  auto vocab = llama_model_get_vocab(model.get());
+  auto tokens = tokenizer::tokenize(vocab, "Hello world", true, true);
+  REQUIRE_FALSE(tokens.empty());
+
+  kv::clear_all(ctx);
+  embedding::encode(ctx, tokens, 512);
+  auto emb = embedding::get(ctx, embedding::Normalize::L2);
+
+  // A model whose output head is not its hidden width
+  // (EmbeddingGemma 2: 768 out of 512) is read at the width it outputs.
+  const int32_t out = llama_model_n_embd_out(model.get());
+  INFO("hidden width " << llama_model_n_embd(model.get()) << ", output width " << out);
+  CHECK(embedding::dimension(model.get()) == out);
+  CHECK(emb.size() == static_cast<size_t>(out));
 }
 
 TEST_CASE(

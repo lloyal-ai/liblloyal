@@ -601,6 +601,10 @@ int32_t llama_model_n_embd(const llama_model * /*model*/) {
   return g_stub_config.n_embd;
 }
 
+int32_t llama_model_n_embd_out(const llama_model * /*model*/) {
+  return g_stub_config.n_embd_out > 0 ? g_stub_config.n_embd_out : g_stub_config.n_embd;
+}
+
 int32_t llama_pooling_type(const llama_context * /*ctx*/) {
   return g_stub_config.pooling_type;
 }

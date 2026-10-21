@@ -224,6 +224,7 @@ extern "C" {
 
     // Embedding operations
     int32_t llama_model_n_embd(const llama_model* model);
+    int32_t llama_model_n_embd_out(const llama_model* model);
     int32_t llama_pooling_type(const llama_context* ctx);
     float* llama_get_embeddings(llama_context* ctx);
     float* llama_get_embeddings_seq(llama_context* ctx, llama_seq_id seq);
@@ -352,6 +353,9 @@ struct LlamaStubConfig {
 
     // Embedding operations
     int32_t n_embd = 0;                        // Embedding dimension (0 = no embeddings)
+    // Width of what the model outputs, as llama_model_n_embd_out reports it.
+    // 0 means the same as n_embd, as llama.cpp answers for a model without its own.
+    int32_t n_embd_out = 0;
     int32_t pooling_type = LLAMA_POOLING_TYPE_NONE;  // Pooling type
     std::vector<float> embeddings;             // Embedding values to return
     bool embeddings_available = false;         // Controls if llama_get_embeddings returns valid ptr
