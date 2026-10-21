@@ -247,6 +247,25 @@ inline void encode(llama_context *ctx, const std::vector<llama_token> &tokens,
   encode(ctx, tokens.data(), static_cast<int32_t>(tokens.size()), n_batch);
 }
 
+/**
+ * Encode a whole input for embeddings: text, media, or both, as one stream
+ *
+ * The input is a segment stream (an `MtmdSource` built with `add_special`,
+ * for the model's own BOS and EOS), placed by the segments rail at sequence 0
+ * from position 0. Read the vector with `get()` afterwards.
+ *
+ * @param ctx    Embedding context (embeddings=true, pooling enabled)
+ * @param source The input's segments
+ * @throws std::runtime_error if the input is malformed or does not fit
+ * @throws decode::DecodeError if the dispatch fails
+ */
+inline void encode(llama_context *ctx, decode::SegmentSource &source) {
+  decode::Scratch scratch;
+  std::vector<llama_pos> positions;
+  decode::segments(ctx, 0, 0, source, static_cast<int32_t>(llama_n_batch(ctx)),
+                   scratch, positions, [](const decode::LandedSegment &) {});
+}
+
 // ===== EMBEDDING EXTRACTION =====
 
 /**

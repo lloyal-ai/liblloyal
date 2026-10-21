@@ -11,8 +11,15 @@ static std::atomic<uintptr_t> g_model_counter{1};
 static std::atomic<uintptr_t> g_context_counter{
     1000}; // Start at different offset
 
-// Singleton memory handle (shared across all contexts for simplicity)
-static llama_memory_t g_memory_handle;
+// One memory shared by every context for simplicity; a context without
+// memory (has_memory = false) reports null, as llama.cpp's does.
+static llama_memory_i g_memory;
+
+// A stub mixed batch: the entries it was given, up to the context's n_batch.
+struct llama_batch_ext {
+    std::vector<StubBatchEntry> entries;
+    size_t capacity = 0;
+};
 
 // Capacity of every live stub batch, keyed by its token buffer, so the batch
 // struct itself stays byte-identical to llama.cpp's.
@@ -91,7 +98,7 @@ llama_context_params llama_context_default_params() {
 // ===== KV CACHE MEMORY OPERATIONS =====
 
 llama_memory_t llama_get_memory(llama_context * /*ctx*/) {
-  return g_memory_handle;
+  return g_stub_config.has_memory ? &g_memory : nullptr;
 }
 
 bool llama_memory_seq_rm(llama_memory_t /*mem*/, llama_seq_id seq,
@@ -277,6 +284,65 @@ int llama_decode(llama_context * /*ctx*/, llama_batch batch) {
 void llama_set_causal_attn(llama_context * /*ctx*/, bool causal) {
   g_stub_config.causal_attn = causal;
   g_stub_config.causal_attn_log.push_back(causal);
+}
+
+bool llama_get_causal_attn(const llama_context * /*ctx*/) {
+  return g_stub_config.causal_attn;
+}
+
+// ===== MIXED BATCH =====
+
+llama_batch_ext *llama_batch_ext_init(llama_context * /*ctx*/) {
+  auto *batch = new llama_batch_ext;
+  batch->capacity = g_stub_config.n_batch;
+  return batch;
+}
+
+void llama_batch_ext_free(llama_batch_ext *batch) { delete batch; }
+
+static int32_t add_entry(llama_batch_ext *batch, StubBatchEntry entry) {
+  if (batch->entries.size() >= batch->capacity) return -1;
+  batch->entries.push_back(std::move(entry));
+  return static_cast<int32_t>(batch->entries.size() - 1);
+}
+
+int32_t llama_batch_ext_add_token(llama_batch_ext *batch, llama_seq_id /*seq_id*/, llama_token id) {
+  StubBatchEntry entry;
+  entry.token = id;
+  return add_entry(batch, std::move(entry));
+}
+
+int32_t llama_batch_ext_add_embd(llama_batch_ext *batch, llama_seq_id /*seq_id*/, llama_embd embd) {
+  // One row per entry, as llama.cpp's set_token_embd requires.
+  if (!embd.data || embd.n_rows != 1) return -2;
+  StubBatchEntry entry;
+  entry.is_row = true;
+  entry.row.assign(embd.data, embd.data + embd.n_embd);
+  return add_entry(batch, std::move(entry));
+}
+
+bool llama_batch_ext_set_pos(llama_batch_ext *batch, int32_t idx, const llama_pos *pos) {
+  if (idx < 0 || idx >= static_cast<int32_t>(batch->entries.size()) || !pos) return false;
+  auto &entry = batch->entries[idx];
+  const int32_t n = entry.is_row ? g_stub_config.n_pos_per_embd : 1;
+  entry.pos.assign(pos, pos + n);
+  return true;
+}
+
+bool llama_batch_ext_set_output_embd(llama_batch_ext *batch, int32_t idx, bool value) {
+  if (idx < 0 || idx >= static_cast<int32_t>(batch->entries.size())) return false;
+  batch->entries[idx].output = value;
+  return true;
+}
+
+bool llama_batch_ext_set_output_logits(llama_batch_ext *batch, int32_t idx, bool value) {
+  return llama_batch_ext_set_output_embd(batch, idx, value);
+}
+
+int32_t llama_process(llama_context * /*ctx*/, enum llama_process_type /*type*/, llama_batch_ext *batch) {
+  ++g_stub_config.process_call_count;
+  g_stub_config.last_process_entries = batch->entries;
+  return g_stub_config.process_result;
 }
 
 // ===== TOKENIZATION OPERATIONS =====

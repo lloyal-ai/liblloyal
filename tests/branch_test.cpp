@@ -1607,9 +1607,14 @@ struct TestSource : lloyal::decode::SegmentSource {
     return n;
   }
   lloyal::decode::Segment at(size_t i) override { return segs[i]; }
-  void positions(size_t, llama_pos, llama_pos* out) override {
+  /// Plain positions, base onward, in every section: what a model without
+  /// M-RoPE gives its rows.
+  void positions(size_t i, llama_pos base, llama_pos* out) override {
     positions_called = true;
-    if (out) *out = 0;  // a real source would fill n_rows * n_pos_per_embd
+    const auto& seg = segs[i];
+    for (int32_t k = 0; k < seg.n_rows * seg.n_pos_per_embd; ++k) {
+      out[k] = base + k % seg.n_rows;
+    }
   }
 };
 
@@ -1746,6 +1751,145 @@ TEST_CASE("branch: decode_segments dispatches each segment on its own, rows chun
   CHECK(llamaStubConfig().causal_attn_log.empty());  // causal rows never touch the context's mode
 
   prune(h, ts.store);
+}
+
+TEST_CASE("decode::segments places the whole stream in one dispatch on a context without memory") {
+  // An embedding model's context sees only one dispatch's entries, so a
+  // stream placed in pieces would be pooled in pieces.
+  resetStubConfig();
+  llamaStubConfig().has_memory = false;
+  llamaStubConfig().pooling_type = LLAMA_POOLING_TYPE_MEAN;
+  auto* ctx = reinterpret_cast<llama_context*>(0x1000);
+
+  llama_token lead[] = {1, 2, 3};
+  llama_token tail[] = {4, 5};
+  std::vector<float> rows = {0.1f, 0.2f, 0.3f, 0.4f};  // two rows of width 2
+  TestSource src;
+  src.segs.resize(3);
+  src.segs[0].kind = lloyal::decode::Segment::Kind::Text; src.segs[0].tokens = lead;
+  src.segs[1] = embd_seg(rows.data(), 2, 2, 2, 1);
+  src.segs[2].kind = lloyal::decode::Segment::Kind::Text; src.segs[2].tokens = tail;
+
+  lloyal::decode::Scratch scratch;
+  std::vector<llama_pos> positions;
+  std::vector<lloyal::decode::LandedSegment> landed;
+  lloyal::decode::segments(ctx, 0, 0, src, 512, scratch, positions,
+                           [&](const lloyal::decode::LandedSegment& seg) { landed.push_back(seg); });
+
+  CHECK(llamaStubConfig().process_call_count == 1);
+  CHECK(llamaStubConfig().decode_call_count == 0);
+  const auto& entries = llamaStubConfig().last_process_entries;
+  REQUIRE(entries.size() == 7);
+  // In order, positions running on across the segments, every entry output on a pooling context.
+  const std::vector<llama_token> tokens = {1, 2, 3, -1, -1, 4, 5};
+  for (size_t k = 0; k < entries.size(); ++k) {
+    CHECK(entries[k].is_row == (k == 3 || k == 4));
+    CHECK(entries[k].token == tokens[k]);
+    REQUIRE(entries[k].pos.size() == 1);
+    CHECK(entries[k].pos[0] == static_cast<llama_pos>(k));
+    CHECK(entries[k].output);
+  }
+  CHECK(entries[3].row == std::vector<float>{0.1f, 0.2f});
+  CHECK(entries[4].row == std::vector<float>{0.3f, 0.4f});
+
+  REQUIRE(landed.size() == 3);
+  CHECK(landed[0].cells == 3);
+  CHECK(landed[1].cells == 2);
+  CHECK(landed[2].cells == 2);
+  CHECK(landed.back().has_logits);
+  CHECK_FALSE(landed.front().has_logits);
+}
+
+TEST_CASE("decode::segments refuses a whole stream larger than one ubatch before anything runs") {
+  // llama.cpp aborts the process on an oversized single-ubatch dispatch, so
+  // the source's quote is checked first.
+  resetStubConfig();
+  llamaStubConfig().has_memory = false;
+  llamaStubConfig().n_ubatch = 4;
+  auto* ctx = reinterpret_cast<llama_context*>(0x1000);
+
+  llama_token text[] = {1, 2, 3, 4, 5};
+  TestSource src;
+  src.segs.resize(1);
+  src.segs[0].kind = lloyal::decode::Segment::Kind::Text; src.segs[0].tokens = text;
+
+  lloyal::decode::Scratch scratch;
+  std::vector<llama_pos> positions;
+  bool landed = false;
+  CHECK_THROWS_AS(lloyal::decode::segments(ctx, 0, 0, src, 512, scratch, positions,
+                                           [&](const lloyal::decode::LandedSegment&) { landed = true; }),
+                  std::runtime_error);
+  CHECK(llamaStubConfig().process_call_count == 0);
+  CHECK_FALSE(landed);
+}
+
+TEST_CASE("decode::segments counts what it built, not what the source quoted") {
+  // The source is untrusted: one that under-quotes its cost must still never
+  // reach a dispatch larger than one ubatch.
+  resetStubConfig();
+  llamaStubConfig().has_memory = false;
+  llamaStubConfig().n_ubatch = 4;
+  auto* ctx = reinterpret_cast<llama_context*>(0x1000);
+
+  struct UnderQuoting : TestSource {
+    size_t cells() const override { return 1; }
+  };
+  llama_token text[] = {1, 2, 3, 4, 5};
+  UnderQuoting src;
+  src.segs.resize(1);
+  src.segs[0].kind = lloyal::decode::Segment::Kind::Text; src.segs[0].tokens = text;
+
+  lloyal::decode::Scratch scratch;
+  std::vector<llama_pos> positions;
+  CHECK_THROWS_AS(lloyal::decode::segments(ctx, 0, 0, src, 512, scratch, positions,
+                                           [](const lloyal::decode::LandedSegment&) {}),
+                  std::runtime_error);
+  CHECK(llamaStubConfig().process_call_count == 0);
+}
+
+TEST_CASE("decode::segments refuses a bidirectional segment on a causal context that keeps memory") {
+  // Pooling makes this context read whole, but its causal mode is
+  // context-wide: a bidirectional block cannot ride inside its mixed batch.
+  resetStubConfig();
+  llamaStubConfig().pooling_type = LLAMA_POOLING_TYPE_LAST;
+  auto* ctx = reinterpret_cast<llama_context*>(0x1000);
+
+  std::vector<float> rows(4, 0.5f);
+  TestSource src;
+  src.segs = {embd_seg(rows.data(), 2, 2, 2, 1)};
+  src.segs[0].non_causal = true;
+
+  lloyal::decode::Scratch scratch;
+  std::vector<llama_pos> positions;
+  CHECK_THROWS_AS(lloyal::decode::segments(ctx, 0, 0, src, 512, scratch, positions,
+                                           [](const lloyal::decode::LandedSegment&) {}),
+                  std::runtime_error);
+  CHECK(llamaStubConfig().process_call_count == 0);
+}
+
+TEST_CASE("decode::segments reports a model that cannot mix as a DecodeError") {
+  resetStubConfig();
+  llamaStubConfig().has_memory = false;
+  llamaStubConfig().process_result = -1;  // llama.cpp's answer for a model that cannot mix
+  auto* ctx = reinterpret_cast<llama_context*>(0x1000);
+
+  llama_token text[] = {1, 2};
+  TestSource src;
+  src.segs.resize(1);
+  src.segs[0].kind = lloyal::decode::Segment::Kind::Text; src.segs[0].tokens = text;
+
+  lloyal::decode::Scratch scratch;
+  std::vector<llama_pos> positions;
+  bool threw = false;
+  try {
+    lloyal::decode::segments(ctx, 0, 0, src, 512, scratch, positions,
+                             [](const lloyal::decode::LandedSegment&) {});
+  } catch (const lloyal::decode::DecodeError& e) {
+    threw = true;
+    CHECK(e.rc == -1);
+    CHECK_FALSE(e.partial);
+  }
+  CHECK(threw);
 }
 
 TEST_CASE("branch: decode_segments rejects an empty segment") {
