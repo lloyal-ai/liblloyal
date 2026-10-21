@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <memory>
 #include <span>
 #include <string>
@@ -40,24 +41,30 @@ struct MtmdDeleter {
 };
 
 /**
- * The projector named by LLAMA_MMPROJ_MODEL, loaded once for the process. A
- * projector is hundreds of megabytes and init runs a warmup encode. Mirrors
- * acquire_test_model(); constructed after the model, so it is destroyed before
- * it (mtmd holds a borrowed llama_model*).
+ * The projector named by LLAMA_MMPROJ_MODEL, loaded once for the process per
+ * image budget. A projector is hundreds of megabytes and init runs a warmup
+ * encode. Mirrors acquire_test_model(); constructed after the model, so it is
+ * destroyed before it (mtmd holds a borrowed llama_model*).
+ *
+ * `image_tokens` pins both ends of the projector's image budget, as llama.cpp's
+ * --image-min-tokens and --image-max-tokens do; 0 keeps the projector's own.
  */
-inline mtmd_context* acquire_mtmd(const llama_model* model) {
-  static std::unique_ptr<mtmd_context, MtmdDeleter> cached;
-  if (!cached) {
+inline mtmd_context* acquire_mtmd(const llama_model* model, int32_t image_tokens = 0) {
+  static std::map<int32_t, std::unique_ptr<mtmd_context, MtmdDeleter>> cached;
+  auto& slot = cached[image_tokens];
+  if (!slot) {
     const char* path = std::getenv("LLAMA_MMPROJ_MODEL");
     if (!path || !*path) return nullptr;
     auto p = mtmd_context_params_default();
-    p.use_gpu        = n_gpu_layers() != 0;
-    p.print_timings  = false;
-    p.n_threads      = 4;
-    p.warmup         = false;  // each media case executes the encoder
-    cached.reset(mtmd_init_from_file(path, model, p));
+    p.use_gpu          = n_gpu_layers() != 0;
+    p.print_timings    = false;
+    p.n_threads        = 4;
+    p.warmup           = false;  // each media case executes the encoder
+    p.image_min_tokens = image_tokens > 0 ? image_tokens : p.image_min_tokens;
+    p.image_max_tokens = image_tokens > 0 ? image_tokens : p.image_max_tokens;
+    slot.reset(mtmd_init_from_file(path, model, p));
   }
-  return cached.get();
+  return slot.get();
 }
 
 /** The committed clip's 16 frames, sampled at 4 per second (fixtures/video). */
