@@ -1370,6 +1370,32 @@ TEST_CASE("multimodal: a video crossing its timestamp interval is stamped after 
   }
 }
 
+TEST_CASE("multimodal: a window cut from the middle of a clip is laid out as the clip's start is") {
+  REQUIRE_VL();
+  LlamaBackendGuard guard;
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+  mtmd_context* mtmd = acquire_mtmd(model.get());
+  REQUIRE(mtmd);
+  const auto* vocab = llama_model_get_vocab(model.get());
+
+  // The same 16 frames, 250 ms apart, once from the start and once as a window
+  // seven minutes in. Thresholds run from the first frame, so the window fuses
+  // as the start does and its one stamp carries its own time.
+  Clip start;
+  auto from_start = video_source(mtmd, model.get(), mtmd_default_marker(), start);
+  const auto expected = read_layout(from_start, vocab);
+
+  Clip window;
+  for (auto& t : window.timestamps_ms) t += 7 * 60 * 1000;
+  auto from_window = video_source(mtmd, model.get(), mtmd_default_marker(), window);
+  const auto layout = read_layout(from_window, vocab);
+  INFO("layout: " << layout.text);
+  CHECK(layout.media_chunks == expected.media_chunks);
+  CHECK(layout.text.find("<frames><|vision_end|>[7m0.00s]") != std::string::npos);
+  CHECK(layout.text.find("[7m0.25s]") == std::string::npos);
+}
+
 TEST_CASE("multimodal: frames sampled farther apart than the interval are each stamped, so none fuse") {
   REQUIRE_VL();
   LlamaBackendGuard guard;

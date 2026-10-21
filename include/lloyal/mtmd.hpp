@@ -85,8 +85,10 @@ struct VideoNote {
  *
  * Laid out as llama.cpp's video helper lays out a decoded clip: "Video:", every
  * frame mergeable, and a "[XmY.YYs]" timestamp after the frame that crosses
- * each `timestamp_interval_ms` (0 disables them). A note joins the first
- * timestamp at or after its time; notes past the last one close the video.
+ * each `timestamp_interval_ms` (0 disables them). Intervals are counted from
+ * the first frame's time, so a window cut from a clip's middle is laid out as
+ * the clip's start is. A note joins the first timestamp at or after its time;
+ * notes past the last one close the video.
  * Notes only join timestamp text the layout already has, so they add no text
  * between frames and leave temporal fusion unchanged.
  */
@@ -250,8 +252,10 @@ inline VideoLayout video_layout(std::vector<::mtmd::bitmap_ptr> frames, const Vi
 
   VideoLayout layout;
   layout.parts.push_back({nullptr, "Video:"});
-  // The next threshold, or none once it would lie past any time an int64 can hold.
-  std::optional<int64_t> next_timestamp_ms = video.timestamp_interval_ms > 0 ? std::optional<int64_t>{0} : std::nullopt;
+  // The next threshold, counted from the first frame (see VideoFrames), or none
+  // once it would lie past any time an int64 can hold.
+  std::optional<int64_t> next_timestamp_ms =
+      video.timestamp_interval_ms > 0 ? std::optional<int64_t>{video.timestamps_ms.front()} : std::nullopt;
   for (size_t i = 0; i < frames.size(); ++i) {
     layout.parts.push_back({std::move(frames[i]), {}});
     const int64_t t = video.timestamps_ms[i];
