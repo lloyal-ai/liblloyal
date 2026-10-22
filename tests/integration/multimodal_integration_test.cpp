@@ -569,6 +569,27 @@ TEST_CASE("multimodal: MtmdSource rejects bad input") {
   }
 }
 
+// An empty prompt with no media, no separator and no special tokens tokenizes
+// to no chunks at all. The source is still a valid, empty stream.
+TEST_CASE("multimodal: an empty stream maps no inputs") {
+  REQUIRE_VL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+  mtmd_context* mtmd = acquire_mtmd(model.get());
+  REQUIRE(mtmd);
+
+  std::vector<std::vector<uint8_t>> none;
+  MtmdSource empty(mtmd, "", none, std::span<const llama_token>(),
+                   llama_model_n_embd_inp(model.get()));
+
+  CHECK(empty.size() == 0);
+  CHECK(empty.cells() == 0);
+  CHECK(empty.input_of(0) == -1);
+  CHECK(empty.total_of(0) == 0);
+}
+
 // ============================================================================
 // cells() is a SegmentSource contract, not an MtmdSource extra. An admission
 // gate holds the base reference — it knows it has segments to place, not that

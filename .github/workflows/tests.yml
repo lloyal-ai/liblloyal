@@ -472,7 +472,7 @@ jobs:
       run: |
         set -o pipefail
         ./build_asan/IntegrationRunner --success \
-          --test-case="fast forward:*,decode failure:*,multimodal: a fast-forwarded*,multimodal: a cohort*,multimodal: a prepared video*,multimodal: an image then a video*" \
+          --test-case="fast forward:*,decode failure:*,multimodal: a fast-forwarded*,multimodal: a cohort*,multimodal: a prepared video*,multimodal: an image then a video*,multimodal: an empty stream*" \
           2>&1 | tee asan_qwen.txt
         if ! grep -qE 'test cases:.*\| +[1-9][0-9]* passed \| +0 failed \|' asan_qwen.txt; then
           echo "::error::No passing cases were reported"
