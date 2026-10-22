@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <doctest/doctest.h>
+#include "media_fixtures.hpp"
 #include "test_config.hpp"
 #include <llama/llama.h>
 #include <lloyal/branch.hpp>
@@ -75,44 +76,8 @@ struct TestParams {
 // Fixtures
 // ============================================================================
 
-static std::vector<uint8_t> read_fixture(const char* name) {
-  const std::string path = std::string(LLOYAL_TEST_FIXTURES_DIR) + "/" + name;
-  std::vector<uint8_t> bytes;
-  FILE* f = std::fopen(path.c_str(), "rb");
-  if (!f) return bytes;
-  std::fseek(f, 0, SEEK_END);
-  const long n = std::ftell(f);
-  std::fseek(f, 0, SEEK_SET);
-  if (n > 0) {
-    bytes.resize(static_cast<size_t>(n));
-    if (std::fread(bytes.data(), 1, bytes.size(), f) != bytes.size()) bytes.clear();
-  }
-  std::fclose(f);
-  return bytes;
-}
-
-/**
- * Shared mtmd context — the projector is ~700 MB and init runs a warmup
- * encode, so it is loaded once for the suite. Mirrors acquire_test_model();
- * constructed after the model, so it is destroyed before it (mtmd holds a
- * borrowed llama_model*).
- */
-struct MtmdDeleter {
-  void operator()(mtmd_context* c) const { if (c) mtmd_free(c); }
-};
-
-static mtmd_context* acquire_mtmd(const llama_model* model) {
-  static std::unique_ptr<mtmd_context, MtmdDeleter> cached;
-  if (!cached) {
-    auto p = mtmd_context_params_default();
-    p.use_gpu        = TestConfig::n_gpu_layers() != 0;
-    p.print_timings  = false;
-    p.n_threads      = 4;
-    p.warmup         = false;  // each media case executes the encoder
-    cached.reset(mtmd_init_from_file(MMPROJ_PATH, model, p));
-  }
-  return cached.get();
-}
+using TestConfig::acquire_mtmd;
+using TestConfig::read_fixture;
 
 /// The user turn carrying the image, as a media_marker content part.
 static std::string image_prompt(const llama_model* model, const std::string& ask) {
@@ -602,6 +567,27 @@ TEST_CASE("multimodal: MtmdSource rejects bad input") {
     CHECK(seg.kind == decode::Segment::Kind::Text);
     CHECK(seg.tokens.size() == sep.size());
   }
+}
+
+// An empty prompt with no media, no separator and no special tokens tokenizes
+// to no chunks at all. The source is still a valid, empty stream.
+TEST_CASE("multimodal: an empty stream maps no inputs") {
+  REQUIRE_VL();
+  LlamaBackendGuard guard;
+
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+  mtmd_context* mtmd = acquire_mtmd(model.get());
+  REQUIRE(mtmd);
+
+  std::vector<std::vector<uint8_t>> none;
+  MtmdSource empty(mtmd, "", none, std::span<const llama_token>(),
+                   llama_model_n_embd_inp(model.get()));
+
+  CHECK(empty.size() == 0);
+  CHECK(empty.cells() == 0);
+  CHECK(empty.input_of(0) == -1);
+  CHECK(empty.total_of(0) == 0);
 }
 
 // ============================================================================
@@ -1232,36 +1218,7 @@ TEST_CASE("audio: position overflow is refused before filling decoder positions"
 // in pairs; still images never fuse.
 // ============================================================================
 
-static std::vector<std::vector<uint8_t>> video_frames() {
-  std::vector<std::vector<uint8_t>> frames;
-  for (int i = 0; i < 16; ++i) {
-    char name[32];
-    std::snprintf(name, sizeof name, "video/frame-%02d.png", i);
-    frames.push_back(read_fixture(name));
-    REQUIRE_MESSAGE(!frames.back().empty(), "fixtures/video frames missing");
-  }
-  return frames;
-}
-
-/// Borrowed views over sampled frames, in the shape MediaInput::Kind::Video takes.
-struct Clip {
-  std::vector<std::vector<uint8_t>> bytes = video_frames();
-  std::vector<std::span<const uint8_t>> frames;
-  std::vector<int64_t> timestamps_ms;
-  std::vector<VideoNote> notes;
-
-  explicit Clip(int64_t frame_ms = 250) {
-    for (size_t i = 0; i < bytes.size(); ++i) {
-      frames.emplace_back(bytes[i]);
-      timestamps_ms.push_back(static_cast<int64_t>(i) * frame_ms);
-    }
-  }
-
-  MediaInput input(int64_t interval_ms = 5000) const {
-    return MediaInput{MediaInput::Kind::Video, {},
-                      VideoFrames{frames, timestamps_ms, interval_ms, notes}};
-  }
-};
+using TestConfig::Clip;
 
 static MtmdSource video_source(mtmd_context* mtmd, const llama_model* model,
                                const std::string& prompt, const Clip& clip) {
@@ -1434,6 +1391,32 @@ TEST_CASE("multimodal: a video crossing its timestamp interval is stamped after 
   }
 }
 
+TEST_CASE("multimodal: a window cut from the middle of a clip is laid out as the clip's start is") {
+  REQUIRE_VL();
+  LlamaBackendGuard guard;
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+  mtmd_context* mtmd = acquire_mtmd(model.get());
+  REQUIRE(mtmd);
+  const auto* vocab = llama_model_get_vocab(model.get());
+
+  // The same 16 frames, 250 ms apart, once from the start and once as a window
+  // seven minutes in. Thresholds run from the first frame, so the window fuses
+  // as the start does and its one stamp carries its own time.
+  Clip start;
+  auto from_start = video_source(mtmd, model.get(), mtmd_default_marker(), start);
+  const auto expected = read_layout(from_start, vocab);
+
+  Clip window;
+  for (auto& t : window.timestamps_ms) t += 7 * 60 * 1000;
+  auto from_window = video_source(mtmd, model.get(), mtmd_default_marker(), window);
+  const auto layout = read_layout(from_window, vocab);
+  INFO("layout: " << layout.text);
+  CHECK(layout.media_chunks == expected.media_chunks);
+  CHECK(layout.text.find("<frames><|vision_end|>[7m0.00s]") != std::string::npos);
+  CHECK(layout.text.find("[7m0.25s]") == std::string::npos);
+}
+
 TEST_CASE("multimodal: frames sampled farther apart than the interval are each stamped, so none fuse") {
   REQUIRE_VL();
   LlamaBackendGuard guard;
@@ -1473,6 +1456,61 @@ TEST_CASE("multimodal: no timestamp follows a frame past the last threshold time
   size_t stamps = 0;
   for (size_t at = layout.text.find("<|vision_end|>["); at != std::string::npos; at = layout.text.find("<|vision_end|>[", at + 1)) ++stamps;
   CHECK(stamps == 2);
+}
+
+TEST_CASE("multimodal: an image then a video report their progress in order, each to its own total") {
+  REQUIRE_VL();
+  LlamaBackendGuard guard;
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+  mtmd_context* mtmd = acquire_mtmd(model.get());
+  REQUIRE(mtmd);
+
+  llama_context_params cparams = llama_context_default_params();
+  cparams.n_ctx = 4096;
+  cparams.n_batch = 512;
+  cparams.n_seq_max = 4;
+  cparams.kv_unified = true;  // as lloyal.node creates every context: one KV the branches share
+  llama_context* ctx = llama_init_from_model(model.get(), cparams);
+  REQUIRE(ctx);
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+  TestParams params;
+  BranchHandle h = create(ctx, model.get(), store, 0, params, 512);
+  REQUIRE(h != INVALID_HANDLE);
+
+  const auto image = read_fixture("cat.jpg");
+  REQUIRE_FALSE(image.empty());
+  Clip clip;
+  const std::array media{MediaInput{MediaInput::Kind::Image, image}, clip.input()};
+  const std::string marker = mtmd_default_marker();
+  MtmdSource source(mtmd, "Compare these.\n" + marker + "\n" + marker, media, {},
+                    llama_model_n_embd_inp(model.get()), {});
+
+  std::vector<decode::SegmentProgress> seen;
+  const auto r = store.decode_segments(h, source, [&](const decode::SegmentProgress& p) { seen.push_back(p); });
+
+  // In order: every report of the image before any of the video, each running
+  // up to its own total, and the inputs plus the prompt's own text are the cost.
+  REQUIRE_FALSE(seen.empty());
+  CHECK(seen.front().input == 0);
+  CHECK(seen.back().input == 1);
+  const auto first_video = std::find_if(seen.begin(), seen.end(), [](const auto& p) { return p.input == 1; });
+  CHECK(std::all_of(first_video, seen.end(), [](const auto& p) { return p.input == 1; }));
+  size_t totals = 0;
+  for (const int32_t input : {0, 1}) {
+    const auto last = std::find_if(seen.rbegin(), seen.rend(), [&](const auto& p) { return p.input == input; });
+    REQUIRE(last != seen.rend());
+    CHECK(last->landed == last->total);
+    CHECK(last->total == source.total_of(input));
+    totals += last->total;
+  }
+  CHECK(totals > 0);
+  CHECK(totals < static_cast<size_t>(r.cells));  // the prompt's own text belongs to neither
+
+  prune(h, store);
+  store.drain();
+  llama_free(ctx);
 }
 
 TEST_CASE("multimodal: a video answers grounded on motion") {

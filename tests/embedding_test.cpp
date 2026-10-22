@@ -1,4 +1,5 @@
 #include "llama_stubs.h"
+#include <algorithm>
 #include <cmath>
 #include <doctest/doctest.h>
 #include <lloyal/embedding.hpp>
@@ -199,6 +200,33 @@ TEST_CASE("Embedding: get_ith - returns embeddings for token index") {
   CHECK(emb[1] == doctest::Approx(0.5f));
 }
 
+// ===== OUTPUT WIDTH =====
+// A model whose output head differs from its hidden width (EmbeddingGemma 2:
+// 768 out of a narrower backbone) is read at the width it outputs.
+
+TEST_CASE("Embedding: dimension - is the model's output width") {
+  resetStubConfig();
+  llamaStubConfig().n_embd = 2;
+  llamaStubConfig().n_embd_out = 3;
+
+  llama_model model{};
+  CHECK(dimension(&model) == 3);
+}
+
+TEST_CASE("Embedding: get, get_seq and get_ith - read the output width") {
+  resetStubConfig();
+  llamaStubConfig().n_embd = 2;
+  llamaStubConfig().n_embd_out = 3;
+  llamaStubConfig().pooling_type = LLAMA_POOLING_TYPE_MEAN;
+  llamaStubConfig().embeddings_available = true;
+  llamaStubConfig().embeddings = {1.0f, 2.0f, 3.0f};
+
+  llama_context ctx{};
+  CHECK(get(&ctx, Normalize::None).size() == 3);
+  CHECK(get_seq(&ctx, 0, Normalize::None).size() == 3);
+  CHECK(get_ith(&ctx, 0, Normalize::None).size() == 3);
+}
+
 // ===== COSINE SIMILARITY =====
 
 TEST_CASE("Embedding: cosine_similarity - identical vectors return 1.0") {
@@ -249,4 +277,55 @@ TEST_CASE("Embedding: cosine_similarity - normalized vectors") {
 
   float sim = cosine_similarity(a, b);
   CHECK(sim == doctest::Approx(0.5f).epsilon(0.001));
+}
+
+// ===== ENCODE ON THE RAIL =====
+
+TEST_CASE("Embedding: encode refuses a context that would read an input in pieces") {
+  // A model that keeps memory and attends causally, with pooling NONE, is
+  // placed a segment at a time; an embedding reads every entry of one
+  // dispatch, so it is refused before anything runs.
+  resetStubConfig();
+  llamaStubConfig().pooling_type = LLAMA_POOLING_TYPE_NONE;
+  llama_context ctx{};
+  const std::vector<llama_token> tokens = {1, 2, 3};
+
+  CHECK_THROWS_AS(encode(&ctx, tokens, 512), std::runtime_error);
+  CHECK(llamaStubConfig().decode_call_count == 0);
+  CHECK(llamaStubConfig().process_call_count == 0);
+}
+
+TEST_CASE("Embedding: encode places a text in one dispatch, every output read") {
+  resetStubConfig();
+  llamaStubConfig().has_memory = false;
+  llamaStubConfig().pooling_type = LLAMA_POOLING_TYPE_MEAN;
+  llama_context ctx{};
+  const std::vector<llama_token> tokens = {1, 2, 3};
+
+  encode(&ctx, tokens, 512);
+
+  CHECK(llamaStubConfig().process_call_count == 1);
+  const auto& entries = llamaStubConfig().last_process_entries;
+  REQUIRE(entries.size() == 3);
+  for (size_t k = 0; k < entries.size(); ++k) {
+    CHECK(entries[k].token == tokens[k]);
+    CHECK(entries[k].pos == std::vector<llama_pos>{static_cast<llama_pos>(k)});
+    CHECK(entries[k].output);
+  }
+}
+
+TEST_CASE("Embedding: encode reads every token of a context without pooling") {
+  // Per-token embeddings from an encoder model: no pooling, no memory, so the
+  // stream is placed whole and every entry's output is on, as before the rail.
+  resetStubConfig();
+  llamaStubConfig().has_memory = false;
+  llamaStubConfig().pooling_type = LLAMA_POOLING_TYPE_NONE;
+  llama_context ctx{};
+  const std::vector<llama_token> tokens = {1, 2, 3};
+
+  encode(&ctx, tokens, 512);
+
+  const auto& entries = llamaStubConfig().last_process_entries;
+  REQUIRE(entries.size() == 3);
+  CHECK(std::all_of(entries.begin(), entries.end(), [](const StubBatchEntry& e) { return e.output; }));
 }

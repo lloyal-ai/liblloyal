@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <llama/llama.h>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
@@ -53,26 +54,9 @@ enum class Normalize : int32_t {
 // ===== MODEL CAPABILITY CHECKS =====
 
 /**
- * Check if model supports embeddings
- *
- * @param model Llama model
- * @return true if model has non-zero embedding dimension
- *
- * NOTE: This checks dimension only. For proper embeddings, the context
- * must also be created with pooling enabled (LLAMA_POOLING_TYPE_MEAN, etc.)
- */
-inline bool has_embeddings(const llama_model *model) {
-  if (!model) {
-    LLOYAL_LOG_DEBUG("[embedding::has_embeddings] ERROR: model is null");
-    return false;
-  }
-
-  int32_t n_embd = llama_model_n_embd(model);
-  return n_embd > 0;
-}
-
-/**
- * Get embedding dimension for model
+ * Get embedding dimension for model: the width the model outputs, which a
+ * model with its own output head (EmbeddingGemma 2) reports apart from its
+ * hidden width. Every reader below takes the width from here.
  *
  * @param model Llama model
  * @return Embedding dimension (e.g., 384, 768, 1024, 4096)
@@ -83,7 +67,20 @@ inline int32_t dimension(const llama_model *model) {
     return 0;
   }
 
-  return llama_model_n_embd(model);
+  return llama_model_n_embd_out(model);
+}
+
+/**
+ * Check if model supports embeddings
+ *
+ * @param model Llama model
+ * @return true if model has non-zero embedding dimension
+ *
+ * NOTE: This checks dimension only. For proper embeddings, the context
+ * must also be created with pooling enabled (LLAMA_POOLING_TYPE_MEAN, etc.)
+ */
+inline bool has_embeddings(const llama_model *model) {
+  return dimension(model) > 0;
 }
 
 // ===== CONTEXT CAPABILITY CHECKS =====
@@ -159,30 +156,50 @@ inline void apply_l2_normalize(std::vector<float> &vec) {
 
 } // namespace detail
 
-// ===== RAII GUARD FOR BATCH CLEANUP =====
-
-namespace detail {
-/**
- * RAII guard for automatic batch cleanup
- * Ensures llama_batch_free is called even if exceptions occur
- */
-struct BatchGuard {
-  llama_batch &batch;
-  explicit BatchGuard(llama_batch &b) : batch(b) {}
-  ~BatchGuard() { llama_batch_free(batch); }
-};
-} // namespace detail
-
 // ===== ENCODING (FORWARD PASS FOR EMBEDDINGS) =====
 
 /**
- * Encode tokens for embedding extraction
+ * Encode a whole input for embeddings: text, media, or both, as one stream
  *
- * Unlike decode::many(), this marks ALL tokens with logits=true which is
- * required for embedding extraction.
+ * The input is a segment stream (an `MtmdSource` built with `add_special`,
+ * for the model's own BOS and EOS; a `decode::TokenSource` for text), placed
+ * by the segments rail at sequence 0 from position 0, in one dispatch. Read
+ * the vector with `get()` afterwards.
  *
- * NOTE: Use this with a dedicated embedding context (embeddings=true, pooling
- * enabled). Clear KV between texts with kv::clear_all():
+ * **The context must read the input whole**: pooled, or without memory, or
+ * with attention that is not causal (see `decode::StreamReading::whole`).
+ * An embedding reads every entry of one dispatch, and the rail places a
+ * stream a segment at a time on any other context, so one is refused: a model
+ * that keeps memory and attends causally, created with embeddings on and
+ * pooling NONE. Per-token embeddings from such a context are not supported;
+ * give it a pooling type, or use an embedding model.
+ *
+ * @param ctx    Embedding context (embeddings=true; pooled, or a model without memory)
+ * @param source The input's segments
+ * @throws std::runtime_error if the context would read the input in pieces,
+ *         or the input is malformed or does not fit one dispatch
+ * @throws decode::DecodeError if the dispatch fails
+ */
+inline void encode(llama_context *ctx, decode::SegmentSource &source) {
+  if (!ctx) {
+    throw std::runtime_error("embedding::encode - NULL context");
+  }
+  if (!decode::reading_of(ctx).whole()) {
+    throw std::runtime_error(
+        "embedding::encode - this context keeps memory, attends causally and "
+        "does not pool, so it would read an input in pieces; give it a pooling "
+        "type, or use an embedding model");
+  }
+  decode::Scratch scratch;
+  std::vector<llama_pos> positions;
+  decode::segments(ctx, 0, 0, source, static_cast<int32_t>(llama_n_batch(ctx)),
+                   scratch, positions, [](const decode::LandedSegment &) {});
+}
+
+/**
+ * Encode tokens for embedding extraction: the text as a one-segment stream
+ * through encode(ctx, source), so every token's output is read from one
+ * dispatch. The same constraint on the context applies.
  *
  *   // Create dedicated embedding context
  *   ctx_params.embeddings = true;
@@ -194,53 +211,25 @@ struct BatchGuard {
  *   embedding::encode(embed_ctx, tokens, 512);
  *   auto emb = embedding::get(embed_ctx);
  *
- * @param ctx Llama context (must have embeddings=true and pooling enabled)
+ * @param ctx Llama context (embeddings=true; pooled, or a model without memory)
  * @param tokens Token array to encode
  * @param n_tokens Number of tokens in array
- * @param n_batch Batch size
- * @throws std::runtime_error if encode fails
+ * @param n_batch Most tokens one text may take; a longer text is refused, never truncated
+ * @throws std::runtime_error if the text does not fit or the context would read it in pieces
+ * @throws decode::DecodeError if the dispatch fails
  */
 inline void encode(llama_context *ctx, const llama_token *tokens,
                    int32_t n_tokens, int32_t n_batch) {
-  LLOYAL_LOG_DEBUG("[embedding::encode] Encoding %d tokens for embeddings",
-                   n_tokens);
-
-  if (!ctx) {
-    LLOYAL_LOG_DEBUG("[embedding::encode] ERROR: NULL context");
-    throw std::runtime_error("embedding::encode - NULL context");
-  }
-
   if (!tokens || n_tokens <= 0) {
-    LLOYAL_LOG_DEBUG("[embedding::encode] ERROR: Invalid token array");
     throw std::runtime_error("embedding::encode - Invalid token array");
   }
-
   if (n_tokens > n_batch) {
-    LLOYAL_LOG_DEBUG("[embedding::encode] ERROR: n_tokens (%d) > n_batch (%d)",
-                     n_tokens, n_batch);
     throw std::runtime_error(
         "embedding::encode - token count exceeds batch size (truncation not "
         "supported, increase n_batch or reduce input length)");
   }
-
-  // Initialize batch - single sequence
-  llama_batch batch = llama_batch_init(n_batch, 0, 1);
-  detail::BatchGuard batch_guard(batch);
-
-  decode::detail::batch_clear(batch);
-
-  // Add ALL tokens with logits=true (required for embedding extraction)
-  for (int32_t i = 0; i < n_tokens; ++i) {
-    decode::detail::batch_add(batch, tokens[i], i, 0, true);
-  }
-
-  // Decode/encode the batch (llama.cpp handles encoder vs decoder internally)
-  if (llama_decode(ctx, batch) != 0) {
-    LLOYAL_LOG_DEBUG("[embedding::encode] ERROR: llama_decode failed");
-    throw std::runtime_error("embedding::encode - llama_decode failed");
-  }
-
-  LLOYAL_LOG_DEBUG("[embedding::encode] Encode complete");
+  decode::TokenSource source(std::span<const llama_token>(tokens, static_cast<size_t>(n_tokens)));
+  encode(ctx, source);
 }
 
 /**
@@ -311,7 +300,7 @@ inline std::vector<float> get(llama_context *ctx,
   }
 
   // Copy to vector
-  int32_t n_embd = llama_model_n_embd(model);
+  int32_t n_embd = dimension(model);
   std::vector<float> embeddings(embd_ptr, embd_ptr + n_embd);
 
   // Apply normalization
@@ -370,7 +359,7 @@ inline std::vector<float> get_seq(llama_context *ctx, llama_seq_id seq,
     throw std::runtime_error("embedding::get_seq: embeddings unavailable");
   }
 
-  int32_t n_embd = llama_model_n_embd(model);
+  int32_t n_embd = dimension(model);
   std::vector<float> embeddings(embd_ptr, embd_ptr + n_embd);
 
   if (normalize == Normalize::L2) {
@@ -418,7 +407,7 @@ inline std::vector<float> get_ith(llama_context *ctx, int32_t idx,
     throw std::runtime_error("embedding::get_ith: embeddings unavailable");
   }
 
-  int32_t n_embd = llama_model_n_embd(model);
+  int32_t n_embd = dimension(model);
   std::vector<float> embeddings(embd_ptr, embd_ptr + n_embd);
 
   if (normalize == Normalize::L2) {

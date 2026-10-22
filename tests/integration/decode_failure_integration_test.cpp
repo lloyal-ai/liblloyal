@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <doctest/doctest.h>
+#include "media_fixtures.hpp"
 #include "test_config.hpp"
 #include <llama/llama.h>
 #include <lloyal/branch.hpp>
@@ -428,25 +429,7 @@ TEST_CASE("decode failure: a repeated handle is refused before anything is dispa
 // Embedding rail — a real projector, rows chunked by the branch's n_batch
 // ============================================================================
 
-static std::vector<uint8_t> read_fixture(const char* name) {
-  const std::string path = std::string(LLOYAL_TEST_FIXTURES_DIR) + "/" + name;
-  std::vector<uint8_t> bytes;
-  FILE* f = std::fopen(path.c_str(), "rb");
-  if (!f) return bytes;
-  std::fseek(f, 0, SEEK_END);
-  const long n = std::ftell(f);
-  std::fseek(f, 0, SEEK_SET);
-  if (n > 0) {
-    bytes.resize(static_cast<size_t>(n));
-    if (std::fread(bytes.data(), 1, bytes.size(), f) != bytes.size()) bytes.clear();
-  }
-  std::fclose(f);
-  return bytes;
-}
-
-struct MtmdDeleter {
-  void operator()(mtmd_context* c) const { if (c) mtmd_free(c); }
-};
+using TestConfig::read_fixture;
 
 static std::string image_prompt(const llama_model* model) {
   chat_in::FormatInputs in;
@@ -465,12 +448,7 @@ TEST_CASE("decode failure: an image whose rows outrun the KV reports partial on 
   auto model = TestConfig::acquire_test_model();
   REQUIRE(model);
 
-  auto mp = mtmd_context_params_default();
-  mp.use_gpu       = TestConfig::n_gpu_layers() != 0;
-  mp.print_timings = false;
-  mp.n_threads     = 4;
-  mp.warmup        = false;
-  std::unique_ptr<mtmd_context, MtmdDeleter> mtmd(mtmd_init_from_file(MMPROJ_PATH, model.get(), mp));
+  auto* mtmd = TestConfig::acquire_mtmd(model.get());
   REQUIRE(mtmd);
 
   const auto image = read_fixture("cat.jpg");
@@ -485,7 +463,7 @@ TEST_CASE("decode failure: an image whose rows outrun the KV reports partial on 
   int32_t text_before = 0;
   int32_t n_rows = 0;
   {
-    MtmdSource probe(mtmd.get(), prompt, images, std::span<const llama_token>(), n_embd_inp);
+    MtmdSource probe(mtmd, prompt, images, std::span<const llama_token>(), n_embd_inp);
     for (size_t i = 0; i < probe.size(); ++i) {
       const auto seg = probe.at(i);
       if (seg.kind == decode::Segment::Kind::Embd) { n_rows = seg.n_rows; break; }
@@ -520,7 +498,7 @@ TEST_CASE("decode failure: an image whose rows outrun the KV reports partial on 
   }
   REQUIRE(get_position(h, store) == fill);
 
-  MtmdSource source(mtmd.get(), prompt, images, std::span<const llama_token>(), n_embd_inp);
+  MtmdSource source(mtmd, prompt, images, std::span<const llama_token>(), n_embd_inp);
   const Caught got = attempt([&] { store.decode_segments(h, source); });
   REQUIRE(got.threw);
   CHECK(got.rc == 1);
