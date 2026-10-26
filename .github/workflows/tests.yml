@@ -6,6 +6,14 @@ on:
   pull_request:
     branches: [ main, develop ]
 
+# The CPU llama.cpp is built for: the AVX2 floor lloyal.node's Linux package
+# ships (scripts/build.js there), never -march=native. A native build compiles
+# whatever the runner offers, so a run would test kernels that never ship, and
+# its result would depend on which CPU it drew. The llama.cpp cache keys carry
+# "avx2" so a tree built for another CPU is never restored.
+env:
+  LLAMA_CPU_FLOOR: -DGGML_NATIVE=OFF -DGGML_AVX2=ON
+
 jobs:
   # Unit tests - stub-based, platform-independent (run on Linux only for speed)
   unit-tests:
@@ -113,9 +121,9 @@ jobs:
       uses: actions/cache@v4
       with:
         path: llama.cpp/build
-        key: llama-linux-${{ runner.arch }}-${{ steps.llama_version.outputs.version }}
+        key: llama-linux-avx2-${{ runner.arch }}-${{ steps.llama_version.outputs.version }}
         restore-keys: |
-          llama-linux-${{ runner.arch }}-
+          llama-linux-avx2-${{ runner.arch }}-
 
     - name: Build llama.cpp
       run: |
@@ -385,7 +393,7 @@ jobs:
       uses: actions/cache@v4
       with:
         path: llama.cpp/build-asan
-        key: llama-linux-asan-${{ runner.arch }}-${{ steps.llama_version.outputs.version }}
+        key: llama-linux-asan-avx2-${{ runner.arch }}-${{ steps.llama_version.outputs.version }}
 
     # Static archives linked straight into the runner (the plain build tree
     # tests/CMakeLists.txt accepts), every one compiled with ASan. OpenMP off:
@@ -397,6 +405,7 @@ jobs:
           -DBUILD_SHARED_LIBS=OFF \
           -DLLAMA_SANITIZE_ADDRESS=ON \
           -DGGML_OPENMP=OFF \
+          $LLAMA_CPU_FLOOR \
           -DLLAMA_BUILD_TOOLS=ON -DMTMD_VIDEO=OFF \
           -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF \
           -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_COMMON=ON -DLLAMA_CURL=OFF
