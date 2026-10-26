@@ -7,8 +7,10 @@
 #   LLAMA_DIR=llama.cpp .github/scripts/build-llama.sh
 #
 # Environment Variables:
-#   LLAMA_DIR    - Path to llama.cpp source (default: llama.cpp)
-#   LLOYAL_GPU   - GPU backend: cuda, vulkan, metal, cpu (default: auto-detect)
+#   LLAMA_DIR        - Path to llama.cpp source (default: llama.cpp)
+#   LLOYAL_GPU       - GPU backend: cuda, vulkan, metal, cpu (default: auto-detect)
+#   LLAMA_CPU_FLOOR  - CMake flags for the CPU to build for (CI sets the shipped
+#                      AVX2 floor; unset, llama.cpp builds for this machine)
 
 set -e
 
@@ -60,6 +62,7 @@ CMAKE_ARGS="$CMAKE_ARGS -DLLAMA_BUILD_SERVER=OFF"
 CMAKE_ARGS="$CMAKE_ARGS -DLLAMA_BUILD_APP=OFF"    # New in b9581+: unified binary, not needed for liblloyal
 CMAKE_ARGS="$CMAKE_ARGS -DLLAMA_BUILD_COMMON=ON"  # Required for liblloyal integration tests
 CMAKE_ARGS="$CMAKE_ARGS -DLLAMA_CURL=OFF"
+CMAKE_ARGS="$CMAKE_ARGS ${LLAMA_CPU_FLOOR:-}"
 
 # Apply Backend Flags
 METAL_ENABLED="OFF"

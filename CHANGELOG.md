@@ -5,6 +5,18 @@ All notable changes to liblloyal will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 3.2.1 - 2026-10-26
+
+- No change to the headers. CI builds llama.cpp for the AVX2 floor lloyal.node's
+  Linux package ships (`GGML_NATIVE=OFF`, `GGML_AVX2=ON`), not for whichever
+  CPU the runner has, so the integration suites test the kernels that ship and
+  give the same result on every runner. A native build on an Intel AMX runner
+  compiled llama.cpp's AMX matrix multiply, which at b11559 corrupts every
+  sequence but the first that shares a batch on Qwen3.5 (upstream
+  ggml-org/llama.cpp#29670). lloyal.node's builds don't reach that kernel: its
+  standard Linux package doesn't compile it, and its GPU pack offloads every
+  layer.
+
 ## 3.2.0 - 2026-10-26
 
 - Multimodal embedding: `embedding::encode(ctx, source)` embeds a segment
