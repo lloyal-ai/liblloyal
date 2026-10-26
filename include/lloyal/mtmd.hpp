@@ -656,7 +656,7 @@ private:
     // The nearest media chunk's input on either side of each segment.
     std::vector<int32_t> before(n, -1), after(n, -1);
     for (size_t i = 1; i < n; ++i) before[i] = media[i - 1] >= 0 ? media[i - 1] : before[i - 1];
-    for (size_t i = n; i-- > 1;) after[i - 1] = media[i] >= 0 ? media[i] : after[i];
+    for (size_t i = n; i > 1; --i) after[i - 2] = media[i - 1] >= 0 ? media[i - 1] : after[i - 1];
 
     input_of_.assign(n, -1);
     total_of_.assign(n_inputs, 0);
