@@ -1458,11 +1458,15 @@ public:
         report(seg);
       });
     } catch (const decode::DecodeError& e) {
-      // One operation to the caller: the rail marks a failure partial when an
-      // earlier segment landed or a chunk of this one did, and either leaves
-      // the branch part-way through.
-      if (!decode::leaves_branch_intact(e.rc, e.partial)) state->poison();
-      throw;
+      // One operation to the caller. The rail marks its own failures partial
+      // when an earlier segment landed or a chunk of this one did; a decode
+      // error from the source or from on_progress cannot know what landed. The
+      // branch's position does: every segment is material, so a moved position
+      // is proof the prefill is part-way through.
+      const bool moved = state->position != start_pos;
+      if (moved || !decode::leaves_branch_intact(e.rc, e.partial)) state->poison();
+      if (e.partial || !moved) throw;
+      throw e.as_partial();
     } catch (...) {
       // The source threw after a segment landed: the branch is part-way through.
       if (state->position != start_pos) state->poison();

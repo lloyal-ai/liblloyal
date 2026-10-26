@@ -159,7 +159,14 @@ struct DecodeError : std::runtime_error {
   DecodeError(int32_t rc_, bool partial_, const std::string& msg)
       : std::runtime_error(msg + " (rc=" + std::to_string(rc_) +
                            (partial_ ? ", partial)" : ")")),
-        rc(rc_), partial(partial_) {}
+        rc(rc_), partial(partial_), msg_(msg) {}
+
+  /// The same failure as an ENCLOSING operation reports it once work before
+  /// the failing call has landed — decode_segments over its segments.
+  DecodeError as_partial() const { return DecodeError(rc, true, msg_); }
+
+private:
+  std::string msg_;
 };
 
 /**
