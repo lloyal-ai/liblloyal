@@ -209,6 +209,10 @@ jobs:
           e87f176479d0855a907a41277aca2f8ee7a09523 fixtures/vision-models.sha256
         download_pair ggml-org/Qwen3-ASR-0.6B-GGUF \
           928ab958557df9aa2ef1c93e0e83c7ad0933fae2 fixtures/asr-models.sha256
+        # EmbeddingGemma 2's projector is BF16, never F16: the model card says
+        # not to run it in float16.
+        download_pair unsloth/embeddinggemma-2-GGUF \
+          031f0d4b35536f69ab3509d4893c923264fcf253 fixtures/embedding-models.sha256
 
     - name: Configure CMake for integration tests
       working-directory: tests
@@ -262,6 +266,22 @@ jobs:
           exit 1
         fi
 
+    - name: Run embedding tests (EmbeddingGemma 2)
+      working-directory: tests
+      env:
+        LLAMA_TEST_MODEL: ${{ github.workspace }}/tests/fixtures/SmolLM2-1.7B-Instruct-Q4_K_M.gguf
+        # A model whose output head is not its hidden width: 768 out of 512.
+        LLAMA_EMBED_MODEL: ${{ github.workspace }}/tests/fixtures/embeddinggemma-2-Q8_0.gguf
+        UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+      run: |
+        set -o pipefail
+        ./build_integration/IntegrationRunner --success \
+          --test-case="*Embedding*" 2>&1 | tee test_output.txt
+        if grep -qE "test cases:.*\| 0 passed \| 0 failed \|" test_output.txt; then
+          echo "::error::No tests executed — all were skipped or filtered out"
+          exit 1
+        fi
+
     - name: Run image projection tests (Qwen3.5-4B)
       working-directory: tests
       env:
@@ -306,6 +326,23 @@ jobs:
           exit 1
         fi
 
+    - name: Run multimodal embedding tests (EmbeddingGemma 2)
+      working-directory: tests
+      env:
+        LLAMA_TEST_MODEL: ${{ github.workspace }}/tests/fixtures/embeddinggemma-2-Q8_0.gguf
+        LLAMA_MMPROJ_MODEL: ${{ github.workspace }}/tests/fixtures/mmproj-BF16.gguf
+        LLAMA_N_GPU_LAYERS: "0"
+        LLOYAL_EMBED_MM_TEST: "1"
+        UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+      run: |
+        set -euo pipefail
+        ./build_integration/IntegrationRunner --success \
+          --test-case="embedding multimodal:*" 2>&1 | tee embedding_mm_output.txt
+        if ! grep -qE 'test cases:.*\| +[1-9][0-9]* passed \| +0 failed \|' embedding_mm_output.txt; then
+          echo "::error::No passing multimodal embedding cases were reported"
+          exit 1
+        fi
+
     - name: Upload test results
       if: always()
       uses: actions/upload-artifact@v4
@@ -314,6 +351,7 @@ jobs:
         path: |
           tests/build_integration/
           tests/audio_output.txt
+          tests/embedding_mm_output.txt
 
   # AddressSanitizer on real weights. The stub tier's sanitizer job never
   # touches a KV cache, a recurrent cell or llama.cpp's own allocations, and
@@ -434,7 +472,7 @@ jobs:
       run: |
         set -o pipefail
         ./build_asan/IntegrationRunner --success \
-          --test-case="fast forward:*,decode failure:*,multimodal: a fast-forwarded*,multimodal: a cohort*,multimodal: a prepared video*" \
+          --test-case="fast forward:*,decode failure:*,multimodal: a fast-forwarded*,multimodal: a cohort*,multimodal: a prepared video*,multimodal: an image then a video*,multimodal: an empty stream*" \
           2>&1 | tee asan_qwen.txt
         if ! grep -qE 'test cases:.*\| +[1-9][0-9]* passed \| +0 failed \|' asan_qwen.txt; then
           echo "::error::No passing cases were reported"

@@ -5,6 +5,42 @@ All notable changes to liblloyal will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 3.2.0 - 2026-10-26
+
+- Multimodal embedding: `embedding::encode(ctx, source)` embeds a segment
+  stream of text, images, video and audio, alone or interleaved as one input.
+  On EmbeddingGemma 2 with its projector, every input kind agrees with
+  llama.cpp's own embedding server to a cosine of 0.999 or better; the
+  reference vectors are committed in `tests/fixtures/embedding` and
+  regenerated offline by `tests/scripts/embedding_reference.sh`. Text embeds
+  through the same path as a one-segment stream (`decode::TokenSource`), with
+  the same signature as before. An empty input is refused. So is a context
+  that keeps memory, attends causally and does not pool, since an embedding
+  reads every entry of one dispatch.
+- `embedding::dimension()` reads the width the model outputs
+  (`llama_model_n_embd_out`), and every embedding reader takes the width from
+  it: EmbeddingGemma 2's vectors are 768 wide, not its backbone's 512.
+- `decode::segments` places a source's segments into one sequence, in order,
+  in the shape the context needs (`StreamReading`). A context that keeps what
+  it is given gets one dispatch per segment, so a reasoning prefill keeps its
+  dispatch shape. A context that reads its input only whole (pooled, without
+  memory, or with attention that is not causal) gets the whole stream as one
+  `llama_batch_ext` and one `llama_process`; a stream larger than one ubatch is
+  refused before anything runs. `BranchStore::decode_segments` moves the
+  branch's books as each segment lands. A decode error after a segment landed,
+  from the dispatch or from the source, is partial and poisons the branch.
+- `MtmdSource` takes `add_special`, so the caller frames a standalone media
+  input with the model's special tokens, as `tokenizer::tokenize` does for
+  text. It defaults to false, so chat callers are unchanged.
+- A video's timestamp intervals count from its first frame, so a window cut
+  from the middle of a clip fuses its frames as the clip's start does.
+- `BranchStore::decode_segments` takes an optional `on_progress`, told as each
+  segment of an input lands how much of that input is in the KV
+  (`SegmentProgress`). `SegmentSource` gains `input_of` and `total_of`,
+  defaulted so a source without inputs is unchanged.
+- `MtmdSource` maps no inputs for an empty stream, and its scan for an input's
+  neighbouring segments never steps below the first.
+
 ## 3.1.1 — 2026-10-17
 
 - An absent seed means the seed the chain has. A branch created without a seed

@@ -477,6 +477,24 @@ std::cout << "Different sentences: " << sim_different << "\n";  // ~0.3
 
 **Note:** For meaningful semantic embeddings, use dedicated embedding models like `nomic-embed-text` or `bge-small-en`. Standard LLMs work but aren't optimized for this task.
 
+**The context must read its input whole.** An embedding is read from one dispatch over the whole input, so `embedding::encode` needs a pooled context or a model without memory. A model that keeps memory and attends causally, created with `embeddings = true` and pooling NONE, is refused by name.
+
+#### Images, Video and Text Together
+
+**From:** `liblloyal/tests/integration/embedding_multimodal_integration_test.cpp`
+
+A model with a vision projector in its embedding space (EmbeddingGemma 2 and its `mmproj`) embeds an image, a clip's frames, or text around them as one input. Build an `MtmdSource` with `add_special`, so the model's own BOS and EOS frame the input as they frame text, and encode it whole:
+
+```cpp
+const std::array media{MediaInput{MediaInput::Kind::Image, image_bytes}};
+MtmdSource source(mtmd, std::string("title: none | text: a photo of ") + mtmd_default_marker(),
+                  media, {}, llama_model_n_embd_inp(model), {}, /*add_special*/ true);
+lloyal::embedding::encode(embed_ctx, source);
+auto emb = lloyal::embedding::get(embed_ctx, lloyal::embedding::Normalize::L2);
+```
+
+A video is `MediaInput::Kind::Video` with its sampled frames and their times, embedded the same way. The whole input goes in one dispatch, so it must fit the context's batch and ubatch; a larger one is refused before anything runs. Text and images land in one space: a text query with the model's search prefix finds the image or clip it describes.
+
 ---
 
 ### Multi-Sequence Operations

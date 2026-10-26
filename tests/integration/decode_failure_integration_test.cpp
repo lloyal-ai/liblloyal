@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <doctest/doctest.h>
+#include "media_fixtures.hpp"
 #include "test_config.hpp"
 #include <llama/llama.h>
 #include <lloyal/branch.hpp>
@@ -133,6 +134,17 @@ struct TextSegments : decode::SegmentSource {
     return s;
   }
   void positions(size_t, llama_pos, llama_pos*) override {}
+};
+
+/// A stream whose source fails at segment `fail_at` with a decode error of its
+/// own, as an encoder that runs a model of its own and finds no room would.
+/// The error says nothing of what the prefill landed before it.
+struct FailingSegments : TextSegments {
+  size_t fail_at = 0;
+  decode::Segment at(size_t i) override {
+    if (i == fail_at) throw decode::DecodeError(1, false, "the source's own encoder found no KV slot");
+    return TextSegments::at(i);
+  }
 };
 
 // ============================================================================
@@ -328,6 +340,71 @@ TEST_CASE("decode failure: a segment after a landed one reports partial even whe
   llama_free(ctx);
 }
 
+TEST_CASE("decode failure: a decode error from the source after a segment landed is partial, and the branch is poisoned") {
+  // The rail marks its own failures partial; a source's error cannot know
+  // what landed before it. The branch's position does: every segment is
+  // material, so a moved position is proof the prefill is part-way through.
+  REQUIRE_MODEL();
+  LlamaBackendGuard guard;
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model);
+
+  llama_context* ctx = small_ctx(model.get(), 256, 128, 2);
+  REQUIRE(ctx);
+  BranchStore store(8);
+  store.init_tenancy(ctx);
+  TestParams params;
+  const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+  const auto a = filler(50, 1000, n_vocab);
+  const auto b = filler(50, 2000, n_vocab);
+
+  // After segment 0 landed: partial, poisoned, the source's own words kept.
+  BranchHandle h = create(ctx, model.get(), store, 0, params, 128);
+  REQUIRE(h != INVALID_HANDLE);
+  FailingSegments late;
+  late.segs = {a, b};
+  late.fail_at = 1;
+  std::string said;
+  const Caught got = attempt([&] {
+    try {
+      store.decode_segments(h, late);
+    } catch (const decode::DecodeError& e) {
+      said = e.what();
+      throw;
+    }
+  });
+  REQUIRE(got.threw);
+  CHECK(got.rc == 1);
+  CHECK(got.partial == true);
+  CHECK(said.find("the source's own encoder found no KV slot") != std::string::npos);
+  CHECK(is_poisoned(h, store));
+  CHECK(get_position(h, store) == 50);
+
+  // Before anything landed: the error passes through as it was, and the
+  // branch is intact, so the same prefill lands on it.
+  BranchHandle fresh = create(ctx, model.get(), store, 0, params, 128);
+  REQUIRE(fresh != INVALID_HANDLE);
+  FailingSegments early;
+  early.segs = {a, b};
+  early.fail_at = 0;
+  const Caught got0 = attempt([&] { store.decode_segments(fresh, early); });
+  REQUIRE(got0.threw);
+  CHECK(got0.rc == 1);
+  CHECK(got0.partial == false);
+  CHECK_FALSE(is_poisoned(fresh, store));
+  CHECK(get_position(fresh, store) == 0);
+  TextSegments whole;
+  whole.segs = {a, b};
+  CHECK_NOTHROW(store.decode_segments(fresh, whole));
+  CHECK(get_position(fresh, store) == 100);
+
+  prune(h, store);
+  prune(fresh, store);
+  CHECK(store.kv_pressure().cells_used == 0);
+  store.drain();
+  llama_free(ctx);
+}
+
 TEST_CASE("decode failure: a chunk larger than the context's batch is refused, never dispatched") {
   // The pinned llama.cpp asserts n_tokens <= n_batch inside llama_decode — an
   // abort, not an rc. Chunk sizes come from the caller (a branch's n_batch,
@@ -428,25 +505,7 @@ TEST_CASE("decode failure: a repeated handle is refused before anything is dispa
 // Embedding rail — a real projector, rows chunked by the branch's n_batch
 // ============================================================================
 
-static std::vector<uint8_t> read_fixture(const char* name) {
-  const std::string path = std::string(LLOYAL_TEST_FIXTURES_DIR) + "/" + name;
-  std::vector<uint8_t> bytes;
-  FILE* f = std::fopen(path.c_str(), "rb");
-  if (!f) return bytes;
-  std::fseek(f, 0, SEEK_END);
-  const long n = std::ftell(f);
-  std::fseek(f, 0, SEEK_SET);
-  if (n > 0) {
-    bytes.resize(static_cast<size_t>(n));
-    if (std::fread(bytes.data(), 1, bytes.size(), f) != bytes.size()) bytes.clear();
-  }
-  std::fclose(f);
-  return bytes;
-}
-
-struct MtmdDeleter {
-  void operator()(mtmd_context* c) const { if (c) mtmd_free(c); }
-};
+using TestConfig::read_fixture;
 
 static std::string image_prompt(const llama_model* model) {
   chat_in::FormatInputs in;
@@ -465,12 +524,7 @@ TEST_CASE("decode failure: an image whose rows outrun the KV reports partial on 
   auto model = TestConfig::acquire_test_model();
   REQUIRE(model);
 
-  auto mp = mtmd_context_params_default();
-  mp.use_gpu       = TestConfig::n_gpu_layers() != 0;
-  mp.print_timings = false;
-  mp.n_threads     = 4;
-  mp.warmup        = false;
-  std::unique_ptr<mtmd_context, MtmdDeleter> mtmd(mtmd_init_from_file(MMPROJ_PATH, model.get(), mp));
+  auto* mtmd = TestConfig::acquire_mtmd(model.get());
   REQUIRE(mtmd);
 
   const auto image = read_fixture("cat.jpg");
@@ -485,7 +539,7 @@ TEST_CASE("decode failure: an image whose rows outrun the KV reports partial on 
   int32_t text_before = 0;
   int32_t n_rows = 0;
   {
-    MtmdSource probe(mtmd.get(), prompt, images, std::span<const llama_token>(), n_embd_inp);
+    MtmdSource probe(mtmd, prompt, images, std::span<const llama_token>(), n_embd_inp);
     for (size_t i = 0; i < probe.size(); ++i) {
       const auto seg = probe.at(i);
       if (seg.kind == decode::Segment::Kind::Embd) { n_rows = seg.n_rows; break; }
@@ -520,7 +574,7 @@ TEST_CASE("decode failure: an image whose rows outrun the KV reports partial on 
   }
   REQUIRE(get_position(h, store) == fill);
 
-  MtmdSource source(mtmd.get(), prompt, images, std::span<const llama_token>(), n_embd_inp);
+  MtmdSource source(mtmd, prompt, images, std::span<const llama_token>(), n_embd_inp);
   const Caught got = attempt([&] { store.decode_segments(h, source); });
   REQUIRE(got.threw);
   CHECK(got.rc == 1);

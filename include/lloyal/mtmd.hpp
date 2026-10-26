@@ -85,8 +85,10 @@ struct VideoNote {
  *
  * Laid out as llama.cpp's video helper lays out a decoded clip: "Video:", every
  * frame mergeable, and a "[XmY.YYs]" timestamp after the frame that crosses
- * each `timestamp_interval_ms` (0 disables them). A note joins the first
- * timestamp at or after its time; notes past the last one close the video.
+ * each `timestamp_interval_ms` (0 disables them). Intervals are counted from
+ * the first frame's time, so a window cut from a clip's middle is laid out as
+ * the clip's start is. A note joins the first timestamp at or after its time;
+ * notes past the last one close the video.
  * Notes only join timestamp text the layout already has, so they add no text
  * between frames and leave temporal fusion unchanged.
  */
@@ -250,8 +252,10 @@ inline VideoLayout video_layout(std::vector<::mtmd::bitmap_ptr> frames, const Vi
 
   VideoLayout layout;
   layout.parts.push_back({nullptr, "Video:"});
-  // The next threshold, or none once it would lie past any time an int64 can hold.
-  std::optional<int64_t> next_timestamp_ms = video.timestamp_interval_ms > 0 ? std::optional<int64_t>{0} : std::nullopt;
+  // The next threshold, counted from the first frame (see VideoFrames), or none
+  // once it would lie past any time an int64 can hold.
+  std::optional<int64_t> next_timestamp_ms =
+      video.timestamp_interval_ms > 0 ? std::optional<int64_t>{video.timestamps_ms.front()} : std::nullopt;
   for (size_t i = 0; i < frames.size(); ++i) {
     layout.parts.push_back({std::move(frames[i]), {}});
     const int64_t t = video.timestamps_ms[i];
@@ -284,12 +288,14 @@ inline std::vector<MediaInput> image_inputs(const std::vector<std::vector<uint8_
  * `"<__media__>"`) per input; mtmd splits it into interleaved text and media
  * chunks. Text chunks come back as ready token ids — never re-tokenized.
  *
- * **Tokenization flags are a parity contract, not a choice.**
- * `add_special = false` (no mid-conversation BOS — matches the text path's
- * `tokenizer::tokenize(vocab, text, false, true)`) and
- * `parse_special = true` (template specials are real tokens). Diverging here
- * puts a spurious BOS around the image and desynchronizes the KV from what
- * the model was trained to see.
+ * **Framing is the caller's, as on the text path.** `add_special` says
+ * whether the model's special tokens (a BOS) frame the prompt, as
+ * `tokenizer::tokenize(vocab, text, add_special, true)` does for text: false
+ * for a chat prompt, which already carries its template's specials (a BOS
+ * there sits mid-conversation and desynchronizes the KV from what the model
+ * was trained to see); true for a standalone embedding input, as upstream
+ * tokenizes one. `parse_special = true` always: template specials are real
+ * tokens.
  *
  * **Lifetime.** Owns its bitmaps and chunk list. The input bytes are decoded
  * into those bitmaps during construction and never retained, so the caller may
@@ -310,20 +316,26 @@ public:
              const std::string& prompt,
              const std::vector<std::vector<uint8_t>>& images,
              std::span<const llama_token> sep,
-             int32_t n_embd_inp)
-      : MtmdSource(ctx, prompt, mtmd_detail::image_inputs(images), sep, n_embd_inp, {}) {}
+             int32_t n_embd_inp,
+             bool add_special = false)
+      : MtmdSource(ctx, prompt, mtmd_detail::image_inputs(images), sep, n_embd_inp, {}, add_special) {}
 
   /**
    * Inputs follow prompt marker order. Audio is integer PCM WAV, with optional
    * INFO/JUNK metadata. Limits apply before decoding or preprocessing; the
    * caller supplies policy. ctx and sep must outlive this source.
+   *
+   * `add_special` adds the model's special tokens (a BOS) around the prompt, as
+   * mtmd_tokenize does for an embedding input. A chat prompt already carries its
+   * template's, so the default leaves them out.
    */
   MtmdSource(mtmd_context* ctx,
              const std::string& prompt,
              std::span<const MediaInput> inputs,
              std::span<const llama_token> sep,
              int32_t n_embd_inp,
-             AudioLimits limits)
+             AudioLimits limits,
+             bool add_special = false)
       : ctx_(ctx), sep_(sep), n_embd_inp_(n_embd_inp) {
     if (!ctx_) throw std::runtime_error("MtmdSource - NULL mtmd context");
     if (n_embd_inp_ <= 0) throw std::runtime_error("MtmdSource - invalid embedding width");
@@ -339,7 +351,7 @@ public:
       const auto& input = inputs[i];
       if (input.kind == MediaInput::Kind::Video) {
         videos.push_back(std::make_unique<mtmd_detail::VideoLayout>(
-            mtmd_detail::video_layout(decode_frames(input.video), input.video)));
+            mtmd_detail::video_layout(decode_frames(input.video, i), input.video)));
         auto* lazy = mtmd_bitmap_init_lazy(ctx_, "", videos.back().get(),
                                            &mtmd_detail::VideoLayout::next);
         if (!lazy) throw std::runtime_error("MtmdSource - video layout failed");
@@ -349,6 +361,7 @@ public:
       }
       auto wrap = decode_media(input.bytes, i);
       bitmaps_.emplace_back(wrap);
+      name_input(wrap, i);
       const bool audio = input.kind == MediaInput::Kind::Audio;
       if (mtmd_bitmap_is_audio(wrap) != audio) {
         throw std::runtime_error("MtmdSource - decoded media kind does not match input");
@@ -366,7 +379,7 @@ public:
     mtmd_input_text txt{};
     txt.text = prompt.c_str();
     txt.text_len = prompt.size();
-    txt.add_special = false;
+    txt.add_special = add_special;
     txt.parse_special = true;
     if (mtmd_tokenize(ctx_, chunks_.get(), &txt, ptrs.data(), ptrs.size()) != 0) {
       throw std::runtime_error("MtmdSource - media preprocessing failed");
@@ -374,21 +387,23 @@ public:
     mrope_ = mtmd_decode_use_mrope(ctx_);
     n_chunks_ = mtmd_input_chunks_size(chunks_.get());
     lead_ = sep_.empty() ? 0 : 1;
-    cells_ = sep_.size();
-    for (size_t k = 0; k < n_chunks_; ++k) {
-      const auto* chunk = mtmd_input_chunks_get(chunks_.get(), k);
-      const auto kind = mtmd_input_chunk_get_type(chunk);
-      if (kind != MTMD_INPUT_CHUNK_TYPE_TEXT && kind != MTMD_INPUT_CHUNK_TYPE_IMAGE &&
-          kind != MTMD_INPUT_CHUNK_TYPE_AUDIO) {
-        throw std::runtime_error("MtmdSource - unsupported media chunk");
+    cells_ = 0;
+    for (size_t i = 0; i < size(); ++i) {
+      if (i >= lead_) {
+        const auto kind = mtmd_input_chunk_get_type(chunk_at(i));
+        if (kind != MTMD_INPUT_CHUNK_TYPE_TEXT && kind != MTMD_INPUT_CHUNK_TYPE_IMAGE &&
+            kind != MTMD_INPUT_CHUNK_TYPE_AUDIO) {
+          throw std::runtime_error("MtmdSource - unsupported media chunk");
+        }
       }
-      const size_t rows = mtmd_input_chunk_get_n_tokens(chunk);
+      const size_t rows = cells_at(i);
       if (rows > std::numeric_limits<int32_t>::max() ||
           rows > std::numeric_limits<size_t>::max() - cells_) {
         throw std::runtime_error("MtmdSource - media token count overflow");
       }
       cells_ += rows;
     }
+    map_inputs(inputs.size());
   }
 
   size_t size() override { return lead_ + n_chunks_; }
@@ -402,6 +417,12 @@ public:
    * `mtmd.h` relies on.
    */
   size_t cells() const override { return cells_; }
+
+  int32_t input_of(size_t i) const override { return i < input_of_.size() ? input_of_[i] : -1; }
+
+  size_t total_of(int32_t input) const override {
+    return input >= 0 && static_cast<size_t>(input) < total_of_.size() ? total_of_[input] : 0;
+  }
 
   decode::Segment at(size_t i) override {
     decode::Segment seg;
@@ -500,13 +521,14 @@ private:
     return wrap.bitmap;
   }
 
-  /** Every frame decoded, of one size, and marked for temporal merge. */
-  std::vector<::mtmd::bitmap_ptr> decode_frames(const VideoFrames& video) const {
+  /** Every frame decoded, of one size, marked for temporal merge, and named for its input. */
+  std::vector<::mtmd::bitmap_ptr> decode_frames(const VideoFrames& video, size_t input) const {
     std::vector<::mtmd::bitmap_ptr> frames;
     frames.reserve(video.frames.size());
     for (size_t k = 0; k < video.frames.size(); ++k) {
       frames.emplace_back(decode_media(video.frames[k], k));
       auto* frame = frames.back().get();
+      name_input(frame, input);
       if (mtmd_bitmap_is_audio(frame)) {
         throw std::runtime_error("MtmdSource - decoded media kind does not match input");
       }
@@ -607,6 +629,44 @@ private:
     return mtmd_input_chunks_get(chunks_.get(), i - lead_);
   }
 
+  /** An input's bitmaps carry its index as their id, so its chunks name it after tokenizing. */
+  static void name_input(mtmd_bitmap* bitmap, size_t input) {
+    mtmd_bitmap_set_id(bitmap, std::to_string(input).c_str());
+  }
+
+  /** KV cells segment `i` takes: the separator's tokens, a text chunk's tokens, a media chunk's rows. */
+  size_t cells_at(size_t i) const {
+    if (lead_ != 0 && i == 0) return sep_.size();
+    return mtmd_input_chunk_get_n_tokens(chunk_at(i));
+  }
+
+  /**
+   * Which input each segment belongs to, and each input's cells. A media chunk
+   * belongs to the input its id names; text between two chunks of one input (a
+   * video's timestamps, the markers between its frames) belongs to that input;
+   * any other text, including the markers around a single-chunk image, is the
+   * prompt's own and belongs to none.
+   */
+  void map_inputs(size_t n_inputs) {
+    const size_t n = size();
+    std::vector<int32_t> media(n, -1);
+    for (size_t i = lead_; i < n; ++i) {
+      if (const char* id = mtmd_input_chunk_get_id(chunk_at(i))) media[i] = std::stoi(id);
+    }
+    // The nearest media chunk's input on either side of each segment.
+    std::vector<int32_t> before(n, -1), after(n, -1);
+    for (size_t i = 1; i < n; ++i) before[i] = media[i - 1] >= 0 ? media[i - 1] : before[i - 1];
+    for (size_t i = n; i > 1; --i) after[i - 2] = media[i - 1] >= 0 ? media[i - 1] : after[i - 1];
+
+    input_of_.assign(n, -1);
+    total_of_.assign(n_inputs, 0);
+    for (size_t i = 0; i < n; ++i) {
+      const bool inside = before[i] >= 0 && before[i] == after[i];
+      input_of_[i] = media[i] >= 0 ? media[i] : (inside ? before[i] : -1);
+      if (input_of_[i] >= 0) total_of_[input_of_[i]] += cells_at(i);
+    }
+  }
+
   mtmd_context* ctx_ = nullptr;
   std::span<const llama_token> sep_;
   int32_t n_embd_inp_ = 0;
@@ -619,6 +679,9 @@ private:
   size_t n_chunks_ = 0;
   size_t lead_     = 0;
   size_t cells_    = 0;
+
+  std::vector<int32_t> input_of_;  // per segment: its input, or -1
+  std::vector<size_t> total_of_;   // per input: its cells
 };
 
 } // namespace lloyal

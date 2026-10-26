@@ -13,7 +13,8 @@
 // Forward declarations matching llama.cpp types
 struct llama_model {};
 struct llama_context {};
-struct llama_memory_t {};  // KV cache memory handle
+struct llama_memory_i {};  // KV cache memory
+using llama_memory_t = llama_memory_i*;  // a handle, null for a context without memory, as in llama.h
 struct llama_vocab {};      // Vocabulary handle
 struct llama_sampler {};    // Sampler chain (new API commit b6451+)
 
@@ -21,6 +22,26 @@ struct llama_sampler {};    // Sampler chain (new API commit b6451+)
 using llama_seq_id = int32_t;
 using llama_pos = int32_t;
 using llama_token = int32_t;
+
+struct llama_embd {
+    const float* data;
+    size_t n_rows;  // number of embedding rows in data
+    size_t n_embd;  // size of one row
+};
+
+enum llama_process_type {
+    LLAMA_PROCESS_TYPE_ENCODE,
+    LLAMA_PROCESS_TYPE_DECODE,
+};
+
+// One entry of a stub mixed batch as llama_process received it.
+struct StubBatchEntry {
+    bool is_row = false;
+    llama_token token = -1;
+    std::vector<float> row;
+    std::vector<llama_pos> pos;
+    bool output = false;
+};
 
 // Special token constants
 #define LLAMA_TOKEN_NULL -1
@@ -135,6 +156,18 @@ extern "C" {
 
     // Attention mode (used by the embedding rail's non-causal bracket)
     void llama_set_causal_attn(llama_context* ctx, bool causal);
+    bool llama_get_causal_attn(const llama_context* ctx);
+
+    // The mixed batch: tokens and embedding rows as entries of one dispatch
+    struct llama_batch_ext;
+    llama_batch_ext* llama_batch_ext_init(llama_context* ctx);
+    void llama_batch_ext_free(llama_batch_ext* batch);
+    int32_t llama_batch_ext_add_token(llama_batch_ext* batch, llama_seq_id seq_id, llama_token id);
+    int32_t llama_batch_ext_add_embd(llama_batch_ext* batch, llama_seq_id seq_id, llama_embd embd);
+    bool llama_batch_ext_set_pos(llama_batch_ext* batch, int32_t idx, const llama_pos* pos);
+    bool llama_batch_ext_set_output_embd(llama_batch_ext* batch, int32_t idx, bool value);
+    bool llama_batch_ext_set_output_logits(llama_batch_ext* batch, int32_t idx, bool value);
+    int32_t llama_process(llama_context* ctx, enum llama_process_type type, llama_batch_ext* batch);
 
     // Tokenization operations
     int llama_tokenize(
@@ -224,6 +257,7 @@ extern "C" {
 
     // Embedding operations
     int32_t llama_model_n_embd(const llama_model* model);
+    int32_t llama_model_n_embd_out(const llama_model* model);
     int32_t llama_pooling_type(const llama_context* ctx);
     float* llama_get_embeddings(llama_context* ctx);
     float* llama_get_embeddings_seq(llama_context* ctx, llama_seq_id seq);
@@ -301,6 +335,16 @@ struct LlamaStubConfig {
     bool causal_attn = true;
     std::vector<bool> causal_attn_log;
 
+    // A context without memory (an embedding model's) reports a null handle.
+    bool has_memory = true;
+
+    // The mixed batch and llama_process. Positions per row entry, as the
+    // model's position type decides upstream (4 under M-RoPE).
+    int32_t n_pos_per_embd = 1;
+    int process_result = 0;
+    int process_call_count = 0;
+    std::vector<StubBatchEntry> last_process_entries;
+
     // Batch geometry reported by llama_n_batch / llama_n_ubatch. Settable so a
     // test can force an oversized non-causal block, which decode::embd must
     // reject rather than silently split across dispatches.
@@ -352,6 +396,9 @@ struct LlamaStubConfig {
 
     // Embedding operations
     int32_t n_embd = 0;                        // Embedding dimension (0 = no embeddings)
+    // Width of what the model outputs, as llama_model_n_embd_out reports it.
+    // 0 means the same as n_embd, as llama.cpp answers for a model without its own.
+    int32_t n_embd_out = 0;
     int32_t pooling_type = LLAMA_POOLING_TYPE_NONE;  // Pooling type
     std::vector<float> embeddings;             // Embedding values to return
     bool embeddings_available = false;         // Controls if llama_get_embeddings returns valid ptr
