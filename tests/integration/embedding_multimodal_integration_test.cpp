@@ -333,3 +333,24 @@ TEST_CASE("embedding multimodal: an input larger than the context's batch is ref
   REQUIRE(cat != entries.end());
   CHECK(dot(embed(ctx.get(), model.get(), *cat), (*cat)["vector"].get<std::vector<float>>()) >= 0.999f);
 }
+
+TEST_CASE("embedding multimodal: an empty input is refused, never read as the input before it"
+          * doctest::skip(embedding_multimodal_disabled())) {
+  LlamaBackendGuard backend;
+  auto model = TestConfig::acquire_test_model();
+  REQUIRE(model != nullptr);
+  auto* mtmd = TestConfig::acquire_mtmd(model.get());
+  REQUIRE(mtmd != nullptr);
+  auto ctx = embedding_context(model.get(), 512);
+  REQUIRE(ctx);
+
+  // A first input leaves its vector in the context.
+  const auto tokens = tokenizer::tokenize(llama_model_get_vocab(model.get()), "a cat", true, true);
+  embedding::encode(ctx.get(), tokens, 512);
+
+  // No text, no media and no framing: a stream with nothing in it.
+  const Input nothing(nlohmann::json::array({{{"text", ""}}}));
+  auto empty = source_of(mtmd, model.get(), nothing, false);
+  REQUIRE(empty.cells() == 0);
+  CHECK_THROWS_AS(embedding::encode(ctx.get(), empty), std::runtime_error);
+}

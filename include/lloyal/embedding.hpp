@@ -174,15 +174,21 @@ inline void apply_l2_normalize(std::vector<float> &vec) {
  * pooling NONE. Per-token embeddings from such a context are not supported;
  * give it a pooling type, or use an embedding model.
  *
+ * An input with nothing in it is refused: no dispatch would run, and `get()`
+ * would read back the vector of the input before it.
+ *
  * @param ctx    Embedding context (embeddings=true; pooled, or a model without memory)
  * @param source The input's segments
- * @throws std::runtime_error if the context would read the input in pieces,
- *         or the input is malformed or does not fit one dispatch
+ * @throws std::runtime_error if the input is empty, the context would read it
+ *         in pieces, or it is malformed or does not fit one dispatch
  * @throws decode::DecodeError if the dispatch fails
  */
 inline void encode(llama_context *ctx, decode::SegmentSource &source) {
   if (!ctx) {
     throw std::runtime_error("embedding::encode - NULL context");
+  }
+  if (source.cells() == 0) {
+    throw std::runtime_error("embedding::encode - empty input");
   }
   if (!decode::reading_of(ctx).whole()) {
     throw std::runtime_error(
